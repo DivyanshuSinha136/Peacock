@@ -1,0 +1,226 @@
+// hwctl.kc -- control over the machine: ACPI table discovery (RSDP -> RSDT/XSDT -> FADT, MADT, DSDT), real S5 power-off from the
+// DSDT's \_S5 package, the ACPI reset register, the PCI reset port, and CPU identification (cpuid).
+// Author: Divyanshu Sinha (MIT License)
+// Physical memory is identity mapped, so table addresses are used directly.  acpi_parse() takes an RSDP address so the host tests can
+// feed it synthetic tables; acpi_find_rsdp() scans the real BIOS areas.  Port I/O goes through hw_out* / hw_in* (hw.kc).
+
+const AT_MAX = 24;
+var acpi_ok = false;
+var acpi_rev = 0;                        // ACPI revision from the RSDP (0 = 1.0, 2 = 2.0+)
+var acpi_oem: u8[8];
+var acpi_nt = 0;
+var at_sig: int[24]; var at_addr: int[24]; var at_len: int[24];
+var acpi_pm1a = 0; var acpi_pm1b = 0; var acpi_smi = 0; var acpi_en = 0; var acpi_dis = 0; var acpi_sci = 0;
+var acpi_slp_a = -1; var acpi_slp_b = -1;          // SLP_TYP values of the S5 (soft-off) state, from the DSDT
+var acpi_flags = 0;
+var acpi_rst_space = -1; var acpi_rst_addr = 0; var acpi_rst_val = 0;
+var acpi_ncpu = 0; var acpi_nioapic = 0;
+var acpi_dsdt = 0;
+var hw_cmos_rebooting = false;
+
+fn am8(a: int) -> int { return *(a as *u8) as int; }
+fn am16(a: int) -> int { return am8(a) | (am8(a + 1) << 8); }
+fn am32(a: int) -> int { return am16(a) | (am16(a + 2) << 16); }
+fn am64(a: int) -> int { return am32(a) | (am32(a + 4) << 32); }
+fn acpi_sum(a: int, n: int) -> int { var s = 0; var i = 0; while (i < n) { s = s + am8(a + i); i++; } return s & 255; }
+/// four ASCII characters as one little-endian int ("FACP" = 0x50434146)
+fn sig4(a: int, b: int, c: int, d: int) -> int { return a | (b << 8) | (c << 16) | (d << 24); }
+fn acpi_has(sig: int) -> int {
+    var i = 0;
+    while (i < acpi_nt) { if (at_sig[i] == sig) { return at_addr[i]; } i++; }
+    return 0;
+}
+
+/// look for "RSD PTR " (valid checksum) in the EBDA and in the BIOS ROM area; 0 = none
+fn acpi_find_rsdp() -> int {
+    let ebda = am16(0x40E) << 4;
+    var pass = 0;
+    while (pass < 2) {
+        var a = 0xE0000; var end = 0x100000;
+        if (pass == 0) { a = ebda; end = ebda + 1024; if (ebda < 0x80000 || ebda > 0x9FFFF) { a = 0; end = 0; } }
+        while (a + 20 <= end) {
+            if (am32(a) == sig4('R', 'S', 'D', ' ') && am32(a + 4) == sig4('P', 'T', 'R', ' ') && acpi_sum(a, 20) == 0) { return a; }
+            a = a + 16;
+        }
+        pass++;
+    }
+    return 0;
+}
+
+/// find \_S5_ in the DSDT and read its SLP_TYPa / SLP_TYPb
+fn acpi_read_s5(dsdt: int) {
+    let len = am32(dsdt + 4);
+    if (len < 44 || len > 4194304) { return; }
+    var p = dsdt + 36;
+    let end = dsdt + len - 8;
+    while (p < end) {
+        if (am32(p) == sig4('_', 'S', '5', '_') && am8(p + 4) == 0x12 && (am8(p - 1) == 0x08 || (am8(p - 1) == 0x5C && am8(p - 2) == 0x08))) {
+            var q = p + 5;
+            q = q + ((am8(q) >> 6) & 3) + 2;                                       // PkgLength + NumElements
+            if (am8(q) == 0x0A) { q++; }                                           // BytePrefix
+            acpi_slp_a = am8(q); q++;
+            if (am8(q) == 0x0A) { q++; }
+            acpi_slp_b = am8(q);
+            return;
+        }
+        p++;
+    }
+}
+
+fn acpi_parse_fadt(f: int) {
+    let len = am32(f + 4);
+    acpi_smi = am32(f + 48); acpi_en = am8(f + 52); acpi_dis = am8(f + 53);
+    acpi_pm1a = am32(f + 64); acpi_pm1b = am32(f + 68);
+    acpi_sci = am16(f + 46);
+    var dsdt = am32(f + 40);
+    if (len >= 148 && am64(f + 140) != 0) { dsdt = am64(f + 140); }
+    acpi_dsdt = dsdt;
+    if (len >= 116) { acpi_flags = am32(f + 112); }
+    if (len >= 129 && (acpi_flags & (1 << 10)) != 0) {                             // RESET_REG supported
+        acpi_rst_space = am8(f + 116); acpi_rst_addr = am64(f + 120); acpi_rst_val = am8(f + 128);
+    }
+    if (dsdt != 0 && acpi_sum(dsdt, am32(dsdt + 4)) == 0) { acpi_read_s5(dsdt); }
+}
+
+fn acpi_parse_madt(m: int) {
+    let len = am32(m + 4);
+    var o = 44;
+    while (o + 2 <= len) {
+        let t = am8(m + o); let l = am8(m + o + 1);
+        if (l < 2) { break; }
+        if (t == 0 && l >= 8 && (am32(m + o + 4) & 1) != 0) { acpi_ncpu++; }
+        if (t == 1) { acpi_nioapic++; }
+        o = o + l;
+    }
+}
+
+/// parse the tables below an RSDP at physical address `rsdp`; false when it is invalid
+fn acpi_parse(rsdp: int) -> bool {
+    acpi_ok = false; acpi_nt = 0; acpi_slp_a = -1; acpi_slp_b = -1; acpi_pm1a = 0; acpi_pm1b = 0; acpi_smi = 0; acpi_ncpu = 0; acpi_nioapic = 0;
+    acpi_rst_space = -1; acpi_flags = 0; acpi_dsdt = 0;
+    if (rsdp == 0 || am32(rsdp) != sig4('R', 'S', 'D', ' ') || acpi_sum(rsdp, 20) != 0) { return false; }
+    acpi_rev = am8(rsdp + 15);
+    var i = 0;
+    while (i < 6) { acpi_oem[i] = am8(rsdp + 9 + i) as u8; i++; }
+    acpi_oem[6] = 0;
+    var root = am32(rsdp + 16); var esz = 4;
+    if (acpi_rev >= 2 && am32(rsdp + 20) >= 36 && am64(rsdp + 24) != 0) {
+        root = am64(rsdp + 24); esz = 8;
+        if (acpi_sum(rsdp, am32(rsdp + 20)) != 0) { root = am32(rsdp + 16); esz = 4; }
+    }
+    if (root == 0 || acpi_sum(root, am32(root + 4)) != 0) { return false; }
+    let n = (am32(root + 4) - 36) / esz;
+    i = 0;
+    while (i < n && acpi_nt < AT_MAX) {
+        var t = 0;
+        if (esz == 8) { t = am64(root + 36 + i * 8); } else { t = am32(root + 36 + i * 4); }
+        if (t != 0) {
+            at_sig[acpi_nt] = am32(t); at_addr[acpi_nt] = t; at_len[acpi_nt] = am32(t + 4);
+            acpi_nt++;
+        }
+        i++;
+    }
+    let f = acpi_has(sig4('F', 'A', 'C', 'P'));
+    if (f != 0 && acpi_sum(f, am32(f + 4)) == 0) { acpi_parse_fadt(f); }
+    let m = acpi_has(sig4('A', 'P', 'I', 'C'));
+    if (m != 0 && acpi_sum(m, am32(m + 4)) == 0) { acpi_parse_madt(m); }
+    acpi_ok = true;
+    return true;
+}
+
+fn acpi_init() -> bool { return acpi_parse(acpi_find_rsdp()); }
+
+// ---------------------------------------------------------------- power off / reset
+/// ACPI soft-off (S5); returns only if the machine did not power down
+fn acpi_poweroff() {
+    if (!acpi_ok || acpi_pm1a == 0 || acpi_slp_a < 0) { return; }
+    if ((hw_in16(acpi_pm1a) & 1) == 0 && acpi_smi != 0 && acpi_en != 0) {          // ACPI mode not active yet: ask the firmware
+        hw_out8(acpi_smi, acpi_en);
+        var s = 0;
+        while (s < 3000000 && (hw_in16(acpi_pm1a) & 1) == 0) { s++; }
+    }
+    hw_out16(acpi_pm1a, (acpi_slp_a << 10) | 0x2000);
+    if (acpi_pm1b != 0) { hw_out16(acpi_pm1b, (acpi_slp_b << 10) | 0x2000); }
+    var w = 0;
+    while (w < 2000000) { w++; }
+}
+fn sys_poweroff() {
+    acpi_poweroff();
+    hal_poweroff();                                                                  // QEMU / Bochs / VirtualBox special ports
+}
+/// reset through the ACPI reset register, then the PCI reset control port, then the keyboard controller
+fn sys_reboot() {
+    if (acpi_ok && acpi_rst_space == 1 && acpi_rst_addr > 0 && acpi_rst_addr < 0x10000) { hw_out8(acpi_rst_addr, acpi_rst_val); }
+    else if (acpi_ok && acpi_rst_space == 0 && acpi_rst_addr > 0x100000) { *(acpi_rst_addr as *u8) = acpi_rst_val as u8; }
+    var w = 0;
+    while (w < 1000000) { w++; }
+    hw_out8(0xCF9, 0x02); hw_out8(0xCF9, 0x06);                                      // PCI reset control register: hard reset
+    w = 0;
+    while (w < 1000000) { w++; }
+    hal_reboot();
+}
+
+// ---------------------------------------------------------------- CPU
+var cpu_vendor: u8[16]; var cpu_brand: u8[52];
+var cpu_fam = 0; var cpu_mod = 0; var cpu_step = 0; var cpu_logical = 1;
+var cpu_f1c = 0; var cpu_f1d = 0; var cpu_f81d = 0; var cpu_maxleaf = 0;
+
+fn cpu_init() {
+    var r: u32[4];
+    cpuid(0, &r[0]);
+    cpu_maxleaf = r[0] as int;
+    *((&cpu_vendor[0]) as *u32) = r[1]; *((&cpu_vendor[4]) as *u32) = r[3]; *((&cpu_vendor[8]) as *u32) = r[2];
+    cpu_vendor[12] = 0;
+    cpu_f1c = 0; cpu_f1d = 0; cpu_f81d = 0;
+    if (cpu_maxleaf >= 1) {
+        cpuid(1, &r[0]);
+        let ea = r[0] as int;
+        cpu_step = ea & 15;
+        cpu_fam = (ea >> 8) & 15; cpu_mod = (ea >> 4) & 15;
+        if (cpu_fam == 15) { cpu_fam = cpu_fam + ((ea >> 20) & 255); }
+        if ((((ea >> 8) & 15) == 15) || (((ea >> 8) & 15) == 6)) { cpu_mod = cpu_mod | (((ea >> 16) & 15) << 4); }
+        cpu_logical = ((r[1] as int) >> 16) & 255;
+        if (cpu_logical < 1) { cpu_logical = 1; }
+        cpu_f1c = r[2] as int; cpu_f1d = r[3] as int;
+    }
+    cpuid(0x80000000, &r[0]);
+    if ((r[0] as int) >= 0x80000001) { cpuid(0x80000001, &r[0]); cpu_f81d = r[3] as int; }
+    t_cpu_brand(&cpu_brand[0]);
+}
+/// space-separated feature names into out (at most n bytes)
+fn cpu_features(out: *u8, n: int) {
+    var k = 0;
+    out[0] = 0;
+    var i = 0;
+    while (i < 16) {
+        var name = "";
+        var on = false;
+        if (i == 0) { name = "fpu"; on = (cpu_f1d & 1) != 0; }
+        else if (i == 1) { name = "tsc"; on = (cpu_f1d & 16) != 0; }
+        else if (i == 2) { name = "msr"; on = (cpu_f1d & 32) != 0; }
+        else if (i == 3) { name = "pae"; on = (cpu_f1d & 64) != 0; }
+        else if (i == 4) { name = "apic"; on = (cpu_f1d & 512) != 0; }
+        else if (i == 5) { name = "mmx"; on = (cpu_f1d & (1 << 23)) != 0; }
+        else if (i == 6) { name = "sse"; on = (cpu_f1d & (1 << 25)) != 0; }
+        else if (i == 7) { name = "sse2"; on = (cpu_f1d & (1 << 26)) != 0; }
+        else if (i == 8) { name = "sse3"; on = (cpu_f1c & 1) != 0; }
+        else if (i == 9) { name = "ssse3"; on = (cpu_f1c & (1 << 9)) != 0; }
+        else if (i == 10) { name = "sse4.1"; on = (cpu_f1c & (1 << 19)) != 0; }
+        else if (i == 11) { name = "sse4.2"; on = (cpu_f1c & (1 << 20)) != 0; }
+        else if (i == 12) { name = "avx"; on = (cpu_f1c & (1 << 28)) != 0; }
+        else if (i == 13) { name = "hypervisor"; on = (cpu_f1c & (1 << 31)) != 0; }
+        else if (i == 14) { name = "nx"; on = (cpu_f81d & (1 << 20)) != 0; }
+        else if (i == 15) { name = "lm"; on = (cpu_f81d & (1 << 29)) != 0; }
+        if (on) {
+            var l = 0;
+            while (name[l] != 0) { l++; }
+            if (k + l + 2 < n) {
+                if (k > 0) { out[k] = ' '; k++; }
+                var j = 0;
+                while (j < l) { out[k] = name[j]; k++; j++; }
+                out[k] = 0;
+            }
+        }
+        i++;
+    }
+}

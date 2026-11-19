@@ -1,0 +1,1298 @@
+// notepad.kc -- Notes 2: a text editor with selection, clipboard, undo/redo, find/replace, word wrap, line numbers, crash recovery.
+// Author: Divyanshu Sinha (MIT License)
+//
+// Buffer: one flat byte array (LF line ends in memory; CRLF files are converted on load and written back as CRLF).  A line-start index
+// (`nl_st`) is kept up to date, so a line lookup is a binary search.  Every edit is one "replace [pos, pos+dl) by text" operation, recorded in
+// a journal (`u_*`) that gives unlimited-ish undo/redo; typing and backspacing coalesce into groups.  Prompts (find, replace, go to, open,
+// save as, confirmations) are a bar above the status line.  Unsaved work is mirrored to /home/.notes-recovery every few seconds and restored
+// after a crash; closing a modified window asks first (np_close_ok, called by ui.kc).
+//
+// Keys: Ctrl+S save, Ctrl+Shift+S save as, Ctrl+O open, Ctrl+N new, Ctrl+Z undo, Ctrl+Y redo, Ctrl+X/C/V clipboard, Ctrl+A select all,
+// Ctrl+F find, Ctrl+R replace, Ctrl+G go to line, Ctrl+W word wrap, Ctrl+L line numbers, Ctrl+D duplicate line, Ctrl+K delete line,
+// Alt+Up/Down move line, Tab/Shift+Tab indent/unindent, Ctrl+Left/Right/Backspace/Delete word-wise, Ctrl+Home/End, Shift+movement selects.
+
+const NMAX = 524288;
+const NLMAX = 200000;
+const UMAX = 2048;
+const UPOOL = 1048576;
+const CLIPMAX = 524288;
+const NP_TB = 30;                                        // toolbar height
+const NP_ST = 22;                                        // status bar height
+
+var nbuf: *u8;
+var nlen = 0; var ncur = 0; var nanc = -1;               // length, caret, selection anchor (-1 none)
+var nl_st: *int; var nl_n = 1;                           // start index of every line
+var n_top = 0; var n_sub = 0; var n_hx = 0;              // first visible line, sub-row inside it (wrap), horizontal scroll (columns)
+var n_wrap = true; var n_lnums = true;
+var n_path: u8[128];
+var n_status: u8[64]; var n_status_t = 0;
+var n_dirty = false; var n_ro = false; var n_crlf = false; var n_bin = false;
+var n_pref = 0;                                          // remembered visual column for Up/Down
+var n_gen = 0;                                           // bumps on every change of the text
+var n_blink = true;
+var n_title_dirty = false;
+var n_as_gen = -1; var n_as_t = 0;                       // recovery autosave bookkeeping
+
+// journal
+var u_pos: *int; var u_dl: *int; var u_il: *int; var u_off: *int; var u_c0: *int; var u_c1: *int; var u_kind: *int;
+var u_pool: *u8; var u_pool_n = 0;
+var u_n = 0; var u_cur = 0; var n_save_mark = 0;
+
+// clipboard (shared; the Terminal could use it too)
+var clip_buf: *u8; var clip_len = 0;
+
+// prompt bar: 0 none, 1 find, 2 replace, 3 go to line, 4 open, 5 save as, 6 confirm (modified buffer)
+var n_mode = 0; var n_pend = 0;                          // pending action after a confirm: 1 new, 2 open file, 3 close window
+var n_pend_path: u8[128];
+var n_f1: u8[128]; var n_f2: u8[128]; var n_f3: u8[128]; var n_ff = 0;   // find / replace / (go to, open, save as) fields; focused field
+var n_case = false;
+var n_fc_gen = -1; var n_fc_key = 0; var n_fc_sel = -1; var n_fc_n = 0; var n_fc_i = 0;   // match counter cache
+var n_clk_t = 0; var n_clk_i = -1; var n_clk_n = 0;      // double / triple click
+var n_drag = false; var n_sbdrag = false;
+var n_ovw_armed = false;
+
+// layout results (set by n_geom)
+var npg_gw = 0; var npg_x0 = 0; var npg_cols = 0; var npg_rows = 0; var npg_eh = 0; var npg_bar = 0; var npg_w = 0; var npg_h = 0;
+var npg_l = 0; var npg_s = 0;                                // scratch: a (line, sub-row) cursor
+var n_cl = 0; var n_cs = 0;                              // caret line / sub-row
+
+fn n_set_status(s: *u8) { kstrncpy(&n_status[0], s, 64); n_status_t = ticks; }
+
+// ================================================================= small helpers
+fn n_lc(c: int) -> int { if (c >= 'A' && c <= 'Z') { return c + 32; } return c; }
+fn n_wordc(c: int) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 128; }
+fn n_vw(c: int, vc: int) -> int { if (c == 9) { return 4 - (vc & 3); } return 1; }
+fn n_has_nl(p: *u8, n: int) -> bool { var i = 0; while (i < n) { if (p[i] == 10) { return true; } i++; } return false; }
+fn n_count_nl(p: *u8, n: int) -> int { var i = 0; var c = 0; while (i < n) { if (p[i] == 10) { c++; } i++; } return c; }
+fn n_flen(f: *u8) -> int { return kstrlen(f); }
+
+fn n_alloc() -> bool {
+    if (nbuf != (0 as *u8)) { return true; }
+    nbuf = kmalloc(NMAX + 8);
+    nl_st = kmalloc(NLMAX * 8) as *int;
+    u_pos = kmalloc(UMAX * 8) as *int; u_dl = kmalloc(UMAX * 8) as *int; u_il = kmalloc(UMAX * 8) as *int; u_off = kmalloc(UMAX * 8) as *int;
+    u_c0 = kmalloc(UMAX * 8) as *int; u_c1 = kmalloc(UMAX * 8) as *int; u_kind = kmalloc(UMAX * 8) as *int;
+    u_pool = kmalloc(UPOOL + 8);
+    if (nbuf == (0 as *u8) || nl_st == (0 as *int) || u_pos == (0 as *int) || u_dl == (0 as *int) || u_il == (0 as *int) || u_off == (0 as *int)
+        || u_c0 == (0 as *int) || u_c1 == (0 as *int) || u_kind == (0 as *int) || u_pool == (0 as *u8)) {
+        if (nbuf != (0 as *u8)) { kfree(nbuf); nbuf = 0 as *u8; }
+        return false;
+    }
+    return true;
+}
+
+// ================================================================= line index
+fn n_rebuild() {
+    nl_n = 1; nl_st[0] = 0;
+    var i = 0;
+    while (i < nlen) {
+        if (nbuf[i] == 10 && nl_n < NLMAX) { nl_st[nl_n] = i + 1; nl_n++; }
+        i++;
+    }
+    n_gen++;
+}
+/// index of the line that holds position p
+fn n_line_of(p: int) -> int {
+    var lo = 0; var hi = nl_n - 1;
+    while (lo < hi) {
+        let mid = (lo + hi + 1) / 2;
+        if (nl_st[mid] <= p) { lo = mid; } else { hi = mid - 1; }
+    }
+    return lo;
+}
+fn n_lend(l: int) -> int { if (l + 1 < nl_n) { return nl_st[l + 1] - 1; } return nlen; }
+fn n_lstart(i: int) -> int { return nl_st[n_line_of(i)]; }
+
+// ================================================================= visual rows (tabs, word wrap)
+fn n_wcols() -> int { if (n_wrap) { return imax(8, npg_cols - 1); } return 1073741824; }
+/// end of the visual row that starts at p (line ends at e)
+fn n_row_end(p: int, e: int, cols: int) -> int {
+    var q = p; var vc = 0;
+    while (q < e) {
+        let w = n_vw(nbuf[q] as int, vc);
+        if (vc + w > cols && q > p) { break; }
+        vc += w; q++;
+    }
+    return q;
+}
+fn n_line_rows(l: int) -> int {
+    if (!n_wrap) { return 1; }
+    let cols = n_wcols();
+    let e = n_lend(l);
+    var r = 1;
+    var q = n_row_end(nl_st[l], e, cols);
+    while (q < e) { r++; q = n_row_end(q, e, cols); }
+    return r;
+}
+fn n_row_start(l: int, sub: int) -> int {
+    var p = nl_st[l];
+    if (sub == 0) { return p; }
+    let e = n_lend(l); let cols = n_wcols();
+    var i = 0;
+    while (i < sub && p < e) { p = n_row_end(p, e, cols); i++; }
+    return p;
+}
+fn n_vcol(p: int, i: int) -> int {
+    var vc = 0; var q = p;
+    while (q < i) { vc += n_vw(nbuf[q] as int, vc); q++; }
+    return vc;
+}
+/// index in the row [p, q) nearest to visual column v (q is the row end; `last` = the row is the last one of its line)
+fn n_at_vcol(p: int, q: int, v: int, last: bool) -> int {
+    var i = p; var vc = 0;
+    while (i < q) {
+        let w = n_vw(nbuf[i] as int, vc);
+        if (vc + w > v) { break; }
+        vc += w; i++;
+    }
+    if (!last && i >= q) { i = q - 1; }
+    return imax(i, p);
+}
+/// caret position -> n_cl / n_cs
+fn n_locate(i: int) {
+    let l = n_line_of(i);
+    n_cl = l; n_cs = 0;
+    if (!n_wrap) { return; }
+    let e = n_lend(l); let cols = n_wcols();
+    var p = nl_st[l];
+    var q = n_row_end(p, e, cols);
+    while (q <= i && q < e) { n_cs++; p = q; q = n_row_end(p, e, cols); }
+}
+/// move npg_l / npg_s one visual row; false at the ends
+fn n_step(dir: int) -> bool {
+    if (dir > 0) {
+        if (npg_s + 1 < n_line_rows(npg_l)) { npg_s++; return true; }
+        if (npg_l + 1 < nl_n) { npg_l++; npg_s = 0; return true; }
+        return false;
+    }
+    if (npg_s > 0) { npg_s--; return true; }
+    if (npg_l > 0) { npg_l--; npg_s = n_line_rows(npg_l) - 1; return true; }
+    return false;
+}
+fn n_is_last_row(l: int, s: int) -> bool { return s + 1 >= n_line_rows(l); }
+
+fn n_gutter() -> int {
+    if (!n_lnums) { return 0; }
+    var d = 1; var v = nl_n;
+    while (v >= 10) { d++; v = v / 10; }
+    return imax(d, 3) * 8 + 16;
+}
+fn n_bar_h() -> int {
+    if (n_mode == 2) { return 58; }
+    if (n_mode != 0) { return 30; }
+    return 0;
+}
+fn n_geom(w: int, h: int) {
+    npg_w = w; npg_h = h;
+    npg_gw = n_gutter();
+    npg_x0 = npg_gw + 6;
+    npg_cols = imax(8, (w - 12 - npg_x0 - 4) / 8);
+    npg_bar = n_bar_h();
+    npg_eh = imax(32, h - NP_TB - npg_bar - NP_ST);
+    npg_rows = imax(1, (npg_eh - 4) / 16);
+}
+
+/// keep the caret on screen
+fn n_reveal() {
+    if (nbuf == (0 as *u8)) { return; }
+    n_locate(ncur);
+    if (n_cl < n_top || (n_cl == n_top && n_cs < n_sub)) { n_top = n_cl; n_sub = n_cs; }
+    else {
+        npg_l = n_top; npg_s = n_sub;
+        var cnt = 0;
+        while (!(npg_l == n_cl && npg_s == n_cs) && cnt < npg_rows) { if (!n_step(1)) { break; } cnt++; }
+        if (cnt >= npg_rows) {
+            npg_l = n_cl; npg_s = n_cs;
+            var k = 1;
+            while (k < npg_rows) { if (!n_step(-1)) { break; } k++; }
+            n_top = npg_l; n_sub = npg_s;
+        }
+    }
+    if (n_top >= nl_n) { n_top = nl_n - 1; n_sub = 0; }
+    if (n_wrap) { n_hx = 0; }
+    else {
+        let vc = n_vcol(nl_st[n_cl], ncur);
+        if (vc < n_hx) { n_hx = imax(0, vc - 8); }
+        else if (vc >= n_hx + npg_cols - 1) { n_hx = vc - npg_cols + 8; }
+    }
+}
+
+// ================================================================= selection
+fn n_has_sel() -> bool { return nanc >= 0 && nanc != ncur; }
+fn n_sel_s() -> int { return imin(nanc, ncur); }
+fn n_sel_e() -> int { return imax(nanc, ncur); }
+
+// ================================================================= journal (undo / redo)
+fn n_j_reset() { u_n = 0; u_cur = 0; u_pool_n = 0; n_save_mark = 0; }
+fn n_j_trim() {
+    // drop the oldest half of the history (compacting the text pool)
+    let half = u_n / 2;
+    if (half < 1) { n_j_reset(); n_save_mark = -1; return; }
+    let shift = u_off[half];
+    kmemmove(u_pool, u_pool + shift, u_pool_n - shift);
+    u_pool_n -= shift;
+    var i = half;
+    while (i < u_n) {
+        u_pos[i - half] = u_pos[i]; u_dl[i - half] = u_dl[i]; u_il[i - half] = u_il[i]; u_off[i - half] = u_off[i] - shift;
+        u_c0[i - half] = u_c0[i]; u_c1[i - half] = u_c1[i]; u_kind[i - half] = u_kind[i];
+        i++;
+    }
+    u_n -= half; u_cur = imax(0, u_cur - half);
+    if (n_save_mark >= 0) { n_save_mark = n_save_mark - half; if (n_save_mark < 0) { n_save_mark = -1; } }
+}
+/// record: removed text is still in the buffer at [pos, pos+dl); inserted text is src[0..sl)
+fn n_j_add(pos: int, dl: int, src: *u8, sl: int, kind: int, c0: int, c1: int) {
+    if (dl + sl > UPOOL / 2) { n_j_reset(); n_save_mark = -1; return; }
+    u_n = u_cur;                                                // a new edit drops the redo branch
+    if (n_save_mark > u_cur) { n_save_mark = -1; }
+    // coalesce typing / backspace / delete runs into one undo step
+    if (u_n > 0 && kind != 0 && u_n - 1 >= n_save_mark && u_kind[u_n - 1] == kind) {
+        let o = u_n - 1;
+        if (kind == 1 && dl == 0 && sl == 1 && u_dl[o] == 0 && pos == u_pos[o] + u_il[o] && u_il[o] < 240 && u_pool_n + 1 <= UPOOL) {
+            u_pool[u_pool_n] = src[0]; u_pool_n++; u_il[o]++; u_c1[o] = c1; return;
+        }
+        if (kind == 2 && sl == 0 && dl == 1 && u_il[o] == 0 && pos == u_pos[o] - 1 && u_dl[o] < 240 && u_pool_n + 1 <= UPOOL) {
+            kmemmove(u_pool + u_off[o] + 1, u_pool + u_off[o], u_dl[o]);
+            u_pool[u_off[o]] = nbuf[pos]; u_pool_n++; u_dl[o]++; u_pos[o] = pos; u_c1[o] = c1; return;
+        }
+        if (kind == 3 && sl == 0 && dl == 1 && u_il[o] == 0 && pos == u_pos[o] && u_dl[o] < 240 && u_pool_n + 1 <= UPOOL) {
+            u_pool[u_pool_n] = nbuf[pos]; u_pool_n++; u_dl[o]++; u_c1[o] = c1; return;
+        }
+    }
+    if (u_n >= UMAX || u_pool_n + dl + sl > UPOOL) { n_j_trim(); u_n = u_cur; }
+    if (u_pool_n + dl + sl > UPOOL) { n_j_reset(); n_save_mark = -1; return; }
+    let o = u_n;
+    u_pos[o] = pos; u_dl[o] = dl; u_il[o] = sl; u_off[o] = u_pool_n; u_c0[o] = c0; u_c1[o] = c1; u_kind[o] = kind;
+    kmemmove(u_pool + u_pool_n, nbuf + pos, dl);
+    kmemmove(u_pool + u_pool_n + dl, src, sl);
+    u_pool_n += dl + sl;
+    u_n++; u_cur = u_n;
+}
+
+/// replace the bytes without journalling
+fn n_raw(pos: int, dl: int, src: *u8, sl: int) {
+    let nl = n_has_nl(nbuf + pos, dl) || n_has_nl(src, sl);
+    kmemmove(nbuf + pos + sl, nbuf + pos + dl, nlen - pos - dl);
+    kmemmove(nbuf + pos, src, sl);
+    nlen += sl - dl;
+    if (nl) { n_rebuild(); }
+    else {
+        let l = n_line_of(pos);
+        var i = l + 1;
+        while (i < nl_n) { nl_st[i] += sl - dl; i++; }
+        n_gen++;
+    }
+}
+
+fn n_title() {
+    let wi = win_of_kind(APP_NOTES);
+    if (wi < 0) { return; }
+    var b = 0;
+    var i = 0;
+    while (n_path[i] != 0) { if (n_path[i] == '/') { b = i + 1; } i++; }
+    kstrncpy(&wins[wi].title[0], "Notes - ", 32);
+    var o = 8;
+    while (n_path[b] != 0 && o < 30) { wins[wi].title[o] = n_path[b]; o++; b++; }
+    if (n_dirty && o < 31) { wins[wi].title[o] = '*'; o++; }
+    wins[wi].title[o] = 0;
+    n_title_dirty = n_dirty;
+    win_rect_dmg(wi);
+}
+
+fn n_after_edit() {
+    n_dirty = (u_cur != n_save_mark);
+    n_pref = n_vcol(n_row_start(n_cl, 0), ncur);
+    n_ovw_armed = false;
+    n_reveal();
+    n_locate(ncur);
+    n_pref = n_vcol(n_row_start(n_cl, n_cs), ncur);
+    if (n_dirty != n_title_dirty) { n_title(); }
+    ui_inval_all(APP_NOTES);
+}
+
+/// the one edit primitive: replace [pos, pos+dl) by src[0..sl), put the caret at newcur, journal it.  false when refused.
+fn n_replace(pos: int, dl: int, src: *u8, sl: int, kind: int, newcur: int) -> bool {
+    if (n_ro) { n_set_status("read-only: use Save as to keep a copy"); return false; }
+    if (nlen - dl + sl > NMAX) { n_set_status("buffer full (512 KiB)"); return false; }
+    if (nl_n + n_count_nl(src, sl) - n_count_nl(nbuf + pos, dl) > NLMAX - 1) { n_set_status("too many lines"); return false; }
+    let c0 = ncur;
+    n_j_add(pos, dl, src, sl, kind, c0, newcur);
+    n_raw(pos, dl, src, sl);
+    ncur = newcur; nanc = -1;
+    n_after_edit();
+    return true;
+}
+
+fn n_undo() {
+    if (u_cur <= 0) { n_set_status("nothing to undo"); return; }
+    u_cur--;
+    let o = u_cur;
+    n_raw(u_pos[o], u_il[o], u_pool + u_off[o], u_dl[o]);
+    ncur = u_c0[o]; nanc = -1;
+    n_dirty = (u_cur != n_save_mark);
+    n_set_status("undo");
+    n_after_edit2();
+}
+fn n_redo() {
+    if (u_cur >= u_n) { n_set_status("nothing to redo"); return; }
+    let o = u_cur;
+    n_raw(u_pos[o], u_dl[o], u_pool + u_off[o] + u_dl[o], u_il[o]);
+    ncur = u_c1[o]; nanc = -1; u_cur++;
+    n_dirty = (u_cur != n_save_mark);
+    n_set_status("redo");
+    n_after_edit2();
+}
+fn n_after_edit2() {
+    if (ncur > nlen) { ncur = nlen; }
+    n_reveal();
+    n_locate(ncur);
+    n_pref = n_vcol(n_row_start(n_cl, n_cs), ncur);
+    if (n_dirty != n_title_dirty) { n_title(); }
+    ui_inval_all(APP_NOTES);
+}
+
+// ================================================================= clipboard
+fn cb_set(p: *u8, n: int) -> bool {
+    if (clip_buf == (0 as *u8)) { clip_buf = kmalloc(CLIPMAX + 8); }
+    if (clip_buf == (0 as *u8)) { return false; }
+    if (n > CLIPMAX) { return false; }
+    kmemmove(clip_buf, p, n); clip_len = n;
+    return true;
+}
+
+fn cb_copy_sel() -> bool {
+    if (n_has_sel()) { return cb_set(nbuf + n_sel_s(), n_sel_e() - n_sel_s()); }
+    let l = n_line_of(ncur);                              // no selection: the whole line, with its line end
+    let s = nl_st[l]; var e = n_lend(l);
+    if (e < nlen) { e++; }
+    return cb_set(nbuf + s, e - s);
+}
+
+// ================================================================= editing commands
+fn n_word_left(p0: int) -> int {
+    var p = p0;
+    while (p > 0 && !n_wordc(nbuf[p - 1] as int) && (nbuf[p - 1] == ' ' || nbuf[p - 1] == 9 || nbuf[p - 1] == 10)) { p--; }
+    if (p > 0) {
+        if (n_wordc(nbuf[p - 1] as int)) { while (p > 0 && n_wordc(nbuf[p - 1] as int)) { p--; } }
+        else { p--; }
+    }
+    return p;
+}
+fn n_word_right(p0: int) -> int {
+    var p = p0;
+    while (p < nlen && (nbuf[p] == ' ' || nbuf[p] == 9 || nbuf[p] == 10)) { p++; }
+    if (p < nlen) {
+        if (n_wordc(nbuf[p] as int)) { while (p < nlen && n_wordc(nbuf[p] as int)) { p++; } }
+        else { p++; }
+    }
+    return p;
+}
+
+fn n_type(c: int) {
+    var ch: u8[2];
+    ch[0] = c as u8;
+    if (n_has_sel()) { let s = n_sel_s(); n_replace(s, n_sel_e() - s, &ch[0], 1, 0, s + 1); }
+    else { n_replace(ncur, 0, &ch[0], 1, c == 10 ? 0 : 1, ncur + 1); }
+}
+fn n_insert_text(src: *u8, sl: int) {
+    if (sl <= 0) { return; }
+    if (n_has_sel()) { let s = n_sel_s(); n_replace(s, n_sel_e() - s, src, sl, 0, s + sl); }
+    else { n_replace(ncur, 0, src, sl, 0, ncur + sl); }
+}
+fn n_enter() {
+    var b: u8[136];
+    b[0] = 10;
+    var k = 1;
+    let ps = imin(ncur, n_has_sel() ? n_sel_s() : ncur);
+    var i = n_lstart(ps);
+    while (i < ps && k < 130 && (nbuf[i] == ' ' || nbuf[i] == 9)) { b[k] = nbuf[i]; k++; i++; }
+    n_insert_text(&b[0], k);
+}
+fn n_backspace(word: bool) {
+    if (n_has_sel()) { let s = n_sel_s(); n_replace(s, n_sel_e() - s, nbuf, 0, 0, s); return; }
+    if (ncur <= 0) { return; }
+    if (word) { let p = n_word_left(ncur); n_replace(p, ncur - p, nbuf, 0, 0, p); return; }
+    n_replace(ncur - 1, 1, nbuf, 0, 2, ncur - 1);
+}
+fn n_delete(word: bool) {
+    if (n_has_sel()) { let s = n_sel_s(); n_replace(s, n_sel_e() - s, nbuf, 0, 0, s); return; }
+    if (ncur >= nlen) { return; }
+    if (word) { let p = n_word_right(ncur); n_replace(ncur, p - ncur, nbuf, 0, 0, ncur); return; }
+    n_replace(ncur, 1, nbuf, 0, 3, ncur);
+}
+
+/// move the caret (extend = keep/begin a selection)
+fn n_goto(p: int, extend: bool, keep_pref: bool) {
+    if (extend) { if (nanc < 0) { nanc = ncur; } } else { nanc = -1; }
+    ncur = imax(0, imin(p, nlen));
+    n_reveal();
+    if (!keep_pref) { n_locate(ncur); n_pref = n_vcol(n_row_start(n_cl, n_cs), ncur); }
+    ui_inval_all(APP_NOTES);
+}
+fn n_vmove(dir: int, count: int, extend: bool) {
+    n_locate(ncur);
+    npg_l = n_cl; npg_s = n_cs;
+    var moved = 0;
+    while (moved < count && n_step(dir)) { moved++; }
+    if (moved == 0) { if (dir < 0) { n_goto(0, extend, false); } else { n_goto(nlen, extend, false); } return; }
+    let p = n_row_start(npg_l, npg_s);
+    let e = n_lend(npg_l);
+    var q = e;
+    if (n_wrap) { q = n_row_end(p, e, n_wcols()); }
+    n_goto(n_at_vcol(p, q, n_pref, q >= e), extend, true);
+}
+fn n_scroll_rows(r: int) {
+    npg_l = n_top; npg_s = n_sub;
+    var i = 0;
+    var d = 1;
+    var n = r;
+    if (r < 0) { d = -1; n = -r; }
+    while (i < n && n_step(d)) { i++; }
+    n_top = npg_l; n_sub = npg_s;
+    ui_inval_all(APP_NOTES);
+}
+
+/// first and last line touched by the selection (a selection that ends at column 0 does not include that line)
+fn n_sel_lines(first: *int, last: *int) {
+    var s = ncur; var e = ncur;
+    if (n_has_sel()) { s = n_sel_s(); e = n_sel_e(); if (e > s && nbuf[e - 1] == 10) { e--; } }
+    first[0] = n_line_of(s); last[0] = n_line_of(e);
+}
+fn n_indent(out: bool) {
+    var fl: int[1]; var ll: int[1];
+    n_sel_lines(&fl[0], &ll[0]);
+    let a = nl_st[fl[0]]; let b = n_lend(ll[0]);
+    let nlines = ll[0] - fl[0] + 1;
+    let tmp = kmalloc((b - a) + nlines * 4 + 8);
+    if (tmp == (0 as *u8)) { return; }
+    var o = 0; var l = fl[0];
+    while (l <= ll[0]) {
+        var p = nl_st[l]; let e = n_lend(l);
+        if (!out) { var k = 0; while (k < 4) { tmp[o] = ' '; o++; k++; } }
+        else {
+            if (p < e && nbuf[p] == 9) { p++; }
+            else { var k = 0; while (k < 4 && p < e && nbuf[p] == ' ') { p++; k++; } }
+        }
+        while (p < e) { tmp[o] = nbuf[p]; o++; p++; }
+        if (l < ll[0]) { tmp[o] = 10; o++; }
+        l++;
+    }
+    let had = n_has_sel();
+    if (n_replace(a, b - a, tmp, o, 0, a + o)) { nanc = a; }
+    kfree(tmp);
+    ui_inval_all(APP_NOTES);
+}
+fn n_dup() {
+    if (n_has_sel()) {
+        let s = n_sel_s(); let e = n_sel_e();
+        let tmp = kmalloc(e - s + 8);
+        if (tmp == (0 as *u8)) { return; }
+        kmemmove(tmp, nbuf + s, e - s);
+        n_replace(e, 0, tmp, e - s, 0, e + (e - s));
+        nanc = e;
+        kfree(tmp);
+        return;
+    }
+    let l = n_line_of(ncur); let s = nl_st[l]; let e = n_lend(l);
+    let col = ncur - s;
+    let tmp = kmalloc(e - s + 8);
+    if (tmp == (0 as *u8)) { return; }
+    tmp[0] = 10; kmemmove(tmp + 1, nbuf + s, e - s);
+    n_replace(e, 0, tmp, e - s + 1, 0, e + 1 + col);
+    kfree(tmp);
+}
+fn n_delline() {
+    var fl: int[1]; var ll: int[1];
+    n_sel_lines(&fl[0], &ll[0]);
+    var a = nl_st[fl[0]]; var b = n_lend(ll[0]);
+    if (b < nlen) { b++; } else if (a > 0) { a--; }
+    n_replace(a, b - a, nbuf, 0, 0, a);
+}
+fn n_moveline(dir: int) {
+    var fl: int[1]; var ll: int[1];
+    n_sel_lines(&fl[0], &ll[0]);
+    let f = fl[0]; let l = ll[0];
+    var o_first = f; var o_last = l;
+    if (dir < 0) { if (f == 0) { return; } o_first = f - 1; o_last = l; }
+    else { if (l + 1 >= nl_n) { return; } o_first = f; o_last = l + 1; }
+    let a = nl_st[o_first]; let b = n_lend(o_last);
+    let tmp = kmalloc((b - a) + 8);
+    if (tmp == (0 as *u8)) { return; }
+    var o = 0;
+    // block = lines f..l ; neighbour = the other line
+    var bs = nl_st[f]; var be = n_lend(l);
+    var ns = 0; var ne = 0;
+    if (dir < 0) { ns = nl_st[f - 1]; ne = n_lend(f - 1); } else { ns = nl_st[l + 1]; ne = n_lend(l + 1); }
+    var i = 0;
+    if (dir < 0) {
+        i = bs; while (i < be) { tmp[o] = nbuf[i]; o++; i++; }
+        tmp[o] = 10; o++;
+        i = ns; while (i < ne) { tmp[o] = nbuf[i]; o++; i++; }
+    } else {
+        i = ns; while (i < ne) { tmp[o] = nbuf[i]; o++; i++; }
+        tmp[o] = 10; o++;
+        i = bs; while (i < be) { tmp[o] = nbuf[i]; o++; i++; }
+    }
+    let shift = (dir < 0) ? (0 - (ne - ns + 1)) : (ne - ns + 1);
+    let had = n_has_sel(); let sa = nanc; let cc = ncur;
+    n_replace(a, b - a, tmp, o, 0, cc + shift);
+    if (had) { nanc = sa + shift; }
+    kfree(tmp);
+}
+
+// ================================================================= find / replace / go to
+fn n_match(i: int) -> bool {
+    let fl = n_flen(&n_f1[0]);
+    if (fl == 0 || i + fl > nlen) { return false; }
+    var k = 0;
+    while (k < fl) {
+        var a = nbuf[i + k] as int; var b = n_f1[k] as int;
+        if (!n_case) { a = n_lc(a); b = n_lc(b); }
+        if (a != b) { return false; }
+        k++;
+    }
+    return true;
+}
+/// select the next match of the find field after `from` (dir > 0) or before it; wraps around
+fn n_find(dir: int, fr0: int) -> bool {
+    let fl = n_flen(&n_f1[0]);
+    if (fl == 0) { return false; }
+    var wrapped = false;
+    var found = -1;
+    if (dir > 0) {
+        var i = fr0;
+        while (i + fl <= nlen) { if (n_match(i)) { found = i; break; } i++; }
+        if (found < 0) { wrapped = true; i = 0; while (i + fl <= nlen && i < fr0 + fl) { if (n_match(i)) { found = i; break; } i++; } }
+    } else {
+        var i = fr0 - 1;
+        while (i >= 0) { if (n_match(i)) { found = i; break; } i--; }
+        if (found < 0) { wrapped = true; i = nlen - fl; while (i >= fr0) { if (n_match(i)) { found = i; break; } i--; } }
+    }
+    if (found < 0) { n_set_status("no match"); return false; }
+    nanc = found; ncur = found + fl;
+    if (wrapped) { n_set_status("wrapped around"); }
+    n_reveal();
+    ui_inval_all(APP_NOTES);
+    return true;
+}
+fn n_find_next(dir: int) {
+    var fr0 = ncur;
+    if (n_has_sel()) { if (dir > 0) { fr0 = n_sel_e(); } else { fr0 = n_sel_s(); } }
+    n_find(dir, fr0);
+}
+fn n_fkey() -> int {
+    var h = n_case ? 7 : 3; var i = 0;
+    while (n_f1[i] != 0) { h = (h * 31 + (n_f1[i] as int)) & 0xFFFFFFF; i++; }
+    return h;
+}
+/// match count and the ordinal of the selected match (cached until the text, the pattern or the selection changes)
+fn n_fc_update() {
+    let key = n_fkey();
+    let ss = n_has_sel() ? n_sel_s() : (0 - 2);
+    if (n_fc_gen == n_gen && n_fc_key == key && n_fc_sel == ss) { return; }
+    n_fc_gen = n_gen; n_fc_key = key; n_fc_sel = ss; n_fc_n = 0; n_fc_i = 0;
+    let fl = n_flen(&n_f1[0]);
+    if (fl == 0) { return; }
+    var i = 0;
+    while (i + fl <= nlen) {
+        if (n_match(i)) { n_fc_n++; if (i == ss) { n_fc_i = n_fc_n; } i += fl; } else { i++; }
+    }
+}
+fn n_replace_one() {
+    let fl = n_flen(&n_f1[0]); let rl = n_flen(&n_f2[0]);
+    if (fl == 0) { return; }
+    if (n_has_sel() && n_sel_e() - n_sel_s() == fl && n_match(n_sel_s())) {
+        let s = n_sel_s();
+        if (!n_replace(s, fl, &n_f2[0], rl, 0, s + rl)) { return; }
+    }
+    n_find(1, ncur);
+}
+fn n_replace_all() {
+    let fl = n_flen(&n_f1[0]); let rl = n_flen(&n_f2[0]);
+    if (fl == 0) { return; }
+    var first = -1; var last = -1; var cnt = 0;
+    var i = 0;
+    while (i + fl <= nlen) { if (n_match(i)) { if (first < 0) { first = i; } last = i + fl; cnt++; i += fl; } else { i++; } }
+    if (cnt == 0) { n_set_status("no match"); return; }
+    let tmp = kmalloc((last - first) + cnt * (rl + 1) + 8);
+    if (tmp == (0 as *u8)) { n_set_status("out of memory"); return; }
+    var o = 0; i = first;
+    while (i < last) {
+        if (n_match(i)) { var k = 0; while (k < rl) { tmp[o] = n_f2[k]; o++; k++; } i += fl; }
+        else { tmp[o] = nbuf[i]; o++; i++; }
+    }
+    if (n_replace(first, last - first, tmp, o, 0, first + o)) {
+        var m: u8[40]; kstrncpy(&m[0], "replaced ", 40);
+        var q = 9; var v = cnt; var dg: u8[12]; var nd = 0;
+        while (v > 0) { dg[nd] = (48 + v % 10) as u8; v = v / 10; nd++; }
+        while (nd > 0 && q < 38) { nd--; m[q] = dg[nd]; q++; }
+        m[q] = 0; n_set_status(&m[0]);
+    }
+    kfree(tmp);
+}
+fn n_goto_line(v: int) {
+    var l = v - 1;
+    if (l < 0) { l = 0; }
+    if (l >= nl_n) { l = nl_n - 1; }
+    n_goto(nl_st[l], false, false);
+}
+
+// ================================================================= files
+fn n_rec_clear() { let r = fs_resolve("/home/.notes-recovery"); if (r >= 0) { fs_remove(r); } }
+fn n_rec_write() {
+    let pl = kstrlen(&n_path[0]);
+    let tmp = kmalloc(nlen + pl + 8);
+    if (tmp == (0 as *u8)) { return; }
+    kmemmove(tmp, &n_path[0], pl); tmp[pl] = 10;
+    kmemmove(tmp + pl + 1, nbuf, nlen);
+    var r = fs_resolve("/home/.notes-recovery");
+    if (r < 0) { r = fs_create("/home/.notes-recovery", K_FILE); }
+    if (r >= 0) { fs_nodes[r].attr = fs_nodes[r].attr | FA_HIDDEN; fs_write(r, tmp, nlen + pl + 1, false); fs_save(); }
+    kfree(tmp);
+}
+fn n_reset_doc() {
+    nlen = 0; ncur = 0; nanc = -1; n_top = 0; n_sub = 0; n_hx = 0; n_pref = 0;
+    n_j_reset(); n_dirty = false; n_ro = false; n_crlf = false; n_bin = false; n_mode = 0; n_pend = 0;
+    nl_n = 1; nl_st[0] = 0; n_gen++; n_as_gen = -1;
+}
+fn n_load() {
+    if (!n_alloc()) { n_set_status("out of memory"); return; }
+    n_reset_doc();
+    var st = "new file - Ctrl+S saves";
+    let n = fs_resolve(&n_path[0]);
+    if (n >= 0 && fs_nodes[n].kind == K_FILE) {
+        let sz = fs_nodes[n].size;
+        let d = fs_nodes[n].data;
+        var i = 0; var o = 0; var nls = 0; var cut = false;
+        while (i < sz) {
+            var c = d[i] as int;
+            if (c == 0) { n_bin = true; }
+            if (c == 13 && i + 1 < sz && d[i + 1] == 10) { n_crlf = true; i++; continue; }
+            if (o >= NMAX || (c == 10 && nls >= NLMAX - 2)) { cut = true; break; }
+            if (c == 10) { nls++; }
+            nbuf[o] = c as u8; o++; i++;
+        }
+        nlen = o;
+        n_rebuild();
+        st = "loaded";
+        if ((fs_nodes[n].attr & FA_RO) != 0) { n_ro = true; st = "read-only file"; }
+        if (cut) { n_ro = true; st = "file too large: shown truncated and read-only"; }
+        if (n_bin) { n_ro = true; st = "binary file: read-only"; }
+    }
+    n_set_status(st);
+    n_save_mark = 0; n_title_dirty = false;
+}
+fn n_save() -> bool {
+    if (n_ro) { n_set_status("read-only: use Save as"); return false; }
+    var n = fs_resolve(&n_path[0]);
+    if (n < 0) { n = fs_create(&n_path[0], K_FILE); }
+    if (n < 0) { n_set_status("cannot create the file"); return false; }
+    var ok = false;
+    var bytes = nlen;
+    if (n_crlf) {
+        let tmp = kmalloc(nlen * 2 + 8);
+        if (tmp == (0 as *u8)) { n_set_status("out of memory"); return false; }
+        var i = 0; var o = 0;
+        while (i < nlen) { if (nbuf[i] == 10) { tmp[o] = 13; o++; } tmp[o] = nbuf[i]; o++; i++; }
+        ok = fs_write(n, tmp, o, false); bytes = o;
+        kfree(tmp);
+    } else { ok = fs_write(n, nbuf, nlen, false); }
+    if (!ok) { n_set_status("save failed (read-only or disk full)"); return false; }
+    fs_save();
+    n_save_mark = u_cur; n_dirty = false; n_rec_clear();
+    var m: u8[40]; kstrncpy(&m[0], "saved ", 40);
+    var q = 6; var v = bytes; var dg: u8[12]; var nd = 0;
+    if (v == 0) { dg[0] = '0'; nd = 1; }
+    while (v > 0) { dg[nd] = (48 + v % 10) as u8; v = v / 10; nd++; }
+    while (nd > 0 && q < 30) { nd--; m[q] = dg[nd]; q++; }
+    kstrncpy(&m[q], " bytes", 40 - q);
+    n_set_status(&m[0]);
+    n_title();
+    ui_inval_all(APP_NOTES);
+    return true;
+}
+fn n_norm_path(src: *u8, out: *u8) {
+    var o = 0;
+    if (src[0] != '/') { kstrncpy(out, "/home/", 128); o = 6; }
+    var i = 0;
+    while (src[i] != 0 && o < 127) { out[o] = src[i]; o++; i++; }
+    out[o] = 0;
+}
+fn n_open_path(p: *u8) {
+    var np: u8[128];
+    n_norm_path(p, &np[0]);
+    let n = fs_resolve(&np[0]);
+    if (n >= 0 && fs_nodes[n].kind != K_FILE) { n_set_status("that is a folder, not a file"); return; }
+    kstrncpy(&n_path[0], &np[0], 128);
+    n_load(); n_title();
+    ui_inval_all(APP_NOTES);
+}
+fn n_save_as(p: *u8) -> bool {
+    var np: u8[128];
+    n_norm_path(p, &np[0]);
+    if (np[kstrlen(&np[0]) - 1] == '/') { n_set_status("enter a file name"); return false; }
+    let ex = fs_resolve(&np[0]);
+    if (ex >= 0 && fs_nodes[ex].kind != K_FILE) { n_set_status("that is a folder"); return false; }
+    if (ex >= 0 && !kstreq(&np[0], &n_path[0]) && !n_ovw_armed) { n_ovw_armed = true; n_set_status("file exists - press Enter again to overwrite"); return false; }
+    if (ex >= 0 && (fs_nodes[ex].attr & FA_RO) != 0) { n_set_status("target is read-only"); return false; }
+    var oldp: u8[128]; kstrncpy(&oldp[0], &n_path[0], 128);
+    let was_ro = n_ro;
+    kstrncpy(&n_path[0], &np[0], 128);
+    n_ro = false;
+    if (!n_save()) { kstrncpy(&n_path[0], &oldp[0], 128); n_ro = was_ro; return false; }
+    if (n_bin) { n_ro = true; }
+    n_title();
+    return true;
+}
+fn n_new_doc() {
+    var k = 1; var cand: u8[40];
+    while (k < 100) {
+        kstrncpy(&cand[0], "/home/untitled", 40);
+        var q = 14;
+        if (k > 1) { cand[q] = '-'; q++; if (k >= 10) { cand[q] = (48 + k / 10) as u8; q++; } cand[q] = (48 + k % 10) as u8; q++; }
+        kstrncpy(&cand[q], ".txt", 40 - q);
+        if (fs_resolve(&cand[0]) < 0) { break; }
+        k++;
+    }
+    kstrncpy(&n_path[0], &cand[0], 128);
+    n_reset_doc(); n_save_mark = 0; n_title_dirty = false;
+    n_set_status("new file - Ctrl+S saves");
+    n_title();
+    ui_inval_all(APP_NOTES);
+}
+fn n_do_pending() {
+    let a = n_pend; n_pend = 0; n_mode = 0;
+    if (a == 1) { n_new_doc(); }
+    else if (a == 2) { n_open_path(&n_pend_path[0]); }
+    else if (a == 3) { let wi = win_of_kind(APP_NOTES); if (wi >= 0) { win_close(wi); } }
+}
+/// begin an action that would drop unsaved changes: confirm first
+fn n_guard(action: int) {
+    if (!n_dirty) { n_pend = action; n_do_pending(); return; }
+    n_pend = action; n_mode = 6;
+    ui_inval_all(APP_NOTES);
+}
+fn n_confirm(yes: int) {          // 1 save, 0 discard, -1 cancel
+    if (yes < 0) { n_pend = 0; n_mode = 0; ui_inval_all(APP_NOTES); return; }
+    if (yes == 1) { if (!n_save()) { n_mode = 0; n_pend = 0; return; } }
+    else { n_dirty = false; n_rec_clear(); }
+    n_do_pending();
+}
+/// called by ui.kc before the Notes window closes; false = keep it open (a confirm bar is shown)
+fn np_close_ok() -> bool {
+    if (!n_dirty || nbuf == (0 as *u8)) { return true; }
+    n_pend = 3; n_mode = 6;
+    ui_inval_all(APP_NOTES);
+    return false;
+}
+/// open any file (absolute path) in Notes, asking about unsaved changes first
+fn n_open(path: *u8) {
+    if (nbuf != (0 as *u8) && n_dirty) { kstrncpy(&n_pend_path[0], path, 128); n_pend = 2; n_mode = 6; ui_inval_all(APP_NOTES); return; }
+    kstrncpy(&n_path[0], path, 128);
+    n_load(); n_title();
+    ui_inval_all(APP_NOTES);
+}
+fn notes_init() {
+    if (!n_alloc()) { return; }
+    n_pref = 0;
+    if (n_path[0] == 0) { kstrncpy(&n_path[0], "/home/notes.txt", 128); }
+    n_load();
+    // crash recovery
+    let r = fs_resolve("/home/.notes-recovery");
+    if (r >= 0 && fs_nodes[r].kind == K_FILE && fs_nodes[r].size > 1 && fs_nodes[r].data[0] == '/') {
+        let d = fs_nodes[r].data; let sz = fs_nodes[r].size;
+        var i = 0;
+        while (i < sz && d[i] != 10 && i < 127) { n_path[i] = d[i]; i++; }
+        n_path[i] = 0;
+        if (i < sz) { i++; }
+        n_reset_doc();
+        var o = 0;
+        while (i < sz && o < NMAX) { nbuf[o] = d[i]; o++; i++; }
+        nlen = o; n_rebuild();
+        n_save_mark = -1; n_dirty = true;
+        n_set_status("recovered unsaved changes from last session - Ctrl+S to keep");
+    }
+    n_title_dirty = !n_dirty;
+}
+
+// ================================================================= prompt bar (find / replace / go to / open / save as / confirm)
+fn n_fld() -> *u8 { if (n_mode >= 3) { return &n_f3[0]; } if (n_ff == 1) { return &n_f2[0]; } return &n_f1[0]; }
+fn n_prompt_open(m: int) {
+    n_mode = m; n_ff = 0; n_ovw_armed = false;
+    n_f2[0] = 0;
+    if (m == 3) { n_f3[0] = 0; }
+    else if (m == 4 || m == 5) { kstrncpy(&n_f3[0], &n_path[0], 128); }
+    else {
+        if (n_has_sel() && n_sel_e() - n_sel_s() < 100 && !n_has_nl(nbuf + n_sel_s(), n_sel_e() - n_sel_s())) {
+            let s = n_sel_s(); let l = n_sel_e() - s;
+            kmemmove(&n_f1[0], nbuf + s, l); n_f1[l] = 0;
+        }
+    }
+    n_geom(npg_w, npg_h);
+    n_reveal();
+    ui_inval_all(APP_NOTES);
+}
+fn n_prompt_close() { n_mode = 0; n_geom(npg_w, npg_h); n_reveal(); ui_inval_all(APP_NOTES); }
+/// edit the focused field; returns true when the text changed
+fn n_fld_key(k: int) -> bool {
+    let f = n_fld();
+    let l = kstrlen(f);
+    if (k == 8) { if (l > 0) { f[l - 1] = 0; return true; } return false; }
+    if (k >= 32 && k < 127 && l < 120) { f[l] = k as u8; f[l + 1] = 0; return true; }
+    if (k == 22 && clip_len > 0) {                               // Ctrl+V: first line of the clipboard
+        var i = 0; var o = l;
+        while (i < clip_len && clip_buf[i] != 10 && clip_buf[i] != 13 && o < 120) { f[o] = clip_buf[i]; o++; i++; }
+        f[o] = 0;
+        return o != l;
+    }
+    return false;
+}
+fn n_prompt_key(k: int) {
+    if (k == 27) { n_prompt_close(); return; }
+    if (k == 10) {
+        if (n_mode == 1 || n_mode == 2) {
+            if (n_mode == 2 && n_ff == 1) { n_replace_one(); } else { n_find_next(kb_shift ? -1 : 1); }
+        }
+        else if (n_mode == 3) { var v = 0; var i = 0; while (n_f3[i] >= '0' && n_f3[i] <= '9') { v = v * 10 + (n_f3[i] as int) - 48; i++; } n_prompt_close(); n_goto_line(v); }
+        else if (n_mode == 4) {
+            kstrncpy(&n_pend_path[0], &n_f3[0], 128);
+            n_prompt_close();
+            if (n_pend_path[0] != 0) { n_guard(2); }
+        }
+        else if (n_mode == 5) { if (n_save_as(&n_f3[0])) { n_prompt_close(); } else { ui_inval_all(APP_NOTES); } }
+        ui_inval_all(APP_NOTES);
+        return;
+    }
+    if (k == 9 && n_mode == 2) { n_ff = 1 - n_ff; ui_inval_all(APP_NOTES); return; }
+    if (n_fld_key(k)) {
+        n_ovw_armed = false;
+        if ((n_mode == 1 || n_mode == 2) && n_ff == 0) { n_find(1, n_has_sel() ? n_sel_s() : ncur); n_gen++; }
+        ui_inval_all(APP_NOTES);
+    }
+}
+
+// ================================================================= keyboard
+fn n_cmd_cut() { if (cb_copy_sel()) { if (n_has_sel()) { n_backspace(false); } else { n_delline(); } n_set_status("cut"); } }
+fn n_cmd_copy() { if (cb_copy_sel()) { if (n_has_sel()) { n_set_status("copied"); } else { n_set_status("copied line"); } } }
+fn n_cmd_paste() {
+    if (clip_len <= 0) { n_set_status("clipboard is empty"); return; }
+    n_insert_text(clip_buf, clip_len);
+}
+fn n_tab_key() {
+    if (kb_shift) { n_indent(true); return; }
+    if (n_has_sel()) {
+        let s = n_sel_s(); let e = n_sel_e();
+        if (n_has_nl(nbuf + s, e - s)) { n_indent(false); return; }
+    }
+    let col = n_vcol(n_lstart(ncur), ncur);
+    let sp = 4 - (col & 3);
+    var b: u8[8]; var i = 0;
+    while (i < sp) { b[i] = ' '; i++; }
+    n_insert_text(&b[0], sp);
+}
+fn n_toggle_wrap() { n_wrap = !n_wrap; n_hx = 0; n_sub = 0; n_reveal(); if (n_wrap) { n_set_status("word wrap on"); } else { n_set_status("word wrap off"); } ui_inval_all(APP_NOTES); }
+fn n_toggle_lines() { n_lnums = !n_lnums; n_geom(npg_w, npg_h); n_reveal(); ui_inval_all(APP_NOTES); }
+
+fn notes_key(k: int) {
+    if (nbuf == (0 as *u8)) { return; }
+    let shift = kb_shift; let ctrl = kb_ctrl; let alt = kb_alt;
+    n_status[0] = 0;
+    if (n_mode == 6) {
+        if (k == 'y' || k == 'Y' || k == 10) { n_confirm(1); }
+        else if (k == 'n' || k == 'N') { n_confirm(0); }
+        else if (k == 27) { n_confirm(-1); }
+        return;
+    }
+    // shortcuts that work everywhere (Ctrl+letter arrives as a control code)
+    if (k == 19) { if (shift) { n_prompt_open(5); } else { n_save(); } return; }
+    if (k == 6) { n_prompt_open(1); return; }
+    if (k == 18) { n_prompt_open(2); return; }
+    if (k == 7) { n_prompt_open(3); return; }
+    if (k == 15) { n_prompt_open(4); return; }
+    if (k == 14) { n_guard(1); return; }
+    if (k == 23) { n_toggle_wrap(); return; }
+    if (k == 12) { n_toggle_lines(); return; }
+    if (n_mode != 0) { n_prompt_key(k); return; }
+    if (k == 1) { nanc = 0; ncur = nlen; n_reveal(); ui_inval_all(APP_NOTES); return; }
+    if (k == 3) { n_cmd_copy(); ui_inval_all(APP_NOTES); return; }
+    if (k == 24) { n_cmd_cut(); return; }
+    if (k == 22) { n_cmd_paste(); return; }
+    if (k == 26) { n_undo(); return; }
+    if (k == 25) { n_redo(); return; }
+    if (k == 4) { n_dup(); return; }
+    if (k == 11) { n_delline(); return; }
+    if (k == 27) { nanc = -1; ui_inval_all(APP_NOTES); return; }
+    if (k == 10) { n_enter(); return; }
+    if (k == 8) { n_backspace(ctrl); return; }
+    if (k == KEY_DEL) { n_delete(ctrl); return; }
+    if (k == 9) { n_tab_key(); return; }
+    if (k == KEY_LEFT) {
+        if (n_has_sel() && !shift) { n_goto(n_sel_s(), false, false); }
+        else { n_goto(ctrl ? n_word_left(ncur) : ncur - 1, shift, false); }
+        return;
+    }
+    if (k == KEY_RIGHT) {
+        if (n_has_sel() && !shift) { n_goto(n_sel_e(), false, false); }
+        else { n_goto(ctrl ? n_word_right(ncur) : ncur + 1, shift, false); }
+        return;
+    }
+    if (k == KEY_UP) { if (alt) { n_moveline(-1); } else if (ctrl) { n_scroll_rows(-1); } else { n_vmove(-1, 1, shift); } return; }
+    if (k == KEY_DOWN) { if (alt) { n_moveline(1); } else if (ctrl) { n_scroll_rows(1); } else { n_vmove(1, 1, shift); } return; }
+    if (k == KEY_PGUP) { n_vmove(-1, imax(1, npg_rows - 1), shift); return; }
+    if (k == KEY_PGDN) { n_vmove(1, imax(1, npg_rows - 1), shift); return; }
+    if (k == KEY_HOME) {
+        if (ctrl) { n_goto(0, shift, false); return; }
+        let ls = n_lstart(ncur);
+        var fnb = ls;
+        while (fnb < nlen && (nbuf[fnb] == ' ' || nbuf[fnb] == 9)) { fnb++; }
+        if (fnb > n_lend(n_line_of(ncur))) { fnb = ls; }
+        n_goto(ncur != fnb ? fnb : ls, shift, false);
+        return;
+    }
+    if (k == KEY_END) {
+        if (ctrl) { n_goto(nlen, shift, false); return; }
+        n_goto(n_lend(n_line_of(ncur)), shift, false);
+        return;
+    }
+    if (k >= 32 && k < 127) { n_type(k); return; }
+}
+
+// ================================================================= toolbar geometry (shared by draw and mouse)
+const NP_NB = 14;
+fn np_blabel(i: int) -> *u8 {
+    if (i == 0) { return "New"; } if (i == 1) { return "Open"; } if (i == 2) { return "Save"; } if (i == 3) { return "Save as"; }
+    if (i == 4) { return "Undo"; } if (i == 5) { return "Redo"; }
+    if (i == 6) { return "Cut"; } if (i == 7) { return "Copy"; } if (i == 8) { return "Paste"; }
+    if (i == 9) { return "Find"; } if (i == 10) { return "Replace"; } if (i == 11) { return "Go to"; }
+    if (i == 12) { return "Wrap"; }
+    return "Lines";
+}
+fn np_bx(i: int) -> int {
+    var x = 6; var k = 0;
+    while (k < i) {
+        x += np_bw(k) + 4;
+        if (k == 3 || k == 5 || k == 8 || k == 11) { x += 8; }
+        k++;
+    }
+    return x;
+}
+fn np_bw(i: int) -> int {
+    if (lbl_glyph(np_blabel(i)) != 0) { return 34; }
+    return text_w(np_blabel(i)) + 16;
+}
+fn np_bhit(mx: int) -> int {
+    var i = 0;
+    while (i < NP_NB) { let x = np_bx(i); if (mx >= x && mx < x + np_bw(i)) { return i; } i++; }
+    return -1;
+}
+fn np_action(i: int) {
+    if (i == 0) { n_guard(1); }
+    else if (i == 1) { n_prompt_open(4); }
+    else if (i == 2) { n_save(); }
+    else if (i == 3) { n_prompt_open(5); }
+    else if (i == 4) { n_undo(); }
+    else if (i == 5) { n_redo(); }
+    else if (i == 6) { if (n_mode == 0) { n_cmd_cut(); } }
+    else if (i == 7) { n_cmd_copy(); ui_inval_all(APP_NOTES); }
+    else if (i == 8) { if (n_mode == 0) { n_cmd_paste(); } }
+    else if (i == 9) { n_prompt_open(1); }
+    else if (i == 10) { n_prompt_open(2); }
+    else if (i == 11) { n_prompt_open(3); }
+    else if (i == 12) { n_toggle_wrap(); }
+    else if (i == 13) { n_toggle_lines(); }
+}
+
+// prompt-bar buttons: index -> x / width (same for draw and hit-testing).  Find: 0 prev 1 next 2 case 3 close; Replace row: 4 replace 5 all;
+// Confirm: 0 save 1 don't save 2 cancel.
+fn np_pbx(i: int) -> int {
+    if (n_mode == 6) { return 300 + i * 110; }
+    if (i == 0) { return 408; } if (i == 1) { return 442; } if (i == 2) { return 476; } if (i == 3) { return 514; }
+    if (i == 4) { return 408; }
+    return 482;
+}
+fn np_pbw(i: int) -> int {
+    if (n_mode == 6) { return 104; }
+    if (i == 2) { return 34; } if (i == 3) { return 26; } if (i == 4) { return 70; } if (i == 5) { return 40; }
+    return 30;
+}
+fn np_pbhit(mx: int, my: int) -> int {          // my relative to the bar's top
+    var i = 0;
+    var n = 0;
+    if (n_mode == 6) { n = 3; } else if (n_mode == 1) { n = 4; } else if (n_mode == 2) { n = 6; }
+    while (i < n) {
+        var by = 3;
+        if (i >= 4 && n_mode == 2) { by = 31; }
+        if (mx >= np_pbx(i) && mx < np_pbx(i) + np_pbw(i) && my >= by && my < by + 24) { return i; }
+        i++;
+    }
+    return -1;
+}
+fn np_pbaction(i: int) {
+    if (n_mode == 6) { if (i == 0) { n_confirm(1); } else if (i == 1) { n_confirm(0); } else { n_confirm(-1); } return; }
+    if (i == 0) { n_find_next(-1); } else if (i == 1) { n_find_next(1); }
+    else if (i == 2) { n_case = !n_case; n_gen++; ui_inval_all(APP_NOTES); }
+    else if (i == 3) { n_prompt_close(); }
+    else if (i == 4) { n_replace_one(); } else if (i == 5) { n_replace_all(); }
+}
+
+// ================================================================= mouse
+fn n_hit(mx: int, my: int) -> int {
+    var r = (my - NP_TB - 2) / 16;
+    if (my - NP_TB - 2 < 0) { r = 0; }
+    npg_l = n_top; npg_s = n_sub;
+    var i = 0;
+    while (i < r) { if (!n_step(1)) { break; } i++; }
+    let p = n_row_start(npg_l, npg_s);
+    let e = n_lend(npg_l);
+    var q = e;
+    if (n_wrap) { q = n_row_end(p, e, n_wcols()); }
+    var v = (mx - npg_x0) / 8;
+    if (mx < npg_x0) { v = 0; }
+    return n_at_vcol(p, q, v + n_hx, q >= e);
+}
+fn n_sb_set(my: int) {
+    let th = imax(20, npg_eh * npg_rows / (nl_n + npg_rows));
+    let span = imax(1, npg_eh - th);
+    var t = (my - NP_TB - th / 2) * nl_n / span;
+    t = imax(0, imin(t, nl_n - 1));
+    n_top = t; n_sub = 0;
+    ui_inval_all(APP_NOTES);
+}
+fn notes_mouse(mx: int, my: int, ev: int) {
+    if (nbuf == (0 as *u8)) { return; }
+    if (ev == 6) { n_scroll_rows(mouse_wheel * 3); return; }
+    if (ev == 3) { n_drag = false; n_sbdrag = false; return; }
+    if (ev == 2) {
+        if (n_sbdrag) { n_sb_set(my); return; }
+        if (n_drag) {
+            if (my < NP_TB + 2) { n_scroll_rows(-1); }
+            else if (my > NP_TB + npg_eh - 2) { n_scroll_rows(1); }
+            let p = n_hit(mx, imax(my, NP_TB + 2));
+            if (p != ncur) { ncur = p; n_reveal(); ui_inval_all(APP_NOTES); }
+        }
+        return;
+    }
+    if (ev != 1) { return; }
+    if (my < NP_TB) {
+        let b = np_bhit(mx);
+        if (b >= 0) { np_action(b); }
+        return;
+    }
+    if (my >= NP_TB + npg_eh && my < NP_TB + npg_eh + npg_bar) {                      // prompt bar
+        let by = my - (NP_TB + npg_eh);
+        let hb = np_pbhit(mx, by);
+        if (hb >= 0) { np_pbaction(hb); return; }
+        if (n_mode == 2 && by >= 28) { n_ff = 1; } else { n_ff = 0; }
+        ui_inval_all(APP_NOTES);
+        return;
+    }
+    if (my >= NP_TB + npg_eh) { return; }
+    if (n_mode == 6) { return; }
+    if (mx >= npg_w - 12) { n_sbdrag = true; n_sb_set(my); return; }
+    if (mx < npg_gw) {                                                            // gutter: select the line
+        let p = n_hit(npg_x0, my); let l = n_line_of(p);
+        nanc = nl_st[l]; ncur = imin(n_lend(l) + 1, nlen); n_reveal(); ui_inval_all(APP_NOTES);
+        return;
+    }
+    let p = n_hit(mx, my);
+    if (kb_shift) { if (nanc < 0) { nanc = ncur; } ncur = p; n_drag = true; n_reveal(); ui_inval_all(APP_NOTES); return; }
+    if (ticks - n_clk_t < 40 && iabs(p - n_clk_i) <= 1) { n_clk_n++; } else { n_clk_n = 1; }
+    n_clk_t = ticks; n_clk_i = p;
+    if (n_clk_n == 2) {
+        var s = p; var e = p;
+        if (p < nlen && n_wordc(nbuf[p] as int)) { while (s > 0 && n_wordc(nbuf[s - 1] as int)) { s--; } while (e < nlen && n_wordc(nbuf[e] as int)) { e++; } }
+        else { e = imin(p + 1, nlen); }
+        nanc = s; ncur = e;
+    } else if (n_clk_n >= 3) {
+        let l = n_line_of(p);
+        nanc = nl_st[l]; ncur = imin(n_lend(l) + 1, nlen); n_clk_n = 0;
+    } else { nanc = -1; ncur = p; n_drag = true; }
+    n_reveal();
+    n_locate(ncur); n_pref = n_vcol(n_row_start(n_cl, n_cs), ncur);
+    ui_inval_all(APP_NOTES);
+}
+
+fn notes_tick() -> bool {
+    var ch = false;
+    let b = blink_on();
+    if (b != n_blink) { n_blink = b; ch = true; }
+    if (n_dirty && n_gen != n_as_gen && ticks - n_as_t > 1000 && nbuf != (0 as *u8)) { n_rec_write(); n_as_t = ticks; n_as_gen = n_gen; }
+    if (n_status[0] != 0 && n_status_t != 0 && ticks - n_status_t > 700) { n_status[0] = 0; ch = true; }
+    return ch;
+}
+
+// ================================================================= drawing
+fn np_digits(v: int) -> int { var d = 1; var x = v; while (x >= 10) { d++; x = x / 10; } return d; }
+
+fn np_row(x: int, ry: int, l: int, s: int, foc: bool, fl: int) {
+    let p = n_row_start(l, s);
+    let e = n_lend(l);
+    var q = e;
+    if (n_wrap) { q = n_row_end(p, e, n_wcols()); }
+    let cols = npg_cols;
+    let tx = x + npg_x0;
+    let sel = n_has_sel();
+    if (!sel && l == n_cl && n_mode == 0) { fill(x + npg_gw, ry, npg_w - 12 - npg_gw, 16, 0xF4F8FF); }
+    if (sel) {
+        let ss = n_sel_s(); let se = n_sel_e();
+        let a = imax(p, ss); let b = imin(q, se);
+        var x1 = 0; var x2 = 0; var any = false;
+        if (a < b) { x1 = n_vcol(p, a) - n_hx; x2 = n_vcol(p, b) - n_hx; any = true; }
+        if (q == e && ss <= e && se > e) { if (!any) { x1 = n_vcol(p, e) - n_hx; x2 = x1; } x2 += 1; any = true; }
+        if (any) { x1 = imax(x1, 0); x2 = imin(x2, cols + 1); if (x2 > x1) { fill(tx + x1 * 8, ry, (x2 - x1) * 8, 16, 0xB7D3FF); } }
+    }
+    if (fl > 0) {
+        var i = p;
+        while (i + fl <= q) {
+            if (n_match(i)) {
+                var x1 = n_vcol(p, i) - n_hx; var x2 = n_vcol(p, i + fl) - n_hx;
+                x1 = imax(x1, 0); x2 = imin(x2, cols + 1);
+                if (x2 > x1 && !(sel && i == n_sel_s() && i + fl == n_sel_e())) { fill(tx + x1 * 8, ry, (x2 - x1) * 8, 16, 0xFFE98A); }
+                i += fl;
+            } else { i++; }
+        }
+    }
+    var vc = 0; var i = p;
+    while (i < q) {
+        let c = nbuf[i] as int;
+        let w = n_vw(c, vc);
+        let col = vc - n_hx;
+        if (col >= cols) { break; }
+        if (col >= 0 && c != 9 && c != 32) {
+            if (c < 32 || c >= 127) { draw_char(tx + col * 8, ry, '.', 0xB0B8C8); } else { draw_char(tx + col * 8, ry, c, C_INK); }
+        }
+        vc += w; i++;
+    }
+    if (foc && n_blink && n_mode == 0 && l == n_cl && s == n_cs) {
+        let cx = n_vcol(p, ncur) - n_hx;
+        if (cx >= 0 && cx <= cols) { fill(tx + cx * 8, ry, 2, 16, 0x1F4FA8); }
+    }
+    if (npg_gw > 0) {
+        if (s == 0) {
+            let dg = np_digits(l + 1);
+            draw_num(x + npg_gw - 10 - dg * 8, ry, l + 1, l == n_cl ? 0x1F4FA8 : 0x9AA3B8);
+        }
+    }
+}
+
+fn np_field(x: int, y: int, w: int, f: *u8, focused: bool, foc: bool) {
+    rfill(x, y, w, 22, 5, focused ? 0x4C7DD6 : 0xCBD2E0, false);
+    rfill(x + 1, y + 1, w - 2, 20, 4, 0xFFFFFF, false);
+    let n = kstrlen(f);
+    let maxc = (w - 12) / 8;
+    var st = 0;
+    if (n > maxc) { st = n - maxc; }
+    draw_text_n(x + 6, y + 3, f + st, maxc, C_INK);
+    if (focused && foc && n_blink) { fill(x + 6 + (n - st) * 8, y + 3, 2, 16, 0x1F4FA8); }
+}
+
+fn np_bar(x: int, y: int, w: int, foc: bool) {
+    fill(x, y, w, npg_bar, 0xF3F5FA);
+    hline(x, y, w, 0xDCE1EC);
+    if (n_mode == 6) {
+        var nm: u8[40]; var b = 0; var i = 0;
+        while (n_path[i] != 0) { if (n_path[i] == '/') { b = i + 1; } i++; }
+        kstrncpy(&nm[0], &n_path[b], 40);
+        let ex = draw_text(x + 10, y + 7, "Save changes to ", C_INK);
+        draw_text_n(ex, y + 7, &nm[0], 22, 0x1F4FA8);
+        a2_btn(x + np_pbx(0), y + 3, np_pbw(0), 24, "Save (Y)", 0xDCE6FA);
+        a2_btn(x + np_pbx(1), y + 3, np_pbw(1), 24, "Discard (N)", 0xFBE3E1);
+        a2_btn(x + np_pbx(2), y + 3, np_pbw(2), 24, "Cancel", 0xFFFFFF);
+        return;
+    }
+    var lab = "Find";
+    if (n_mode == 2) { lab = "Find"; } else if (n_mode == 3) { lab = "Go to line"; } else if (n_mode == 4) { lab = "Open"; } else if (n_mode == 5) { lab = "Save as"; }
+    draw_text(x + 10, y + 7, lab, 0x5B6784);
+    if (n_mode == 1 || n_mode == 2) {
+        np_field(x + 64, y + 4, 240, &n_f1[0], n_ff == 0, foc);
+        n_fc_update();
+        let fl = n_flen(&n_f1[0]);
+        if (fl > 0) {
+            if (n_fc_n == 0) { draw_text(x + 314, y + 7, "no matches", 0xB3261E); }
+            else { var e2 = draw_num(x + 314, y + 7, n_fc_i, 0x5B6784); e2 = draw_text(e2, y + 7, " of ", 0x5B6784); draw_num(e2, y + 7, n_fc_n, 0x5B6784); }
+        }
+        a2_btn(x + np_pbx(0), y + 3, 30, 24, "<", 0xFFFFFF);
+        a2_btn(x + np_pbx(1), y + 3, 30, 24, ">", 0xFFFFFF);
+        a2_btn(x + np_pbx(2), y + 3, 34, 24, "Aa", n_case ? 0xDCE6FA : 0xFFFFFF);
+        a2_btn(x + np_pbx(3), y + 3, 26, 24, "x", 0xFFFFFF);
+        if (n_mode == 2) {
+            draw_text(x + 10, y + 35, "Replace", 0x5B6784);
+            np_field(x + 64, y + 32, 240, &n_f2[0], n_ff == 1, foc);
+            a2_btn(x + np_pbx(4), y + 31, 70, 24, "Replace", 0xFFFFFF);
+            a2_btn(x + np_pbx(5), y + 31, 40, 24, "All", 0xFFFFFF);
+        }
+    } else {
+        let fw = imin(w - 200, 460);
+        np_field(x + 84, y + 4, fw, &n_f3[0], true, foc);
+        draw_text(x + 84 + fw + 10, y + 7, "Enter = ok   Esc = cancel", 0x8A97AD);
+    }
+}
+
+fn np_status(x: int, y: int, w: int) {
+    fill(x, y, w, NP_ST, 0xF8F9FC); hline(x, y, w, 0xE3E7F0);
+    let xr = imax(w - 360, w / 2);
+    if (n_status[0] != 0) { draw_text_n(x + 8, y + 3, &n_status[0], (xr - 16) / 8, n_ro ? 0xB3261E : 0x5B6784); }
+    else if (n_ro) { draw_text(x + 8, y + 3, "READ-ONLY", 0xB3261E); }
+    else { draw_text_n(x + 8, y + 3, &n_path[0], (xr - 16) / 8, 0x8A97AD); }
+    n_locate(ncur);
+    let ln = n_line_of(ncur);
+    var ex = draw_text(x + xr, y + 3, "Ln ", 0x5B6784);
+    ex = draw_num(ex, y + 3, ln + 1, 0x5B6784);
+    ex = draw_text(ex, y + 3, " Col ", 0x5B6784);
+    ex = draw_num(ex, y + 3, ncur - nl_st[ln] + 1, 0x5B6784);
+    if (n_has_sel()) { ex = draw_text(ex, y + 3, "  Sel ", 0x1F4FA8); ex = draw_num(ex, y + 3, n_sel_e() - n_sel_s(), 0x1F4FA8); }
+    ex = draw_text(ex, y + 3, "  ", 0x5B6784);
+    ex = draw_num(ex, y + 3, nlen, 0x5B6784);
+    if (n_crlf) { ex = draw_text(ex, y + 3, " B CRLF", 0x5B6784); } else { ex = draw_text(ex, y + 3, " B LF", 0x5B6784); }
+    if (n_wrap) { draw_text(ex, y + 3, " Wrap", 0x5B6784); }
+}
+
+fn notes_draw(x: int, y: int, w: int, h: int, foc: bool) {
+    fill(x, y, w, h, 0xFFFFFF);
+    if (nbuf == (0 as *u8)) { draw_text(x + 10, y + 10, "Notes: out of memory", 0xB3261E); return; }
+    let ow = npg_w; let oh = npg_h; let ob = npg_bar; let og = npg_gw;
+    n_geom(w, h);
+    if (ow != w || oh != h || ob != npg_bar || og != npg_gw) { n_reveal(); }
+    n_locate(ncur);
+    // toolbar
+    fill(x, y, w, NP_TB, 0xF8F9FC); hline(x, y + NP_TB - 1, w, 0xE3E7F0);
+    var i = 0;
+    while (i < NP_NB) {
+        let bx = np_bx(i);
+        if (bx + np_bw(i) > w - 4) { break; }
+        var col = 0xFFFFFF;
+        if (i == 4 && u_cur <= 0) { col = 0xE4E4E8; }
+        if (i == 5 && u_cur >= u_n) { col = 0xE4E4E8; }
+        if ((i == 6 || i == 7) && nlen == 0) { col = 0xE4E4E8; }
+        if (i == 12 && n_wrap) { col = 0xDCE6FA; }
+        if (i == 13 && n_lnums) { col = 0xDCE6FA; }
+        if (i == 2 && n_dirty) { col = 0xFBE3E1; }
+        a2_btn(x + bx, y + 3, np_bw(i), 24, np_blabel(i), col);
+        i++;
+    }
+    // text area
+    let ey = y + NP_TB;
+    if (npg_gw > 0) { fill(x, ey, npg_gw, npg_eh, 0xF4F6FA); vline(x + npg_gw, ey, npg_eh, 0xE3E7F0); }
+    var fl = 0;
+    if (n_mode == 1 || n_mode == 2) { fl = n_flen(&n_f1[0]); }
+    npg_l = n_top; npg_s = n_sub;
+    var r = 0;
+    while (r < npg_rows) {
+        let l = npg_l; let s = npg_s;
+        np_row(x, ey + 2 + r * 16, l, s, foc, fl);
+        npg_l = l; npg_s = s;
+        if (!n_step(1)) { break; }
+        r++;
+    }
+    if (nlen == 0 && !n_dirty && n_mode == 0) {
+        draw_text(x + npg_x0 + 24, ey + 40, "Start typing, or press Ctrl+O to open a file.", 0xB0B8C8);
+        draw_text(x + npg_x0 + 24, ey + 60, "Ctrl+F find   Ctrl+R replace   Ctrl+G go to line   Ctrl+Z undo", 0xB0B8C8);
+    }
+    // scrollbar
+    fill(x + w - 12, ey, 12, npg_eh, 0xF1F3F8);
+    let th = imax(20, npg_eh * npg_rows / (nl_n + npg_rows));
+    let ty = ey + (npg_eh - th) * n_top / imax(1, nl_n - 1);
+    rfill(x + w - 10, ty, 8, th, 4, n_sbdrag ? 0x8A97AD : 0xBDC5D6, false);
+    if (npg_bar > 0) { np_bar(x, ey + npg_eh, w, foc); }
+    np_status(x, y + h - NP_ST, w);
+}

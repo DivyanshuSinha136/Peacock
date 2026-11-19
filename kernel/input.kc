@@ -1,0 +1,62 @@
+// input.kc -- keyboard and mouse event queues (portable: filled by the PS/2 drivers in hw.kc, drained by the desktop).
+// Author: Divyanshu Sinha (MIT License)
+const KEY_UP = 0x101; const KEY_DOWN = 0x102; const KEY_LEFT = 0x103; const KEY_RIGHT = 0x104;
+const KEY_HOME = 0x105; const KEY_END = 0x106; const KEY_DEL = 0x107; const KEY_PGUP = 0x108; const KEY_PGDN = 0x109;
+
+var kb_buf: int[256];
+var kb_head = 0;
+var kb_tail = 0;
+
+fn kb_push(c: int) {
+    let next = (kb_head + 1) & 255;
+    if (next == kb_tail) { return; }
+    kb_buf[kb_head] = c;
+    kb_head = next;
+}
+
+/// next key or -1
+fn kb_get() -> int {
+    if (kb_head == kb_tail) { return -1; }
+    let c = kb_buf[kb_tail];
+    kb_tail = (kb_tail + 1) & 255;
+    return c;
+}
+
+// ---- mouse: absolute position (clamped to the screen) + a queue of (x, y, buttons) samples, one per packet
+var mouse_x = 0;
+var mouse_y = 0;
+var mouse_btn = 0;
+var mouse_wheel = 0;                      // accumulated wheel clicks (positive = scroll down); drained by ui_frame
+var mouse_w = 640;
+var mouse_h = 480;
+var mq: int[384];
+var mq_head = 0;
+var mq_tail = 0;
+
+fn mouse_set_bounds(w: int, h: int) { mouse_w = w; mouse_h = h; mouse_x = w / 2; mouse_y = h / 2; }
+
+fn mouse_push(dx: int, dy: int, btn: int) {
+    mouse_x = mouse_x + dx;
+    mouse_y = mouse_y + dy;
+    if (mouse_x < 0) { mouse_x = 0; }
+    if (mouse_y < 0) { mouse_y = 0; }
+    if (mouse_x > mouse_w - 1) { mouse_x = mouse_w - 1; }
+    if (mouse_y > mouse_h - 1) { mouse_y = mouse_h - 1; }
+    mouse_btn = btn;
+    let next = (mq_head + 1) % 128;
+    if (next == mq_tail) { return; }
+    mq[mq_head * 3] = mouse_x;
+    mq[mq_head * 3 + 1] = mouse_y;
+    mq[mq_head * 3 + 2] = btn;
+    mq_head = next;
+}
+
+/// pop one sample into out[0..2] = x y buttons; false when the queue is empty
+fn mouse_pop(out: *int) -> bool {
+    if (mq_head == mq_tail) { return false; }
+    out[0] = mq[mq_tail * 3];
+    out[1] = mq[mq_tail * 3 + 1];
+    out[2] = mq[mq_tail * 3 + 2];
+    mq_tail = (mq_tail + 1) % 128;
+    return true;
+}

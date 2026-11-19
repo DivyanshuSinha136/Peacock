@@ -1,0 +1,368 @@
+// modern.kc -- the modern desktop chrome: start menu with search and app grid, desktop context menu, toast notifications,
+// window fade-in, and the taskbar tray (network + date/time).  Author: Divyanshu Sinha (MIT License)
+//
+// State variables live in ui.kc (menu_*, ctx_*, toast_*, ...); drawing here follows the same rules as ui.kc: everything is drawn
+// clipped to the damage rectangle, and every state change adds the affected rectangle with dmg_add().
+
+// ================================================================= start menu
+fn menu_hmax() -> int { return SM_GRID + ((NMENU + SM_COLS - 1) / SM_COLS) * SM_CH + 8 + SM_FOOT; }
+
+fn menu_dmg() { dmg_add(menu_x() - 10, menu_y() - 10, MENU_W + 20, menu_h() + 20); }
+
+fn lc(c: int) -> int { if (c >= 'A' && c <= 'Z') { return c + 32; } return c; }
+
+/// does `hay` contain `needle` (case-insensitive)?
+fn ci_contains(hay: *u8, needle: *u8) -> bool {
+    let nl = kstrlen(needle);
+    if (nl == 0) { return true; }
+    var i = 0;
+    while (hay[i] != 0) {
+        var j = 0;
+        while (j < nl && hay[i + j] != 0 && lc(hay[i + j] as int) == lc(needle[j] as int)) { j++; }
+        if (j == nl) { return true; }
+        i++;
+    }
+    return false;
+}
+
+/// rebuild the list of apps that match the search text
+fn menu_filter() {
+    menu_n = 0;
+    var a = 0;
+    while (a < NAPPS) {
+        if (!app_hidden(a + 1) && ci_contains(app_name(a + 1), &menu_q[0])) { menu_list[menu_n] = a; menu_n++; }
+        a++;
+    }
+    if (menu_hover >= menu_n) { menu_hover = menu_n - 1; }
+}
+
+fn menu_show() {
+    menu_open = true; menu_hover = -1; menu_qn = 0; menu_q[0] = 0;
+    menu_filter();
+    menu_dmg(); taskbar_dmg();
+}
+
+fn menu_hide() {
+    menu_open = false;
+    menu_dmg(); taskbar_dmg();
+}
+
+/// code: >= 0 index into menu_list, -3 restart, -4 shut down
+fn menu_action(code: int) {
+    if (code >= 0 && code < menu_n) { app_open(menu_list[code] + 1); return; }
+    if (code == -3) { klog("restart"); fs_flush(); sys_reboot(); return; }
+    if (code == -4) { klog("shutdown"); fs_flush(); sys_poweroff(); return; }
+}
+
+fn menu_item_at(x: int, y: int) -> int {
+    let mx = menu_x(); let my = menu_y(); let h = menu_h();
+    if (x < mx || x >= mx + MENU_W || y < my || y >= my + h) { return -1; }
+    let fy = my + h - SM_FOOT;
+    if (y >= fy) {
+        let cy = fy + SM_FOOT / 2;
+        let dx = x - (mx + MENU_W - 72); let dy = y - cy;
+        if (dx * dx + dy * dy <= 17 * 17) { return -3; }
+        let dx2 = x - (mx + MENU_W - 34);
+        if (dx2 * dx2 + dy * dy <= 17 * 17) { return -4; }
+        return -1;
+    }
+    let gx = x - mx - SM_PAD; let gy = y - my - SM_GRID;
+    if (gx < 0 || gy < 0 || gx >= SM_COLS * SM_CW) { return -1; }
+    let k = (gy / SM_CH) * SM_COLS + gx / SM_CW;
+    if (k >= menu_n) { return -1; }
+    return k;
+}
+
+/// keyboard while the menu is open; true when the key was used
+fn menu_key(k: int) -> bool {
+    if (k == 27) { menu_hide(); return true; }
+    if (k == 10 || k == 13) {
+        var c = menu_hover;
+        if (c == -1 && menu_n > 0) { c = 0; }
+        menu_hide();
+        menu_action(c);
+        return true;
+    }
+    if (k == 8) {
+        if (menu_qn > 0) { menu_qn--; menu_q[menu_qn] = 0; menu_filter(); menu_hover = -1; menu_dmg(); }
+        return true;
+    }
+    if (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_UP || k == KEY_DOWN) {
+        if (menu_n == 0) { return true; }
+        var h = menu_hover;
+        if (h < 0) { h = 0; }
+        else if (k == KEY_LEFT) { h = h - 1; }
+        else if (k == KEY_RIGHT) { h = h + 1; }
+        else if (k == KEY_UP) { h = h - SM_COLS; }
+        else { h = h + SM_COLS; }
+        if (h < 0) { h = 0; }
+        if (h >= menu_n) { h = menu_n - 1; }
+        menu_hover = h; menu_dmg();
+        return true;
+    }
+    if (k >= 32 && k < 127 && menu_qn < 20) {
+        menu_q[menu_qn] = k as u8; menu_qn++; menu_q[menu_qn] = 0;
+        menu_filter(); menu_hover = -1; menu_dmg();
+        return true;
+    }
+    return true;
+}
+
+fn draw_menu() {
+    let x = menu_x(); let y = menu_y(); let w = MENU_W; let h = menu_h();
+    glass_grab(0, x + 1, y + 1, w - 2, h - 2);
+    soft_shadow(x, y, w, h);
+    rfill(x, y, w, h, 18, th_line, false);
+    glass_put(0, x + 1, y + 1, w - 2, h - 2, th_menu, 212, 17, false);
+    // search box
+    let sx = x + SM_PAD; let sy = y + 12; let sw = w - 2 * SM_PAD;
+    let boxc = mix(th_menu, 0xFFFFFF, 40);
+    rfill(sx, sy, sw, 34, 17, boxc, false);
+    svg_tint(G_SEARCH, sx + 11, sy + 8, 18, 0xC8D0E4, 256);
+    if (menu_qn > 0) {
+        draw_text(sx + 40, sy + 9, &menu_q[0], 0xFFFFFF);
+        if ((ticks / 50) % 2 == 0) { fill(sx + 40 + menu_qn * 8, sy + 8, 2, 18, th_edge); }
+    } else {
+        draw_text(sx + 40, sy + 9, "Search apps", 0x8C97B3);
+        if ((ticks / 50) % 2 == 0) { fill(sx + 38, sy + 8, 2, 18, th_edge); }
+    }
+    if (menu_qn > 0) { draw_text(x + 18, y + 54, "Results", 0x9AA6C4); } else { draw_text(x + 18, y + 54, "All apps", 0x9AA6C4); }
+    // app tiles
+    var k = 0;
+    while (k < menu_n) {
+        let a = menu_list[k];
+        let cx = x + SM_PAD + (k % SM_COLS) * SM_CW; let cy = y + SM_GRID + (k / SM_COLS) * SM_CH;
+        if (k == menu_hover) { rfill(cx + 2, cy, SM_CW - 4, SM_CH - 3, 10, th_hov, false); }
+        draw_app_art(a + 1, cx + (SM_CW - 48) / 2, cy + 4);
+        let nm = app_name(a + 1);
+        draw_text(cx + SM_CW / 2 - text_w(nm) / 2, cy + 54, nm, 0xEAF0FF);
+        k++;
+    }
+    if (menu_n == 0) { draw_text(x + w / 2 - 52, y + SM_GRID + 40, "No apps match", 0x9AA6C4); }
+    // footer: user + power buttons
+    let fy = y + h - SM_FOOT;
+    hline(x + 14, fy, w - 28, th_line);
+    disc(x + 36, fy + SM_FOOT / 2, 15, th_acc); draw_text(x + 32, fy + SM_FOOT / 2 - 8, "P", contrast(th_acc));
+    draw_text(x + 60, fy + 12, "Peacock", 0xFFFFFF);
+    draw_text(x + 60, fy + 29, "Peacock OS", 0x8C97B3);
+    let cy = fy + SM_FOOT / 2;
+    let rx = x + w - 72; let px = x + w - 34;
+    if (menu_hover == -3) { disc(rx, cy, 17, th_hov); }
+    if (menu_hover == -4) { disc(px, cy, 17, th_hov); }
+    svg_tint(G_RESET, rx - 10, cy - 10, 20, 0xE8B923, 256);
+    svg_tint(G_POWER, px - 10, cy - 10, 20, 0xEC5F57, 256);
+}
+
+// ================================================================= desktop context menu (right click on the desktop)
+const CTX_W = 196; const CTX_ITEM = 28; const CTX_N = 6;
+
+fn ctx_label(i: int) -> *u8 {
+    if (i == 0) { return "Open Terminal"; }
+    if (i == 1) { return "Open Files"; }
+    if (i == 2) { return "Appearance..."; }
+    if (i == 3) { return "Next wallpaper"; }
+    if (i == 4) { return "System Info"; }
+    return "Fonts...";
+}
+fn ctx_glyph(i: int) -> int {
+    if (i == 0) { return G_TERMINAL; }
+    if (i == 1) { return G_FOLDER; }
+    if (i == 2) { return G_PALETTE; }
+    if (i == 3) { return G_IMAGE; }
+    if (i == 4) { return G_INFO; }
+    return G_TEXT;
+}
+fn ctx_h() -> int { return CTX_N * CTX_ITEM + 12; }
+fn ctx_dmg() { dmg_add(ctx_x - 10, ctx_y - 10, CTX_W + 20, ctx_h() + 22); }
+
+fn ctx_show(x: int, y: int) {
+    ctx_x = imin(x, fb_w - CTX_W - 6); ctx_y = imin(y, fb_h - TASKBAR_H - ctx_h() - 6);
+    if (ctx_y < 4) { ctx_y = 4; }
+    ctx_open = true; ctx_hover = -1;
+    ctx_dmg();
+}
+fn ctx_hide() { if (ctx_open) { ctx_open = false; ctx_dmg(); } }
+
+fn ctx_item_at(x: int, y: int) -> int {
+    if (x < ctx_x + 6 || x >= ctx_x + CTX_W - 6 || y < ctx_y + 6 || y >= ctx_y + 6 + CTX_N * CTX_ITEM) { return -1; }
+    return (y - ctx_y - 6) / CTX_ITEM;
+}
+
+fn ctx_action(i: int) {
+    if (i == 0) { app_open(APP_TERM); }
+    else if (i == 1) { app_open(APP_FILES); }
+    else if (i == 2) { app_open(APP_THEME); }
+    else if (i == 3) { theme_apply((th_cur + 1) % TH_N, true); toast_theme(); }
+    else if (i == 4) { app_open(APP_INFO); }
+    else if (i == 5) { app_open(APP_FONT); }
+}
+
+fn draw_ctx() {
+    let x = ctx_x; let y = ctx_y; let w = CTX_W; let h = ctx_h();
+    glass_grab(0, x + 1, y + 1, w - 2, h - 2);
+    soft_shadow(x, y, w, h);
+    rfill(x, y, w, h, 10, th_line, false);
+    glass_put(0, x + 1, y + 1, w - 2, h - 2, th_menu, 218, 9, false);
+    var i = 0;
+    while (i < CTX_N) {
+        let iy = y + 6 + i * CTX_ITEM;
+        if (i == ctx_hover) { rfill(x + 6, iy, w - 12, CTX_ITEM - 2, 7, th_hov, false); }
+        svg_tint(ctx_glyph(i), x + 14, iy + 5, 16, th_edge, 256);
+        draw_text(x + 38, iy + 5, ctx_label(i), 0xEAF0FF);
+        i++;
+    }
+}
+
+// ================================================================= toast notifications
+const TOAST_LIFE = 300; const TOAST_ANIM = 16;
+
+fn toast(msg: *u8) {
+    kstrncpy(&toast_txt[0], msg, 60);
+    toast_t0 = ticks;
+}
+
+fn toast_theme() {
+    var b: u8[64];
+    kstrncpy(&b[0], "Theme: ", 8);
+    kstrncpy(&b[7], th_name(th_cur), 50);
+    toast(&b[0]);
+}
+
+fn toast_active() -> bool { return ticks - toast_t0 < TOAST_LIFE + 2; }
+fn toast_w() -> int { return imax(230, text_w(&toast_txt[0]) + 76); }
+fn toast_dmg() { dmg_add(fb_w - toast_w() - 40, TOPBAR_H, toast_w() + 40, 78); }
+
+fn draw_toast() {
+    let life = ticks - toast_t0;
+    if (life < 0 || life >= TOAST_LIFE) { return; }
+    let w = toast_w(); let h = 52;
+    var off = 0;
+    if (life < TOAST_ANIM) { off = ((TOAST_ANIM - life) * (TOAST_ANIM - life) * (w + 24)) / (TOAST_ANIM * TOAST_ANIM); }
+    if (life > TOAST_LIFE - TOAST_ANIM) { let r = life - (TOAST_LIFE - TOAST_ANIM); off = (r * r * (w + 24)) / (TOAST_ANIM * TOAST_ANIM); }
+    let x = fb_w - w - 14 + off; let y = TOPBAR_H + 10;
+    glass_grab(0, x + 1, y + 1, w - 2, h - 2);
+    soft_shadow(x, y, w, h);
+    rfill(x, y, w, h, 12, th_line, false);
+    glass_put(0, x + 1, y + 1, w - 2, h - 2, th_menu, 222, 11, false);
+    disc(x + 28, y + h / 2, 12, th_acc); draw_text(x + 24, y + h / 2 - 8, "i", contrast(th_acc));
+    draw_text(x + 52, y + 9, "Peacock", 0x9AA6C4);
+    draw_text(x + 52, y + 27, &toast_txt[0], 0xFFFFFF);
+}
+
+// ================================================================= window fade-in
+const FADE_T = 18;
+
+fn fade_active(i: int) -> bool { return wins[i].anim > 0 && ticks - wins[i].anim < FADE_T; }
+
+/// remember what is behind a window that is fading in (only the part inside the current clip)
+fn fade_begin(i: int) {
+    fade_buf = 0 as *u64;
+    let rx = imax(wins[i].x - 6, clip_x0); let ry = imax(wins[i].y - 4, clip_y0);
+    let rx1 = imin(wins[i].x + wins[i].w + 6, clip_x1); let ry1 = imin(wins[i].y + wins[i].h + 8, clip_y1);
+    if (rx1 <= rx || ry1 <= ry) { return; }
+    fade_x = rx; fade_y = ry; fade_w = rx1 - rx; fade_h = ry1 - ry;
+    let b = kmalloc(fade_w * fade_h * 8);
+    if (b == (0 as *u8)) { return; }
+    fade_buf = b as *u64;
+    var j = 0;
+    while (j < fade_h) {
+        var k = 0;
+        while (k < fade_w) { fade_buf[j * fade_w + k] = bb[(fade_y + j) * fb_w + fade_x + k]; k++; }
+        j++;
+    }
+}
+
+/// blend the freshly drawn window with the saved backdrop: alpha grows from 0 to 256 over FADE_T ticks
+fn fade_end(i: int) {
+    if (fade_buf == (0 as *u64)) { return; }
+    var a = ((ticks - wins[i].anim) * 256) / FADE_T;
+    if (a > 256) { a = 256; }
+    a = (a * a) / 256;                                      // ease-in
+    var j = 0;
+    while (j < fade_h) {
+        var k = 0;
+        let row = (fade_y + j) * fb_w + fade_x;
+        while (k < fade_w) {
+            let n = bb[row + k] as int; let o = fade_buf[j * fade_w + k] as int;
+            bb[row + k] = mixpp(o, n, a) as u64;
+            k++;
+        }
+        j++;
+    }
+    kfree(fade_buf as *u8);
+    fade_buf = 0 as *u64;
+}
+
+// ================================================================= taskbar tray: network + date/time
+fn dow(y: int, m: int, d: int) -> int {                      // 0 = Sunday
+    let t0 = (14 - m) / 12; let yy = y - t0; let mm = m + 12 * t0 - 2;
+    return (d + yy + yy / 4 - yy / 100 + yy / 400 + (31 * mm) / 12) % 7;
+}
+
+fn month_abbr(m: int) -> *u8 {
+    if (m == 1) { return "Jan"; } if (m == 2) { return "Feb"; } if (m == 3) { return "Mar"; } if (m == 4) { return "Apr"; }
+    if (m == 5) { return "May"; } if (m == 6) { return "Jun"; } if (m == 7) { return "Jul"; } if (m == 8) { return "Aug"; }
+    if (m == 9) { return "Sep"; } if (m == 10) { return "Oct"; } if (m == 11) { return "Nov"; }
+    return "Dec";
+}
+fn day_abbr(d: int) -> *u8 {
+    if (d == 0) { return "Sun"; } if (d == 1) { return "Mon"; } if (d == 2) { return "Tue"; } if (d == 3) { return "Wed"; }
+    if (d == 4) { return "Thu"; } if (d == 5) { return "Fri"; }
+    return "Sat";
+}
+
+/// "Sat 14 Nov" into date_txt
+fn update_date(y: int, m: int, d: int) {
+    kstrncpy(&date_txt[0], day_abbr(dow(y, m, d)), 4);
+    date_txt[3] = ' ';
+    fmt2(d, &date_txt[4]); date_txt[6] = ' ';
+    kstrncpy(&date_txt[7], month_abbr(m), 4);
+}
+
+// top bar: [launcher pill: logo + focused window]  ........................  [network] [date] [clock]
+fn tb_clock_w() -> int { return text_w(&clock_txt[0]) + 22; }
+fn tb_date_w() -> int { return text_w(&date_txt[0]) + 22; }
+fn tb_clock_x() -> int { return fb_w - 8 - tb_clock_w(); }
+fn tb_date_x() -> int { return tb_clock_x() - 6 - tb_date_w(); }
+fn tb_net_x() -> int { return tb_date_x() - 6 - 34; }
+fn tb_title() -> *u8 {
+    if (focus >= 0 && wins[focus].used != 0 && wins[focus].minimized == 0) { return &wins[focus].title[0]; }
+    return "Peacock OS";
+}
+fn tb_left_w() -> int { return 40 + imin(text_w(tb_title()), 240) + 8; }
+/// 1 launcher pill, 2 network, 3 date, 4 clock, 0 nothing
+fn topbar_hit(x: int) -> int {
+    if (x >= 6 && x < 6 + tb_left_w()) { return 1; }
+    if (x >= tb_clock_x() && x < tb_clock_x() + tb_clock_w()) { return 4; }
+    if (x >= tb_date_x() && x < tb_date_x() + tb_date_w()) { return 3; }
+    if (x >= tb_net_x() && x < tb_net_x() + 34) { return 2; }
+    return 0;
+}
+
+fn draw_topbar() {
+    glass_grab(0, 0, 0, fb_w, TOPBAR_H);
+    glass_put(0, 0, 0, fb_w, TOPBAR_H, th_tint, 204, 0, false);
+    hline(0, TOPBAR_H - 1, fb_w, th_line);
+    let pill = mix(th_tint, 0xFFFFFF, 24);
+    // left: launcher pill with the logo and the focused window's title
+    let lw = tb_left_w();
+    if (menu_open) { rfill(6, 4, lw, 22, 11, th_acc_dk, false); } else { rfill(6, 4, lw, 22, 11, pill, false); }
+    pk_draw(10, 5, 20);
+    draw_text_n(36, 7, tb_title(), 30, 0xE6ECF8);
+    // right: network, date, clock
+    let nx = tb_net_x();
+    rfill(nx, 4, 34, 22, 11, pill, false);
+    var c = 0x7F8AA8;
+    if (net_up) { c = 0x57D68D; }
+    var b = 0;
+    while (b < 4) {
+        var bc = c;
+        if (!net_up && b > 0) { bc = mix(pill, 0x7F8AA8, 90); }
+        fill(nx + 10 + b * 4, 21 - b * 3 - 3, 3, b * 3 + 3, bc);
+        b++;
+    }
+    rfill(tb_date_x(), 4, tb_date_w(), 22, 11, pill, false);
+    draw_text(tb_date_x() + 11, 7, &date_txt[0], 0xAEB8D2);
+    rfill(tb_clock_x(), 4, tb_clock_w(), 22, 11, th_acc_dk, false);
+    draw_text(tb_clock_x() + 11, 7, &clock_txt[0], 0xFFFFFF);
+}

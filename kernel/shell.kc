@@ -1,0 +1,842 @@
+// shell.kc -- more Terminal commands: cp mv rm -r head tail wc grep find tree du df install edit.
+// Author: Divyanshu Sinha (MIT License)
+// t_exec() in apps.kc calls sh_exec(); it returns false when the command is not one of these.
+// Needs: apps.kc (t_puts, t_putc, t_putdec, t_av, targc), fs.kc, pkg.kc, kstr.kc.
+
+var g_pat: u8[64]; var g_plen = 0; var g_icase = false; var g_num = false; var g_multi = false;
+var g_hits = 0; var g_n = 10; var g_files = 0; var g_dirs = 0; var g_flag_r = false;
+
+fn sh_putc(ch: int) {
+    if (ch == 10) { t_putc(10, 0); }
+    else if (ch < 32) { t_putc(' ', 0); }
+    else if (ch >= 127) { t_putc('?', 0); }
+    else { t_putc(ch, 0); }
+}
+fn sh_lower(c: int) -> int { if (c >= 'A' && c <= 'Z') { return c + 32; } return c; }
+
+fn sh_err(who: *u8, msg: *u8, arg: *u8) {
+    t_puts(who, 2); t_puts(": ", 2); t_puts(msg, 2);
+    if (arg != (0 as *u8)) { t_puts(": ", 2); t_puts(arg, 2); }
+    t_putc(10, 0);
+}
+fn sh_node_arg(i: int, who: *u8) -> int {
+    let n = fs_resolve(t_av(i));
+    if (n < 0) { sh_err(who, "no such file or directory", t_av(i)); }
+    return n;
+}
+/// "<dir path>/<name>" into out
+fn sh_join(dir: int, name: *u8, out: *u8) {
+    fs_path(dir, out);
+    var n = kstrlen(out);
+    if (n > 1) { out[n] = '/'; n++; }
+    var j = 0;
+    while (name[j] != 0 && n < 126) { out[n] = name[j]; n++; j++; }
+    out[n] = 0;
+}
+fn sh_contains(hay: *u8, needle: *u8) -> bool {
+    let nl = kstrlen(needle);
+    var i = 0;
+    while (hay[i] != 0) {
+        var j = 0;
+        while (j < nl && hay[i + j] == needle[j]) { j++; }
+        if (j == nl) { return true; }
+        i++;
+    }
+    return nl == 0;
+}
+
+// ---------------------------------------------------------------- cp / mv / rm
+fn sh_cp_tree(src: int, dst: *u8, depth: int) -> bool {
+    if (depth > 14) { return false; }
+    if (fs_nodes[src].kind == K_FILE) {
+        var n = fs_resolve(dst);
+        if (n >= 0 && fs_nodes[n].kind != K_FILE) { return false; }
+        if (n < 0) { n = fs_create(dst, K_FILE); }
+        if (n < 0) { return false; }
+        if (n == src) { return true; }
+        return fs_write(n, fs_nodes[src].data, fs_nodes[src].size, false);
+    }
+    var d = fs_resolve(dst);
+    if (d < 0) { d = fs_create(dst, K_DIR); }
+    if (d < 0 || fs_nodes[d].kind != K_DIR) { return false; }
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == src && i != d) {
+            var sub: u8[128];
+            sh_join(d, &fs_nodes[i].name[0], &sub[0]);
+            if (!sh_cp_tree(i, &sub[0], depth + 1)) { return false; }
+        }
+        i++;
+    }
+    return true;
+}
+
+fn sh_cp() {
+    var rec = false;
+    var first = 1;
+    while (first < targc && t_av(first)[0] == '-' && kstrlen(t_av(first)) > 1) {
+        if (kstreq(t_av(first), "-r") || kstreq(t_av(first), "-R") || kstreq(t_av(first), "-a")) { rec = true; }
+        first++;
+    }
+    if (targc - first < 2) { t_puts("usage: cp [-r] <src>... <dst>\n", 2); return; }
+    let dst = t_av(targc - 1);
+    let dn = fs_resolve(dst);
+    if (targc - first > 2 && (dn < 0 || fs_nodes[dn].kind != K_DIR)) { sh_err("cp", "target is not a directory", dst); return; }
+    var i = first;
+    var done = 0;
+    while (i < targc - 1) {
+        let s = sh_node_arg(i, "cp");
+        if (s >= 0) {
+            if (fs_nodes[s].kind == K_DIR && !rec) { sh_err("cp", "-r not specified, omitting directory", t_av(i)); }
+            else {
+                var target: u8[128];
+                var parent = 0;
+                if (dn >= 0 && fs_nodes[dn].kind == K_DIR) { sh_join(dn, &fs_nodes[s].name[0], &target[0]); parent = dn; }
+                else { kstrncpy(&target[0], dst, 128); var nm: u8[32]; parent = fs_split(dst, &nm[0]); }
+                if (fs_nodes[s].kind == K_DIR && parent >= 0 && fs_is_ancestor(s, parent)) { sh_err("cp", "cannot copy a directory into itself", t_av(i)); }
+                else if (parent < 0) { sh_err("cp", "bad destination", dst); }
+                else if (sh_cp_tree(s, &target[0], 0)) { done++; }
+                else { sh_err("cp", "failed (filesystem full or name clash)", t_av(i)); }
+            }
+        }
+        i++;
+    }
+}
+
+fn sh_mv() {
+    if (targc != 3) { t_puts("usage: mv <src> <dst>\n", 2); return; }
+    let s = sh_node_arg(1, "mv");
+    if (s < 0) { return; }
+    if (s == 0) { sh_err("mv", "cannot move the root", 0 as *u8); return; }
+    if ((fs_nodes[s].attr & FA_RO) != 0) { sh_err("mv", "read-only", t_av(1)); return; }
+    var name: u8[32];
+    var parent = 0;
+    let d = fs_resolve(t_av(2));
+    if (d >= 0 && fs_nodes[d].kind == K_DIR) { parent = d; kstrncpy(&name[0], &fs_nodes[s].name[0], 32); }
+    else if (d >= 0) {
+        if (fs_nodes[s].kind != K_FILE || d == s) { sh_err("mv", "target exists", t_av(2)); return; }
+        if ((fs_nodes[d].attr & FA_RO) != 0) { sh_err("mv", "target is read-only", t_av(2)); return; }
+        parent = fs_nodes[d].parent; kstrncpy(&name[0], &fs_nodes[d].name[0], 32);
+        fs_remove(d);
+    } else {
+        parent = fs_split(t_av(2), &name[0]);
+        if (parent < 0) { sh_err("mv", "bad destination", t_av(2)); return; }
+    }
+    if (!fs_valid_name(&name[0])) { sh_err("mv", "invalid name", &name[0]); return; }
+    if (fs_nodes[s].kind == K_DIR && fs_is_ancestor(s, parent)) { sh_err("mv", "cannot move a directory into itself", t_av(1)); return; }
+    let clash = fs_child(parent, &name[0]);
+    if (clash >= 0 && clash != s) { sh_err("mv", "target exists", &name[0]); return; }
+    if (parent != fs_nodes[s].parent) { if (fs_move(s, parent) != 0) { sh_err("mv", "cannot move", t_av(1)); return; } }
+    if (!kstreq(&fs_nodes[s].name[0], &name[0])) { if (fs_rename(s, &name[0]) != 0) { sh_err("mv", "cannot rename", t_av(1)); } }
+}
+
+fn sh_rm() {
+    var rec = false;
+    var i = 1;
+    while (i < targc && t_av(i)[0] == '-' && kstrlen(t_av(i)) > 1) {
+        if (kstreq(t_av(i), "-r") || kstreq(t_av(i), "-rf") || kstreq(t_av(i), "-R")) { rec = true; }
+        i++;
+    }
+    if (i >= targc) { t_puts("usage: rm [-r] <path>...\n", 2); return; }
+    while (i < targc) {
+        let n = sh_node_arg(i, "rm");
+        if (n >= 0) {
+            if (n == 0 || fs_is_ancestor(n, fs_cwd)) { sh_err("rm", "refusing to remove the root or the current directory", t_av(i)); }
+            else if (rec) { if (!fs_remove_tree(n)) { sh_err("rm", "cannot remove", t_av(i)); } }
+            else if (!fs_remove(n)) { sh_err("rm", "cannot remove (use -r for folders)", t_av(i)); }
+        }
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------- head / tail / wc
+fn sh_lines_arg() -> int {
+    g_n = 10;
+    if (targc > 2 && kstreq(t_av(1), "-n")) { g_n = katoi(t_av(2)); return 3; }
+    if (targc > 1 && t_av(1)[0] == '-' && kisdigit(t_av(1)[1] as int)) { g_n = katoi(t_av(1) + 1); return 2; }
+    return 1;
+}
+fn sh_file_node(f: int, who: *u8) -> int {
+    if (f >= targc) { t_puts("usage: ", 2); t_puts(who, 2); t_puts(" [-n N] <file>\n", 2); return -1; }
+    let n = sh_node_arg(f, who);
+    if (n < 0) { return -1; }
+    if (fs_nodes[n].kind != K_FILE) { sh_err(who, "is a directory", t_av(f)); return -1; }
+    return n;
+}
+fn sh_head() {
+    let n = sh_file_node(sh_lines_arg(), "head");
+    if (n < 0) { return; }
+    var lines = 0; var i = 0;
+    let d = fs_nodes[n].data; let sz = fs_nodes[n].size;
+    while (i < sz && lines < g_n) { let ch = d[i] as int; sh_putc(ch); if (ch == 10) { lines++; } i++; }
+    if (i > 0 && d[i - 1] != 10) { t_putc(10, 0); }
+}
+fn sh_tail() {
+    let n = sh_file_node(sh_lines_arg(), "tail");
+    if (n < 0) { return; }
+    let d = fs_nodes[n].data; let sz = fs_nodes[n].size;
+    var total = 0; var i = 0;
+    while (i < sz) { if (d[i] == 10) { total++; } i++; }
+    if (sz > 0 && d[sz - 1] != 10) { total++; }
+    var skip = total - g_n;
+    i = 0;
+    while (skip > 0 && i < sz) { if (d[i] == 10) { skip--; } i++; }
+    while (i < sz) { sh_putc(d[i] as int); i++; }
+    if (sz > 0 && d[sz - 1] != 10) { t_putc(10, 0); }
+}
+fn sh_wc() {
+    if (targc < 2) { t_puts("usage: wc <file>...\n", 2); return; }
+    var a = 1;
+    while (a < targc) {
+        let n = sh_node_arg(a, "wc");
+        if (n >= 0 && fs_nodes[n].kind == K_FILE) {
+            let d = fs_nodes[n].data; let sz = fs_nodes[n].size;
+            var lines = 0; var words = 0; var inw = false; var i = 0;
+            while (i < sz) {
+                let c = d[i] as int;
+                if (c == 10) { lines++; }
+                if (c == ' ' || c == 10 || c == 9 || c == 13) { inw = false; } else if (!inw) { inw = true; words++; }
+                i++;
+            }
+            t_putdec(lines, 3); t_puts(" lines  ", 0); t_putdec(words, 3); t_puts(" words  ", 0); t_putdec(sz, 3); t_puts(" bytes  ", 0); t_puts(t_av(a), 4); t_putc(10, 0);
+        }
+        a++;
+    }
+}
+
+// ---------------------------------------------------------------- grep
+fn sh_match(s: *u8, len: int) -> bool {
+    var i = 0;
+    while (i + g_plen <= len) {
+        var j = 0;
+        while (j < g_plen) {
+            var a = s[i + j] as int;
+            if (g_icase) { a = sh_lower(a); }
+            if (a != (g_pat[j] as int)) { break; }
+            j++;
+        }
+        if (j == g_plen) { return true; }
+        i++;
+    }
+    return false;
+}
+fn sh_grep_lines(n: int, label: *u8) {
+    let d = fs_nodes[n].data; let sz = fs_nodes[n].size;
+    var p = 0; var ln = 1;
+    while (p < sz) {
+        var e = p;
+        while (e < sz && d[e] != 10) { e++; }
+        if (sh_match(d + p, e - p)) {
+            g_hits++;
+            if (g_hits <= 400) {
+                if (g_multi) { t_puts(label, 3); t_puts(":", 4); }
+                if (g_num) { t_putdec(ln, 4); t_puts(":", 4); }
+                var k = 0;
+                while (k < e - p && k < 100) { sh_putc(d[p + k] as int); k++; }
+                t_putc(10, 0);
+            }
+        }
+        p = e + 1; ln++;
+    }
+}
+fn sh_grep_walk(n: int) {
+    if (fs_nodes[n].kind == K_FILE) {
+        var path: u8[128];
+        fs_path(n, &path[0]);
+        sh_grep_lines(n, &path[0]);
+        return;
+    }
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == n && g_hits <= 400) { sh_grep_walk(i); }
+        i++;
+    }
+}
+fn sh_grep() {
+    g_icase = false; g_num = false; g_flag_r = false; g_hits = 0;
+    var i = 1;
+    while (i < targc && t_av(i)[0] == '-' && kstrlen(t_av(i)) > 1) {
+        var k = 1;
+        while (t_av(i)[k] != 0) {
+            let f = t_av(i)[k] as int;
+            if (f == 'n') { g_num = true; } else if (f == 'i') { g_icase = true; } else if (f == 'r' || f == 'R') { g_flag_r = true; }
+            k++;
+        }
+        i++;
+    }
+    if (i >= targc) { t_puts("usage: grep [-n] [-i] [-r] <text> [path]...\n", 2); return; }
+    kstrncpy(&g_pat[0], t_av(i), 64);
+    g_plen = kstrlen(&g_pat[0]);
+    if (g_icase) { var q = 0; while (q < g_plen) { g_pat[q] = sh_lower(g_pat[q] as int) as u8; q++; } }
+    i++;
+    let npaths = targc - i;
+    g_multi = g_flag_r || npaths > 1;
+    if (npaths <= 0) {
+        if (!g_flag_r) { t_puts("grep: no file given (use -r to search the current folder)\n", 2); return; }
+        sh_grep_walk(fs_cwd);
+    }
+    while (i < targc) {
+        let n = sh_node_arg(i, "grep");
+        if (n >= 0) {
+            if (fs_nodes[n].kind == K_DIR) { if (g_flag_r) { sh_grep_walk(n); } else { sh_err("grep", "is a directory (use -r)", t_av(i)); } }
+            else { sh_grep_lines(n, t_av(i)); }
+        }
+        i++;
+    }
+    if (g_hits > 400) { t_puts("... more matches not shown\n", 4); }
+    else if (g_hits == 0) { t_puts("(no matches)\n", 4); }
+}
+
+// ---------------------------------------------------------------- find / tree / du / df
+fn sh_find_walk(n: int, sub: *u8, depth: int) {
+    if (depth > 20) { return; }
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == n && i != n) {
+            if (sh_contains(&fs_nodes[i].name[0], sub)) {
+                var p: u8[128];
+                fs_path(i, &p[0]);
+                t_puts(&p[0], fs_nodes[i].kind == K_DIR ? 3 : 0); t_putc(10, 0);
+                g_hits++;
+            }
+            if (fs_nodes[i].kind == K_DIR) { sh_find_walk(i, sub, depth + 1); }
+        }
+        i++;
+    }
+}
+fn sh_find() {
+    var start = fs_cwd;
+    var sub = "";
+    var i = 1;
+    while (i < targc) {
+        if (kstreq(t_av(i), "-name") && i + 1 < targc) { sub = t_av(i + 1); i = i + 2; }
+        else { start = sh_node_arg(i, "find"); if (start < 0) { return; } i++; }
+    }
+    g_hits = 0;
+    sh_find_walk(start, sub, 0);
+    t_putdec(g_hits, 4); t_puts(" match(es)\n", 4);
+}
+
+fn sh_tree_walk(n: int, depth: int) {
+    if (depth > 12) { return; }
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == n && i != n) {
+            var k = 0;
+            while (k < depth) { t_puts("  ", 4); k++; }
+            t_puts("+ ", 4);
+            if (fs_nodes[i].kind == K_DIR) { t_puts(&fs_nodes[i].name[0], 3); t_puts("/\n", 3); g_dirs++; sh_tree_walk(i, depth + 1); }
+            else { t_puts(&fs_nodes[i].name[0], 0); t_putc(10, 0); g_files++; }
+        }
+        i++;
+    }
+}
+fn sh_tree() {
+    var start = fs_cwd;
+    if (targc > 1) { start = sh_node_arg(1, "tree"); if (start < 0) { return; } }
+    g_files = 0; g_dirs = 0;
+    var p: u8[128];
+    fs_path(start, &p[0]);
+    t_puts(&p[0], 3); t_putc(10, 0);
+    sh_tree_walk(start, 0);
+    t_putdec(g_dirs, 4); t_puts(" folders, ", 4); t_putdec(g_files, 4); t_puts(" files\n", 4);
+}
+
+fn sh_du_sum(n: int, depth: int) -> int {
+    if (fs_nodes[n].kind == K_FILE) { g_files++; return fs_nodes[n].size; }
+    if (depth > 20) { return 0; }
+    g_dirs++;
+    var total = 0; var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == n && i != n) { total = total + sh_du_sum(i, depth + 1); }
+        i++;
+    }
+    return total;
+}
+fn sh_du() {
+    var start = fs_cwd;
+    if (targc > 1) { start = sh_node_arg(1, "du"); if (start < 0) { return; } }
+    g_files = 0; g_dirs = 0;
+    let total = sh_du_sum(start, 0);
+    t_putdec(total, 3); t_puts(" bytes in ", 0); t_putdec(g_files, 0); t_puts(" files, ", 0); t_putdec(g_dirs, 0); t_puts(" folders\n", 0);
+}
+
+fn sh_df() {
+    var s: int[4];
+    fs_stats(&s[0]);
+    t_puts("filesystem  ", 3); t_puts("KCFS 2   ", 0); t_putdec(s[0], 0); t_puts(" / ", 0); t_putdec(FS_MAX, 0); t_puts(" nodes, ", 0); t_putdec(s[3], 0); t_puts(" bytes stored\n", 0);
+    t_puts("disk store  ", 3); t_putdec(store_total() / 1024, 0); t_puts(" / ", 0); t_putdec(STORE_MAX / 1024, 0); t_puts(" KiB used (two slots, crash-safe)\n", 0);
+    if (disk_present) {
+        t_puts("saved       ", 3);
+        if (fs_persisted) {
+            var ts: u8[24]; fs_time_str(fs_saved_at, &ts[0]);
+            t_puts("generation ", 0); t_putdec(fs_gen, 0); t_puts(" at ", 0); t_puts(&ts[0], 0);
+        } else { t_puts("never", 2); }
+        if (fs_dirty) { t_puts("   [unsaved changes: autosave in a moment, or 'sync']", 4); } else { t_puts("   [up to date]", 0); }
+        t_putc(10, 0);
+        if (fs_recovered == 1) { t_puts("recovery    the newest generation was damaged; an older one was loaded\n", 2); }
+        if (fs_recovered == 2) { t_puts("migrated    upgraded from KCFS 1\n", 4); }
+    } else { t_puts("(no disk)\n", 2); }
+    if (disk_present) { t_puts("disk        ", 3); t_puts(&disk_model[0], 0); t_puts("  ", 0); t_putdec(disk_sectors / 2048, 0); t_puts(" MiB\n", 0); }
+    if (pkg_header()) { t_puts("bundle      ", 3); t_puts(&pk_name[0], 0); t_puts("  ", 0); t_putdec(pk_records, 0); t_puts(" entries, ", 0); t_putdec(pk_bytes / 1024, 0); t_puts(" KiB  (run 'install')\n", 0); }
+}
+
+/// stat <path>: size, type, times, attributes
+fn sh_stat() {
+    if (targc < 2) { t_puts("usage: stat <path>\n", 2); return; }
+    let n = sh_node_arg(1, "stat");
+    if (n < 0) { return; }
+    var ts: u8[24]; var at: u8[8];
+    t_puts("  name      ", 3); t_puts(&fs_nodes[n].name[0], 0); t_putc(10, 0);
+    t_puts("  type      ", 3); t_puts(fs_nodes[n].kind == K_DIR ? "folder" : "file", 0); t_putc(10, 0);
+    if (fs_nodes[n].kind == K_DIR) { var items = 0; let b = fs_tree_size(n, &items); t_puts("  contains  ", 3); t_putdec(items, 0); t_puts(" items, ", 0); t_putdec(b, 0); t_puts(" bytes\n", 0); }
+    else { t_puts("  size      ", 3); t_putdec(fs_nodes[n].size, 0); t_puts(" bytes\n", 0); }
+    fs_time_str(fs_nodes[n].ctime, &ts[0]); t_puts("  created   ", 3); t_puts(&ts[0], 0); t_putc(10, 0);
+    fs_time_str(fs_nodes[n].mtime, &ts[0]); t_puts("  modified  ", 3); t_puts(&ts[0], 0); t_putc(10, 0);
+    t_attr_str(n, &at[0]); t_puts("  attrs     ", 3); t_puts(&at[0], 0); t_puts("  (r read-only, h hidden, s system, x executable)\n", 4);
+}
+
+/// attr +r|-r|+h|-h <path>...
+fn sh_attr() {
+    if (targc < 3) { t_puts("usage: attr +r|-r|+h|-h|+x|-x <path>...   (r read-only, h hidden, x executable)\n", 2); return; }
+    let f = t_av(1);
+    var mask = 0;
+    if (f[1] == 'r') { mask = FA_RO; } else if (f[1] == 'h') { mask = FA_HIDDEN; } else if (f[1] == 'x') { mask = FA_EXEC; }
+    if ((f[0] != '+' && f[0] != '-') || mask == 0 || f[2] != 0) { t_puts("attr: flag must be +r -r +h -h +x or -x\n", 2); return; }
+    var i = 2;
+    while (i < targc) {
+        let n = sh_node_arg(i, "attr");
+        if (n > 0) { fs_set_attr(n, mask, f[0] == '+'); }
+        i++;
+    }
+}
+
+/// fsck [-r]: check the tree; -r repairs
+fn sh_fsck() {
+    var rep: int[5];
+    var fix = false;
+    if (targc > 1 && kstreq(t_av(1), "-r")) { fix = true; }
+    let p = fs_fsck(fix, &rep[0]);
+    if (p == 0) { t_puts("fsck: filesystem is clean\n", 0); return; }
+    t_puts("fsck: ", 3); t_putdec(p, 2); t_puts(" problem(s): ", 0);
+    t_putdec(rep[1], 0); t_puts(" orphaned, ", 0); t_putdec(rep[2], 0); t_puts(" duplicate names, ", 0); t_putdec(rep[3], 0); t_puts(" bad sizes, ", 0); t_putdec(rep[4], 0); t_puts(" bad nodes\n", 0);
+    if (fix) { t_puts("repaired (orphans are in /lost+found)\n", 0); } else { t_puts("run 'fsck -r' to repair\n", 4); }
+}
+
+// ---------------------------------------------------------------- install / edit
+fn sh_install() {
+    var list = false;
+    var dest = "/usr/src";
+    var i = 1;
+    while (i < targc) {
+        if (kstreq(t_av(i), "-l")) { list = true; } else { dest = t_av(i); }
+        i++;
+    }
+    if (!pkg_header()) {
+        t_puts("install: no bundle on this disk.  Build the image with the KingCobra sources: make BUNDLE=1\n", 2);
+        return;
+    }
+    if (list) {
+        t_puts("bundle  ", 3); t_puts(&pk_name[0], 0); t_putc(10, 0);
+        t_puts("entries ", 3); t_putdec(pk_records, 0); t_putc(10, 0);
+        t_puts("size    ", 3); t_putdec(pk_bytes / 1024, 0); t_puts(" KiB\n", 0);
+        t_puts("'install' unpacks it under /usr/src (or the folder you give)\n", 4);
+        return;
+    }
+    t_puts("installing ", 0); t_puts(&pk_name[0], 3); t_puts(" into ", 0); t_puts(dest, 3); t_puts(" ...\n", 0);
+    ui_inval_all(APP_TERM); repaint();
+    var out: int[4];
+    let rc = pkg_install(dest, &out[0]);
+    if (rc == 0) {
+        t_putdec(out[0], 3); t_puts(" files, ", 0); t_putdec(out[1], 3); t_puts(" folders, ", 0); t_putdec(out[2] / 1024, 3); t_puts(" KiB installed\n", 0);
+        if (out[3] > 0) { t_putdec(out[3], 2); t_puts(" entries skipped\n", 2); }
+        t_puts("run 'sync' to keep them after a reboot; try:  tree ", 4); t_puts(dest, 4); t_putc(10, 0);
+    }
+    else if (rc == 1) { t_puts("install: no bundle found\n", 2); }
+    else if (rc == 2) { t_puts("install: bundle is corrupt (checksum or read error)\n", 2); }
+    else if (rc == 3) { t_puts("install: out of memory\n", 2); }
+    else { t_puts("install: filesystem full (raise FS_MAX) - partially installed\n", 2); }
+}
+
+fn sh_edit() {
+    if (targc < 2) { t_puts("usage: edit <file>   (opens it in Notes; Ctrl+S saves)\n", 2); return; }
+    var n = fs_resolve(t_av(1));
+    if (n < 0) { n = fs_create(t_av(1), K_FILE); }
+    if (n < 0 || fs_nodes[n].kind != K_FILE) { sh_err("edit", "cannot open", t_av(1)); return; }
+    var p: u8[128];
+    fs_path(n, &p[0]);
+    app_open(APP_NOTES);
+    n_open(&p[0]);
+}
+
+// ---------------------------------------------------------------- network commands: ifconfig dhcp ping nslookup wget browse
+// ping / nslookup / wget run as a "job": the terminal ignores typing (except Ctrl+C) until sh_job_tick() reports it finished.
+var t_job = 0;                       // 0 none, 1 wget, 2 ping, 3 nslookup
+var t_stage = 0; var t_cnt = 0; var t_t0 = 0; var t_ip = 0;
+var t_wurl: u8[300]; var t_wfile: u8[64]; var t_wredir = 0; var t_wtries = 0;
+
+fn sh_ip(ip: int, attr: int) { var b: u8[20]; ip_str(ip, &b[0]); t_puts(&b[0], attr); }
+fn sh_hex2(v: int) { let h = "0123456789abcdef"; t_putc(h[(v >> 4) & 15] as int, 0); t_putc(h[v & 15] as int, 0); }
+
+fn sh_ifconfig() {
+    if (!net_ready) { t_puts("eth0: no network card found\n", 2); t_puts(&net_note[0], 4); t_putc(10, 0); t_puts("QEMU: add  -nic user,model=rtl8139\n", 4); return; }
+    t_puts("eth0  RTL8139   mac ", 3);
+    var i = 0;
+    while (i < 6) { sh_hex2(my_mac[i] as int); if (i < 5) { t_putc(':', 0); } i++; }
+    t_putc(10, 0);
+    t_puts("      inet ", 3); sh_ip(my_ip, 0); t_puts("  netmask ", 3); sh_ip(net_mask, 0); t_putc(10, 0);
+    t_puts("      gateway ", 3); sh_ip(gw_ip, 0); t_puts("  dns ", 3); sh_ip(dns_ip, 0); t_putc(10, 0);
+    t_puts("      ", 3); t_puts(&net_note[0], net_up ? 0 : 2); t_putc(10, 0);
+    t_puts("      rx ", 3); t_putdec(net_rx_count, 0); t_puts(" frames, tx ", 3); t_putdec(net_tx_count, 0); t_puts(" packets\n", 3);
+}
+
+fn sh_job_end() { t_job = 0; t_stage = 0; t_prompt(); }
+fn sh_job_cancel() {
+    if (t_job == 1) { fetch_cancel(); fetch_release(); }
+    dns_busy = false; ping_wait = false;
+    t_puts("^C\n", 4);
+    sh_job_end();
+}
+
+fn sh_name_of_path(path: *u8, out: *u8) {
+    var b = 0; var i = 0;
+    while (path[i] != 0 && path[i] != '?') { if (path[i] == '/') { b = i + 1; } i++; }
+    var o = 0;
+    while (b < i && o < 60) { out[o] = path[b]; o++; b++; }
+    out[o] = 0;
+    if (o == 0) { kstrncpy(out, "index.html", 64); }
+}
+
+fn sh_wget_begin(url: *u8) -> bool {
+    let sch = url_parse(url);
+    if (sch == 2) { t_puts("wget: https:// is not supported (no TLS) - use an http:// address\n", 2); return false; }
+    if (sch != 1) { t_puts("wget: only http:// addresses work\n", 2); return false; }
+    var full: u8[300];
+    var o = url_origin(&full[0]);
+    url_put(&full[0], o, &pu_path[0]);
+    kstrncpy(&t_wurl[0], &full[0], 300);
+    if (t_wfile[0] == 0) { sh_name_of_path(&pu_path[0], &t_wfile[0]); }
+    t_puts("--> ", 4); t_puts(&full[0], 3); t_putc(10, 0);
+    fetch_release();
+    if (!fetch_start(&pu_host[0], pu_port, &pu_path[0])) { t_puts("wget: the network is busy (the browser is loading a page?)\n", 2); return false; }
+    return true;
+}
+
+fn sh_wget() {
+    if (targc < 2) { t_puts("usage: wget <http://host[:port]/path> [file]\n", 2); return; }
+    t_wfile[0] = 0;
+    if (targc > 2) { kstrncpy(&t_wfile[0], t_av(2), 64); }
+    t_wredir = 0;
+    if (sh_wget_begin(t_av(1))) { t_job = 1; }
+}
+fn sh_ping() {
+    if (targc < 2) { t_puts("usage: ping <host or address>\n", 2); return; }
+    if (!net_up) { t_puts("ping: the network is not up (see ifconfig)\n", 2); return; }
+    dns_start(t_av(1));
+    t_job = 2; t_stage = 0; t_cnt = 0; t_t0 = ticks;
+}
+fn sh_nslookup() {
+    if (targc < 2) { t_puts("usage: nslookup <host>\n", 2); return; }
+    if (!net_up) { t_puts("nslookup: the network is not up (see ifconfig)\n", 2); return; }
+    dns_start(t_av(1));
+    t_job = 3;
+}
+
+/// called every frame by term_tick; true when the terminal printed something
+fn sh_job_tick() -> bool {
+    if (t_job == 3) {
+        if (!dns_done) { return false; }
+        if (dns_ok) { t_puts("address: ", 3); sh_ip(dns_result, 0); t_putc(10, 0); } else { t_puts("nslookup: no such host\n", 2); }
+        sh_job_end(); return true;
+    }
+    if (t_job == 2) {
+        if (t_stage == 0) {
+            if (!dns_done) { return false; }
+            if (!dns_ok) { t_puts("ping: unknown host\n", 2); sh_job_end(); return true; }
+            t_ip = dns_result; t_stage = 1; t_t0 = ticks;
+            t_puts("PING ", 3); sh_ip(t_ip, 0); t_putc(10, 0);
+            return true;
+        }
+        if (t_stage == 1) {
+            ping_seq++;
+            if (ping_send(t_ip)) { t_stage = 2; return false; }
+            if (ticks - t_t0 > 200) { t_puts("ping: cannot reach the gateway\n", 2); sh_job_end(); return true; }
+            return false;
+        }
+        if (t_stage == 2) {
+            if (ping_got) {
+                t_puts("reply from ", 0); sh_ip(t_ip, 0); t_puts(": time=", 0); t_putdec(ping_rtt, 0); t_puts(" ms\n", 0);
+            } else if (!ping_wait) { t_puts("request timed out\n", 2); }
+            else { return false; }
+            t_cnt++;
+            if (t_cnt >= 4) { sh_job_end(); return true; }
+            t_stage = 3; t_t0 = ticks;
+            return true;
+        }
+        if (t_stage == 3 && ticks - t_t0 >= 100) { t_stage = 1; }
+        return false;
+    }
+    if (t_job == 1) {
+        if (fx_state == F_ERR) { t_puts("wget: ", 2); t_puts(&fx_msg[0], 2); t_putc(10, 0); fetch_release(); sh_job_end(); return true; }
+        if (fx_state != F_DONE) { return false; }
+        if ((resp_code == 301 || resp_code == 302 || resp_code == 303 || resp_code == 307 || resp_code == 308) && resp_loc[0] != 0) {
+            t_wredir++;
+            var nu: u8[300];
+            url_resolve(&t_wurl[0], &resp_loc[0], &nu[0]);
+            fetch_release();
+            if (t_wredir > 6) { t_puts("wget: too many redirects\n", 2); sh_job_end(); return true; }
+            t_puts("redirected\n", 4);
+            if (!sh_wget_begin(&nu[0])) { sh_job_end(); }
+            return true;
+        }
+        var n = fs_resolve(&t_wfile[0]);
+        if (n < 0) { n = fs_create(&t_wfile[0], K_FILE); }
+        if (n < 0 || fs_nodes[n].kind != K_FILE || !fs_write(n, rb_buf + resp_off, resp_len, false)) { t_puts("wget: cannot write ", 2); t_puts(&t_wfile[0], 2); t_putc(10, 0); }
+        else {
+            t_puts("HTTP ", 0); t_putdec(resp_code, 0); t_puts("  ", 0); t_putdec(resp_len, 3); t_puts(" bytes saved to ", 0); t_puts(&t_wfile[0], 3); t_putc(10, 0);
+            if (resp_code >= 400) { t_puts("(the server answered with an error page)\n", 2); }
+        }
+        fetch_release();
+        sh_job_end(); return true;
+    }
+    return false;
+}
+
+fn sh_browse() {
+    app_open(APP_WEB);
+    if (targc > 1) { web_nav(t_av(1), true); }
+}
+
+/// run NAME: start an app built with the App Builder (NAME or a path to a .pea file)
+fn sh_run() {
+    if (targc < 2) { t_puts("usage: run NAME   (programs are in /apps; build your own with the App Builder)\n", 2); return; }
+    if (!sh_try_prog(t_av(1))) { t_puts("run: no such program (ls /apps)\n", 2); }
+}
+
+// ---------------------------------------------------------------- threads
+fn sh_ps() {
+    t_puts("  ID  NAME             STATE     PRI  CPU%  SWITCHES  STACK\n", 3);
+    var i = 0;
+    while (i < THR_MAX) {
+        if (thr[i].state != TS_FREE) {
+            t_pad(thr[i].id, 4); t_putdec(thr[i].id, 0); t_puts("  ", 0);
+            t_puts(&thr[i].name[0], 0); var l = kstrlen(&thr[i].name[0]); while (l < 17) { t_putc(32, 0); l++; }
+            let st = thr_state_name(thr[i].state);
+            t_puts(st, thr[i].state == TS_BLOCK ? 2 : 0); l = kstrlen(st); while (l < 10) { t_putc(32, 0); l++; }
+            t_putdec(thr[i].prio, 0); t_puts("    ", 0);
+            var pc = thr[i].cpu_pct;
+            if (i == 0) { pc = imax(0, pc - thr_idle_pct); }          // the desktop thread also owns the idle time
+            t_pad(pc, 3); t_putdec(pc, 0); t_puts("   ", 0);
+            t_pad(thr[i].switches, 8); t_putdec(thr[i].switches, 0); t_puts("  ", 0);
+            if (thr[i].stack != 0) { t_putdec(thr_stack_used(i) / 1024, 0); t_puts("/", 0); t_putdec(THR_STACK / 1024, 0); t_puts(" KiB", 0); } else { t_puts("boot", 4); }
+            if (thr[i].overruns > 0) { t_puts("  overruns ", 2); t_putdec(thr[i].overruns, 2); }
+            t_putc(10, 0);
+        }
+        i++;
+    }
+    t_puts("idle ", 3); t_putdec(thr_idle_pct, 0); t_puts("%   context switches ", 0); t_putdec(thr_total_sw, 0); t_puts("   slow slices (>200 ms) ", 0); t_putdec(thr_total_ov, 0); t_putc(10, 0);
+}
+
+fn sh_kill() {
+    if (targc < 2) { t_puts("usage: kill <id>   (see 'ps')\n", 2); return; }
+    var id = 0; var k = 0; let a = t_av(1);
+    while (a[k] >= '0' && a[k] <= '9') { id = id * 10 + (a[k] as int) - 48; k++; }
+    if (k == 0) { t_puts("kill: not a thread id\n", 2); return; }
+    if (thr_kill(id)) { t_puts("thread stopped\n", 0); } else { t_puts("kill: no such thread, or it is a system thread\n", 2); }
+}
+
+/// spawn counter [n] | spin [n] | hog [ms]: start a demo thread
+fn sh_spawn() {
+    if (targc < 2) { t_puts("usage: spawn counter|spin|hog [n]\n", 2); return; }
+    var n = 10; var k = 0;
+    if (targc > 2) { n = 0; let a = t_av(2); while (a[k] >= '0' && a[k] <= '9') { n = n * 10 + (a[k] as int) - 48; k++; } }
+    var id = -1;
+    if (kstreq(t_av(1), "counter")) { id = thr_create("counter", fnaddr(demo_counter), n, 2, 0); }
+    else if (kstreq(t_av(1), "spin")) { id = thr_create("spin", fnaddr(demo_spin), n, 1, 0); }
+    else if (kstreq(t_av(1), "hog")) { id = thr_create("hog", fnaddr(demo_hog), imin(n * 100, 3000), 2, 0); }
+    else { t_puts("spawn: unknown worker (counter, spin, hog)\n", 2); return; }
+    if (id < 0) { t_puts("spawn: no free thread slot\n", 2); } else { t_puts("started thread ", 0); t_putdec(id, 0); t_putc(10, 0); }
+}
+
+// ---------------------------------------------------------------- Peacock executables
+fn t_hex(v: int, digits: int) {
+    var i = digits - 1;
+    while (i >= 0) { let d = (v >> (i * 4)) & 15; if (d < 10) { t_putc(48 + d, 0); } else { t_putc(87 + d, 0); } i--; }
+}
+
+/// find a runnable program for a command word: path, path.pea, or /apps/NAME.pea; -1 when nothing matches
+fn sh_find_prog(c: *u8, out: *u8) -> int {
+    var i = 0; var slash = false;
+    while (c[i] != 0) { if (c[i] == '/') { slash = true; } i++; }
+    var n = fs_resolve(c);
+    if (n >= 0 && fs_nodes[n].kind == K_FILE && (slash || ends_with(c, ".pea"))) { kstrncpy(out, c, 128); return n; }
+    kstrncpy(out, c, 100); kstrncpy(&out[kstrlen(out)], ".pea", 5);
+    n = fs_resolve(out);
+    if (n >= 0 && fs_nodes[n].kind == K_FILE) { return n; }
+    if (!slash) {
+        kstrncpy(out, "/apps/", 128); kstrncpy(&out[6], c, 100); kstrncpy(&out[kstrlen(out)], ".pea", 5);
+        n = fs_resolve(out);
+        if (n >= 0 && fs_nodes[n].kind == K_FILE) { return n; }
+    }
+    return -1;
+}
+
+/// run a program by name ("./x", "x.pea", "x"); false when the word is not a program at all
+fn sh_try_prog(c: *u8) -> bool {
+    var p: u8[128];
+    let n = sh_find_prog(c, &p[0]);
+    if (n < 0) { return false; }
+    if (!pea_is_binary(fs_nodes[n].data, fs_nodes[n].size)) {
+        if (ends_with(&p[0], ".pea")) { t_puts(c, 2); t_puts(": cannot execute: not a Peacock executable (compile sources with 'peac')\n", 2); return true; }
+        return false;
+    }
+    if ((fs_nodes[n].attr & FA_EXEC) == 0) { t_puts(c, 2); t_puts(": permission denied (not executable: 'attr +x ", 2); t_puts(c, 2); t_puts("')\n", 2); return true; }
+    if (!run_load(&p[0])) { t_puts(c, 2); t_puts(": cannot execute: ", 2); t_puts(pea_err_str(pea_last_err), 2); t_putc(10, 0); }
+    return true;
+}
+
+/// file <path>...: what kind of file is it?
+fn sh_file() {
+    if (targc < 2) { t_puts("usage: file <path>...\n", 2); return; }
+    var i = 1;
+    while (i < targc) {
+        let n = sh_node_arg(i, "file");
+        if (n >= 0) {
+            t_puts(t_av(i), 3); t_puts(": ", 0);
+            if (fs_nodes[n].kind == K_DIR) { t_puts("directory\n", 0); }
+            else if (pea_is_binary(fs_nodes[n].data, fs_nodes[n].size)) {
+                var hdr: int[6]; var tt: u8[32];
+                let wd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd;
+                let k = pea_decode(fs_nodes[n].data, fs_nodes[n].size, wd, &hdr[0], &tt[0]);
+                if (k < 0) { t_puts("Peacock executable, DAMAGED: ", 2); t_puts(pea_err_str(k), 2); t_putc(10, 0); }
+                else {
+                    t_puts("Peacock executable v1, GUI, \"", 0); t_puts(&tt[0], 0); t_puts("\", ", 0); t_putdec(hdr[0], 0); t_puts("x", 0); t_putdec(hdr[1], 0);
+                    t_puts(", ", 0); t_putdec(k, 0); t_puts(" widgets", 0);
+                    if ((hdr[4] & PF_3D) != 0) { t_puts(", uses 3D", 0); }
+                    if ((hdr[4] & PF_TIMERS) != 0) { t_puts(", uses timers", 0); }
+                    t_putc(10, 0);
+                }
+                kfree(wd as *u8);
+            } else if (fs_nodes[n].size >= 4 && fs_nodes[n].data[0] == 'A' && fs_nodes[n].data[1] == 'P' && fs_nodes[n].data[2] == 'P' && fs_nodes[n].data[3] == '|') { t_puts("Peacock program source (compile with 'peac')\n", 0); }
+            else if (fs_nodes[n].size == 0) { t_puts("empty\n", 0); }
+            else {
+                var text = true; var k = 0;
+                while (k < fs_nodes[n].size && k < 256) { let ch = fs_nodes[n].data[k] as int; if (ch < 9 || (ch > 13 && ch < 32) || ch > 126) { text = false; } k++; }
+                if (text) { t_puts("ASCII text\n", 0); } else { t_puts("data\n", 0); }
+            }
+        }
+        i++;
+    }
+}
+
+/// peac <source> [output.pea]: compile a Peacock text source to an executable
+fn sh_peac() {
+    if (targc < 2) { t_puts("usage: peac <source> [output.pea]\n", 2); return; }
+    let sn = sh_node_arg(1, "peac");
+    if (sn < 0) { return; }
+    var out: u8[128];
+    if (targc > 2) { kstrncpy(&out[0], t_av(2), 128); }
+    else {
+        kstrncpy(&out[0], t_av(1), 120);
+        let l = kstrlen(&out[0]);
+        if (ends_with(&out[0], ".peas")) { out[l - 1] = 0; } else if (ends_with(&out[0], ".pea")) { kstrncpy(&out[l - 4], "-bin.pea", 9); } else { kstrncpy(&out[l], ".pea", 5); }
+    }
+    var on = fs_resolve(&out[0]);
+    if (on < 0) { on = fs_create(&out[0], K_FILE); }
+    if (on < 0) { t_puts("peac: cannot create the output file\n", 2); return; }
+    if (on == sn) { t_puts("peac: the output would overwrite the source\n", 2); return; }
+    let copy = kmalloc(fs_nodes[sn].size + 1);
+    if (copy == (0 as *u8)) { t_puts("peac: out of memory\n", 2); return; }
+    kmemcpy(copy, fs_nodes[sn].data, fs_nodes[sn].size); copy[fs_nodes[sn].size] = 0;
+    let r = pea_compile(copy, fs_nodes[sn].size, on);
+    kfree(copy);
+    if (r != 0) { t_puts("peac: ", 2); t_puts(t_av(1), 2); t_puts(": not a valid Peacock source\n", 2); return; }
+    t_puts(&out[0], 3); t_puts(" written (", 0); t_putdec(fs_nodes[on].size, 0); t_puts(" bytes, executable)\n", 0);
+}
+
+/// peadump <program>: header, section table and the program as source
+fn sh_peadump() {
+    if (targc < 2) { t_puts("usage: peadump <program.pea>\n", 2); return; }
+    let n = sh_node_arg(1, "peadump");
+    if (n < 0) { return; }
+    let d = fs_nodes[n].data; let len = fs_nodes[n].size;
+    if (!pea_is_binary(d, len)) { t_puts("peadump: not a Peacock executable\n", 2); return; }
+    var hdr: int[6]; var tt: u8[32];
+    let wd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd;
+    let k = pea_decode(d, len, wd, &hdr[0], &tt[0]);
+    t_puts("PEA header\n", 3);
+    t_puts("  magic      7f 50 45 41   version ", 0); t_putdec(d[5] as int, 0); t_puts("   class ", 0); t_putdec(d[4] as int, 0); t_puts(" (GUI)\n", 0);
+    t_puts("  size       ", 0); t_putdec(pru32(d, 16), 0); t_puts(" bytes   sections ", 0); t_putdec(pru32(d, 12), 0); t_puts("   needs OS >= ", 0); t_putdec(pru32(d, 20) / 100, 0); t_putc('.', 0); t_putdec(pru32(d, 20) % 100 / 10, 0); t_putc(10, 0);
+    var ts: u8[24]; fs_time_str(pru32(d, 28), &ts[0]);
+    t_puts("  built      ", 0); t_puts(&ts[0], 0); t_puts("   by ", 0); t_puts((d + 32) as *u8, 0); t_putc(10, 0);
+    t_puts("  flags      ", 0); t_hex(d[6] as int, 2); if ((d[6] as int & PF_3D) != 0) { t_puts(" 3D", 0); } if ((d[6] as int & PF_TIMERS) != 0) { t_puts(" timers", 0); } t_putc(10, 0);
+    t_puts("  header crc ", 0); t_hex(pru32(d, 48), 8); t_putc(10, 0);
+    t_puts("sections\n", 3);
+    var s = 0;
+    while (s < pru32(d, 12) && s < 8) {
+        let e = PEA_HDR + s * 16;
+        let ty = pru32(d, e);
+        t_puts("  ", 0); t_putdec(s, 0); t_puts("  ", 0);
+        if (ty == PS_META) { t_puts("META   ", 0); } else if (ty == PS_WIDGETS) { t_puts("WIDGETS", 0); } else if (ty == PS_INFO) { t_puts("INFO   ", 0); } else { t_puts("?      ", 0); }
+        t_puts("  offset ", 0); t_putdec(pru32(d, e + 4), 0); t_puts("  size ", 0); t_putdec(pru32(d, e + 8), 0); t_puts("  crc ", 0); t_hex(pru32(d, e + 12), 8);
+        let ok = (crc32(d + pru32(d, e + 4), pru32(d, e + 8)) & 0xFFFFFFFF) == pru32(d, e + 12);
+        if (ok) { t_puts("  ok\n", 0); } else { t_puts("  BAD\n", 2); }
+        s++;
+    }
+    if (k < 0) { t_puts("verify: ", 3); t_puts(pea_err_str(k), 2); t_putc(10, 0); kfree(wd as *u8); return; }
+    t_puts("verify: ok\n", 0);
+    t_puts("source\n", 3);
+    let buf = kzalloc(8192);
+    if (buf != (0 as *u8)) {
+        let m = wd_ser(buf, wd, k, &tt[0], hdr[0], hdr[1], hdr[2]);
+        var i = 0;
+        while (i < m) { if (buf[i] == 10) { t_putc(10, 0); } else { t_putc(buf[i] as int, 0); } i++; }
+        kfree(buf);
+    }
+    kfree(wd as *u8);
+}
+
+fn sh_depth() {
+    if (targc < 2) { t_puts("depth: ", 2); t_puts(depth_name(ui_depth), 2); t_puts("   (depth flat|soft|3d)\n", 2); return; }
+    let a = t_av(1);
+    if (kstreq(a, "flat")) { depth_apply(0, true); }
+    else if (kstreq(a, "soft")) { depth_apply(1, true); }
+    else if (kstreq(a, "3d")) { depth_apply(2, true); }
+    else { t_puts("depth: use flat, soft or 3d\n", 2); return; }
+    t_puts("button style set to ", 2); t_puts(depth_name(ui_depth), 2); t_puts("\n", 2);
+}
+
+fn sh_exec(c: *u8) -> bool {
+    if (kstreq(c, "depth")) { sh_depth(); }
+    else if (kstreq(c, "cp")) { sh_cp(); }
+    else if (kstreq(c, "mv")) { sh_mv(); }
+    else if (kstreq(c, "rm")) { sh_rm(); }
+    else if (kstreq(c, "head")) { sh_head(); }
+    else if (kstreq(c, "tail")) { sh_tail(); }
+    else if (kstreq(c, "wc")) { sh_wc(); }
+    else if (kstreq(c, "grep")) { sh_grep(); }
+    else if (kstreq(c, "find")) { sh_find(); }
+    else if (kstreq(c, "tree")) { sh_tree(); }
+    else if (kstreq(c, "du")) { sh_du(); }
+    else if (kstreq(c, "df")) { sh_df(); }
+    else if (kstreq(c, "stat")) { sh_stat(); }
+    else if (kstreq(c, "attr") || kstreq(c, "chmod")) { sh_attr(); }
+    else if (kstreq(c, "fsck")) { sh_fsck(); }
+    else if (kstreq(c, "ps")) { sh_ps(); }
+    else if (kstreq(c, "kill")) { sh_kill(); }
+    else if (kstreq(c, "spawn")) { sh_spawn(); }
+    else if (kstreq(c, "install")) { sh_install(); }
+    else if (kstreq(c, "edit")) { sh_edit(); }
+    else if (kstreq(c, "ifconfig") || kstreq(c, "ip")) { sh_ifconfig(); }
+    else if (kstreq(c, "dhcp")) { if (net_ready) { dhcp_start(); t_puts("asking for an address ...\n", 4); } else { t_puts("no network card\n", 2); } }
+    else if (kstreq(c, "ping")) { sh_ping(); }
+    else if (kstreq(c, "nslookup")) { sh_nslookup(); }
+    else if (kstreq(c, "run")) { sh_run(); }
+    else if (kstreq(c, "file")) { sh_file(); }
+    else if (kstreq(c, "peac")) { sh_peac(); }
+    else if (kstreq(c, "peadump")) { sh_peadump(); }
+    else if (kstreq(c, "wget")) { sh_wget(); }
+    else if (kstreq(c, "browse") || kstreq(c, "web")) { sh_browse(); }
+    else { return sh_try_prog(c); }
+    return true;
+}

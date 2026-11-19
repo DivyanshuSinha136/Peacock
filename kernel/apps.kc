@@ -1,0 +1,881 @@
+// apps.kc -- the built-in applications: Terminal, Notes, Paint, Calculator, System Info.
+// Author: Divyanshu Sinha (MIT License)
+// Each app has one window at most; its state lives in globals.  ui.kc calls the app_* dispatchers below.
+// Needs: gfx.kc, ui.kc (ui_inval*), fs.kc, kstr.kc, input.kc and the hooks listed in ui.kc.
+
+// ================================================================= dispatchers
+fn app_size(kind: int, out: *int) {
+    if (kind == APP_TERM) { out[0] = TCOLS * 8 + 8; out[1] = TROWS * 16 + 8; }
+    else if (kind == APP_NOTES) { out[0] = 860; out[1] = 540; }
+    else if (kind == APP_PAINT) { out[0] = PW + 16; out[1] = PTOP + PH + 8; }
+    else if (kind == APP_CALC) { out[0] = 236; out[1] = 292; }
+    else if (kind == APP_INFO) { out[0] = 400; out[1] = 290; }
+    else if (kind == APP_SETTINGS) { set_size(out); }
+    else { app2_size(kind, out); }
+}
+fn app_init(kind: int) {
+    if (kind == APP_TERM) { term_init(); }
+    else if (kind == APP_NOTES) { notes_init(); }
+    else if (kind == APP_PAINT) { paint_init(); }
+    else if (kind == APP_CALC) { calc_reset(); }
+    else if (kind == APP_INFO) { info_init(); }
+    else if (kind == APP_SETTINGS) { set_init(); }
+    else { app2_init(kind); }
+}
+fn app_close(kind: int) {
+    if (kind == APP_PAINT) { paint_free(); }
+    else if (kind == APP_SETTINGS) { set_close(); }
+    else { app2_close(kind); }
+}
+fn app_draw(kind: int, x: int, y: int, w: int, h: int, foc: bool) {
+    if (kind == APP_TERM) { term_draw(x, y, w, h, foc); }
+    else if (kind == APP_NOTES) { notes_draw(x, y, w, h, foc); }
+    else if (kind == APP_PAINT) { paint_draw(x, y, w, h); }
+    else if (kind == APP_CALC) { calc_draw(x, y, w, h); }
+    else if (kind == APP_INFO) { info_draw(x, y, w, h); }
+    else if (kind == APP_SETTINGS) { set_draw(x, y, w, h, foc); }
+    else { app2_draw(kind, x, y, w, h, foc); }
+}
+fn app_key(kind: int, k: int) {
+    if (kind == APP_TERM) { term_key(k); }
+    else if (kind == APP_NOTES) { notes_key(k); }
+    else if (kind == APP_CALC) { calc_key(k); }
+    else if (kind == APP_SETTINGS) { set_key(k); }
+    else { app2_key(kind, k); }
+}
+/// ev: 1 press, 2 move (button held), 3 release, 4 right-button press; (mx, my) relative to the client area
+fn app_mouse(kind: int, mx: int, my: int, ev: int, w: int, h: int) {
+    if (kind == APP_NOTES) { notes_mouse(mx, my, ev); }
+    else if (kind == APP_PAINT) { paint_mouse(mx, my, ev); }
+    else if (kind == APP_CALC) { calc_mouse(mx, my, ev); }
+    else if (kind == APP_SETTINGS) { set_mouse(mx, my, ev); }
+    else { app2_mouse(kind, mx, my, ev, w, h); }
+}
+/// called every frame; true = the window needs a redraw
+fn app_tick(kind: int) -> bool {
+    if (kind == APP_TERM) { return term_tick(); }
+    if (kind == APP_NOTES) { return notes_tick(); }
+    if (kind == APP_INFO) { return info_tick(); }
+    if (kind == APP_SETTINGS) { return set_tick(); }
+    return app2_tick(kind);
+}
+
+fn blink_on() -> bool { return ((ticks / 50) & 1) == 0; }
+
+// ================================================================= Terminal
+const TCOLS = 70; const TROWS = 20;
+var tch: u8[1400];
+var tat: u8[1400];
+var t_row = 0; var t_col = 0;
+var tin: u8[128];
+var tin_len = 0;
+var targ: u8[128];
+var targv: int[16];
+var targc = 0;
+var thist: u8[1024];            // 8 entries x 128
+var thist_n = 0;
+var thist_pos = 0;
+var t_blink = true;
+var t_cwd_name: u8[128];
+const SB_MAX = 300;                      // scrollback lines (heap ring, allocated by term_init)
+var sb_ch: *u8; var sb_at: *u8;
+var sb_n = 0; var sb_head = 0; var t_off = 0;
+
+fn term_clear() {
+    sb_n = 0; sb_head = 0; t_off = 0;
+    var i = 0;
+    while (i < TCOLS * TROWS) { tch[i] = ' '; tat[i] = 0; i++; }
+    t_row = 0; t_col = 0;
+}
+fn term_scroll() {
+    if (sb_ch != (0 as *u8)) {
+        kmemcpy(sb_ch + sb_head * TCOLS, &tch[0], TCOLS);
+        kmemcpy(sb_at + sb_head * TCOLS, &tat[0], TCOLS);
+        sb_head = (sb_head + 1) % SB_MAX;
+        if (sb_n < SB_MAX) { sb_n++; }
+    }
+    var i = 0;
+    while (i < TCOLS * (TROWS - 1)) { tch[i] = tch[i + TCOLS]; tat[i] = tat[i + TCOLS]; i++; }
+    while (i < TCOLS * TROWS) { tch[i] = ' '; tat[i] = 0; i++; }
+    t_row = TROWS - 1;
+}
+fn t_putc(c: int, a: int) {
+    if (c == 10) { t_col = 0; t_row++; if (t_row >= TROWS) { term_scroll(); } return; }
+    if (c == 8) { if (t_col > 0) { t_col--; tch[t_row * TCOLS + t_col] = ' '; } return; }
+    if (c == 9) { t_putc(' ', a); while ((t_col & 3) != 0) { t_putc(' ', a); } return; }
+    if (t_col >= TCOLS) { t_col = 0; t_row++; if (t_row >= TROWS) { term_scroll(); } }
+    tch[t_row * TCOLS + t_col] = c as u8;
+    tat[t_row * TCOLS + t_col] = a as u8;
+    t_col++;
+}
+fn t_puts(s: *u8, a: int) { var i = 0; while (s[i] != 0) { t_putc(s[i] as int, a); i++; } }
+fn t_putdec(v: int, a: int) { var b: u8[24]; itoa(v, &b[0]); t_puts(&b[0], a); }
+
+fn t_prompt() {
+    fs_path(fs_cwd, &t_cwd_name[0]);
+    t_puts("peacock", 1); t_puts(":", 4); t_puts(&t_cwd_name[0], 3); t_puts("$ ", 1);
+}
+
+fn term_init() {
+    if (sb_ch == (0 as *u8)) { sb_ch = kzalloc(SB_MAX * TCOLS); sb_at = kzalloc(SB_MAX * TCOLS); if (sb_at == (0 as *u8)) { sb_ch = 0 as *u8; } }
+    term_clear();
+    t_puts("Peacock terminal  -  type 'help'\n", 3);
+    t_prompt();
+    tin_len = 0; thist_n = 0; thist_pos = 0;
+}
+
+fn t_av(i: int) -> *u8 { return targv[i] as *u8; }
+
+fn term_split() {
+    kstrncpy(&targ[0], &tin[0], 128);
+    targc = 0;
+    var i = 0;
+    while (targ[i] != 0) {
+        while (targ[i] == ' ') { targ[i] = 0; i++; }
+        if (targ[i] == 0) { break; }
+        if (targc < 16) { targv[targc] = (&targ[i]) as int; targc++; }
+        while (targ[i] != 0 && targ[i] != ' ') { i++; }
+    }
+}
+
+fn t_cat_file(n: int) {
+    var i = 0;
+    while (i < fs_nodes[n].size) { t_putc(fs_nodes[n].data[i] as int, 0); i++; }
+    if (fs_nodes[n].size > 0 && fs_nodes[n].data[fs_nodes[n].size - 1] != 10) { t_putc(10, 0); }
+}
+
+fn t_help() {
+    t_puts("files:   ls [-la] cd pwd cat mkdir touch rm [-r] cp [-r] mv echo [> file] stat file attr +r|+h|+x fsck sync\n", 0);
+    t_puts("network: ifconfig dhcp ping nslookup wget <url> [file]  browse [url]\n", 3);
+    t_puts("text:    head tail wc grep [-nir] find [-name x] tree du df edit <file>\n", 0);
+    t_puts("install: install [-l] [folder]  unpack the KingCobra sources (default /usr/src)\n", 3);
+    t_puts("system:  ver uname date uptime mem cpu neofetch  ps kill <id> spawn counter|spin|hog [n]\n", 0);
+    t_puts("programs: name or ./name.pea runs a program   peac <src> [out]   peadump <prog>   run <name>\n", 0);
+    t_puts("apps:    open <terminal|notes|paint|calc|files|cal|clock|snake|mines|monitor|web|settings|usb|network>\n", 0);
+    t_puts("hw:      lspci [-v]  lscpu  lsmem  acpi\n", 0);
+    t_puts("usb:     usb  (list devices)   usb read <sector>  (hex dump of the first USB disk)\n", 3);
+    t_puts("power:   reboot poweroff   other: clear beep help\n", 0);
+    t_puts("apps:    open builder (design your own apps)  open 3d (3D Studio)  run NAME   look: depth flat|soft|3d\n", 0);
+    t_puts("keys:    Up/Down history, Tab complete, PgUp/PgDn scroll, Ctrl+L clear, Ctrl+U kill\n", 4);
+}
+
+fn t_cpu_vendor(out: *u8) {
+    var r: u32[4];
+    cpuid(0, &r[0]);
+    *((out) as *u32) = r[1];
+    *((out + 4) as *u32) = r[3];
+    *((out + 8) as *u32) = r[2];
+    out[12] = 0;
+}
+fn t_cpu_brand(out: *u8) {
+    var r: u32[4];
+    out[0] = 0;
+    cpuid(0x80000000, &r[0]);
+    if ((r[0] as int) < 0x80000004) { kstrncpy(out, "unknown x86-64 CPU", 48); return; }
+    var k = 0;
+    while (k < 3) {
+        cpuid(0x80000002 + k, &r[0]);
+        *((out + k * 16) as *u32) = r[0]; *((out + k * 16 + 4) as *u32) = r[1];
+        *((out + k * 16 + 8) as *u32) = r[2]; *((out + k * 16 + 12) as *u32) = r[3];
+        k++;
+    }
+    out[48] = 0;
+    var s = 0;
+    while (out[s] == ' ') { s++; }
+    if (s > 0) { kmemmove(out, out + s, 49 - s); }
+}
+
+/// sync: save now and report
+fn t_sync() {
+    let r = fs_save();
+    if (r == 0) { t_puts("saved generation ", 0); t_putdec(fs_gen, 0); t_puts(" (", 0); t_putdec(fs_saved_bytes, 0); t_puts(" bytes)\n", 0); }
+    else if (r == 1) { t_puts("sync: no disk\n", 2); }
+    else if (r == 2) { t_puts("sync: the filesystem is larger than the store (", 2); t_putdec(STORE_MAX / 1024, 2); t_puts(" KiB)\n", 2); }
+    else { t_puts("sync: write failed\n", 2); }
+}
+
+fn t_pad(n: int, w: int) {                    // right-align the decimal n in w columns
+    var d = 1; var v = n;
+    while (v >= 10) { v = v / 10; d++; }
+    while (d < w) { t_putc(32, 0); d++; }
+}
+fn t_attr_str(n: int, out: *u8) {
+    out[0] = fs_nodes[n].kind == K_DIR ? 'd' : '-';
+    out[1] = (fs_nodes[n].attr & FA_RO) != 0 ? 'r' : '-';
+    out[2] = (fs_nodes[n].attr & FA_HIDDEN) != 0 ? 'h' : '-';
+    out[3] = (fs_nodes[n].attr & FA_SYS) != 0 ? 's' : '-';
+    out[4] = (fs_nodes[n].attr & FA_EXEC) != 0 ? 'x' : '-';
+    out[5] = 0;
+}
+
+/// ls [-l] [-a] [path]: sorted (folders first); -a shows hidden entries, -l adds attributes, size and modification time
+fn t_ls() {
+    var dir = fs_cwd;
+    var longf = false; var all = false;
+    var i = 1;
+    while (i < targc) {
+        let a = t_av(i);
+        if (a[0] == '-' && a[1] != 0) {
+            var k = 1;
+            while (a[k] != 0) { if (a[k] == 'l') { longf = true; } else if (a[k] == 'a') { all = true; } k++; }
+        } else { dir = fs_resolve(a); if (dir < 0) { t_puts("ls: no such path\n", 2); return; } }
+        i++;
+    }
+    var one: int[1];
+    var ids = kmalloc(FS_MAX * 8) as *int;
+    var cnt = 0;
+    if (fs_nodes[dir].kind == K_FILE) { one[0] = dir; ids = &one[0]; cnt = 1; }
+    else {
+        if (ids == (0 as *int)) { t_puts("ls: out of memory\n", 2); return; }
+        cnt = fs_list(dir, ids, FS_MAX, all);
+    }
+    var k = 0;
+    while (k < cnt) {
+        let n = ids[k];
+        if (longf) {
+            var at: u8[8]; t_attr_str(n, &at[0]);
+            var ts: u8[24]; fs_time_str(fs_nodes[n].mtime, &ts[0]);
+            t_puts(&at[0], 4); t_puts(" ", 0);
+            if (fs_nodes[n].kind == K_DIR) { t_puts("      -", 0); } else { t_pad(fs_nodes[n].size, 7); t_putdec(fs_nodes[n].size, 0); }
+            t_puts("  ", 0); t_puts(&ts[0], 4); t_puts("  ", 0);
+        }
+        if (fs_nodes[n].kind == K_DIR) { t_puts(&fs_nodes[n].name[0], 3); t_puts("/", 3); }
+        else { t_puts(&fs_nodes[n].name[0], 0); if (!longf) { t_puts("  ", 0); t_putdec(fs_nodes[n].size, 4); t_puts(" B", 4); } }
+        t_putc(10, 0);
+        k++;
+    }
+    if (ids != &one[0]) { kfree(ids as *u8); }
+}
+
+fn t_echo() {
+    var redirect = -1;
+    var append = false;
+    var i = 1;
+    while (i < targc) {
+        if (kstreq(t_av(i), ">") || kstreq(t_av(i), ">>")) { redirect = i; append = kstreq(t_av(i), ">>"); break; }
+        i++;
+    }
+    var stop = targc;
+    if (redirect >= 0) { stop = redirect; }
+    var out: u8[128];
+    var o = 0;
+    i = 1;
+    while (i < stop) {
+        let s = t_av(i);
+        var j = 0;
+        while (s[j] != 0 && o < 125) { out[o] = s[j]; o++; j++; }
+        if (i + 1 < stop && o < 125) { out[o] = ' '; o++; }
+        i++;
+    }
+    out[o] = 0;
+    if (redirect < 0) { t_puts(&out[0], 0); t_putc(10, 0); return; }
+    if (redirect + 1 >= targc) { t_puts("echo: missing file name\n", 2); return; }
+    out[o] = 10; out[o + 1] = 0;
+    var n = fs_resolve(t_av(redirect + 1));
+    if (n < 0) { n = fs_create(t_av(redirect + 1), K_FILE); }
+    if (n < 0 || !fs_write(n, &out[0], o + 1, append)) { t_puts("echo: cannot write\n", 2); }
+}
+
+fn t_open() {
+    if (targc < 2) { t_puts("usage: open terminal|notes|paint|calc|info|files|cal|clock|snake|mines|monitor|web|builder\n", 2); return; }
+    let a = t_av(1);
+    if (kstreq(a, "terminal")) { app_open(APP_TERM); }
+    else if (kstreq(a, "notes")) { app_open(APP_NOTES); }
+    else if (kstreq(a, "paint")) { app_open(APP_PAINT); }
+    else if (kstreq(a, "calc")) { app_open(APP_CALC); }
+    else if (kstreq(a, "info")) { app_open(APP_INFO); }
+    else if (kstreq(a, "files")) { app_open(APP_FILES); }
+    else if (kstreq(a, "cal") || kstreq(a, "calendar")) { app_open(APP_CAL); }
+    else if (kstreq(a, "clock")) { app_open(APP_CLOCK); }
+    else if (kstreq(a, "snake")) { app_open(APP_SNAKE); }
+    else if (kstreq(a, "mines") || kstreq(a, "minesweeper")) { app_open(APP_MINES); }
+    else if (kstreq(a, "monitor") || kstreq(a, "mon")) { app_open(APP_MON); }
+    else if (kstreq(a, "web") || kstreq(a, "browser")) { app_open(APP_WEB); }
+    else if (kstreq(a, "builder")) { app_open(APP_BLD); }
+    else if (kstreq(a, "settings")) { set_open(SP_APPEAR); }
+    else if (kstreq(a, "network") || kstreq(a, "net")) { set_open(SP_NET); }
+    else if (kstreq(a, "usb")) { set_open(SP_USB); }
+    else if (kstreq(a, "appearance") || kstreq(a, "theme") || kstreq(a, "themes")) { app_open(APP_THEME); }
+    else if (kstreq(a, "fonts") || kstreq(a, "font")) { app_open(APP_FONT); }
+    else if (kstreq(a, "3d") || kstreq(a, "studio")) { app_open(APP_3D); }
+    else { t_puts("open: unknown app\n", 2); }
+}
+
+fn t_hexc(v: int, digits: int, a: int) {
+    var i = digits - 1;
+    while (i >= 0) { let n = (v >> (i * 4)) & 15; if (n < 10) { t_putc('0' + n, a); } else { t_putc('a' + n - 10, a); } i--; }
+}
+fn t_lspci() {
+    let verbose = targc >= 2 && kstreq(t_av(1), "-v");
+    if (!pci_scanned) { pci_scan(); }
+    var i = 0;
+    while (i < pci_n) {
+        t_hexc(pcid_bus(i), 2, 3); t_putc(':', 3); t_hexc(pcid_dev(i), 2, 3); t_putc('.', 3); t_putc('0' + pcid_fn(i), 3); t_putc(' ', 0);
+        t_puts(pci_class_name(pd_cls[i]), 0);
+        t_putc(' ', 0); t_hexc(pd_vid[i], 4, 2); t_putc(':', 2); t_hexc(pd_did[i], 4, 2); t_putc(' ', 0);
+        let dn = pci_dev_name(pd_vid[i], pd_did[i]);
+        if (dn[0] != 0) { t_puts(dn, 0); } else { t_puts(pci_vendor_name(pd_vid[i]), 0); }
+        let dr = pci_driver_name(i);
+        if (dr[0] != 0) { t_puts("  [", 0); t_puts(dr, 4); t_putc(']', 0); }
+        t_putc(10, 0);
+        if (verbose) {
+            t_puts("    rev ", 0); t_hexc(pd_rev[i], 2, 0); t_puts("  irq ", 0); t_putdec(pd_irq[i] & 255, 0);
+            if (((pd_irq[i] >> 8) & 255) != 0) { t_putc(' ', 0); t_putc('A' + ((pd_irq[i] >> 8) & 255) - 1, 0); }
+            if (pd_caps[i] != 0) {
+                t_puts("  caps:", 0);
+                if ((pd_caps[i] & PCAP_PM) != 0) { t_puts(" PM", 0); } if ((pd_caps[i] & PCAP_MSI) != 0) { t_puts(" MSI", 0); }
+                if ((pd_caps[i] & PCAP_MSIX) != 0) { t_puts(" MSI-X", 0); } if ((pd_caps[i] & PCAP_PCIE) != 0) { t_puts(" PCIe", 0); }
+            }
+            if ((pd_hdr[i] & 0x7F) == 1) { t_puts("  bridge to bus ", 0); t_putdec(pd_sec[i], 0); }
+            t_putc(10, 0);
+            var k = 0;
+            while (k < 6) {
+                let ty = pd_bty[i * 6 + k];
+                if (ty != 0) {
+                    t_puts("    BAR", 0); t_putc('0' + k, 0); t_putc(' ', 0);
+                    if (ty == 1) { t_puts("I/O  ", 0); } else if ((ty & 3) == 3) { t_puts("mem64", 0); } else { t_puts("mem  ", 0); }
+                    t_puts(" 0x", 0); t_hexc(pd_bar[i * 6 + k], 8, 0);
+                    t_puts("  size ", 0);
+                    let sz = pd_bsz[i * 6 + k];
+                    if (sz >= 1048576) { t_putdec(sz / 1048576, 0); t_puts(" MiB", 0); } else if (sz >= 1024) { t_putdec(sz / 1024, 0); t_puts(" KiB", 0); } else { t_putdec(sz, 0); t_puts(" B", 0); }
+                    if (ty >= 4) { t_puts("  prefetchable", 0); }
+                    t_putc(10, 0);
+                }
+                k++;
+            }
+        }
+        i++;
+    }
+    t_putdec(pci_n, 0); t_puts(" PCI function(s) on ", 0); t_putdec(pci_buses, 0); t_puts(" bus(es)\n", 0);
+}
+fn t_lscpu() {
+    var f: u8[160];
+    cpu_features(&f[0], 160);
+    t_puts("Vendor    ", 3); t_puts(&cpu_vendor[0], 0); t_putc(10, 0);
+    t_puts("Model     ", 3); t_puts(&cpu_brand[0], 0); t_putc(10, 0);
+    t_puts("Family    ", 3); t_putdec(cpu_fam, 0); t_puts("  model ", 0); t_putdec(cpu_mod, 0); t_puts("  stepping ", 0); t_putdec(cpu_step, 0); t_putc(10, 0);
+    t_puts("Threads   ", 3); t_putdec(cpu_logical, 0); t_puts(" per package (this kernel runs on the boot CPU)\n", 0);
+    t_puts("Features  ", 3); t_puts(&f[0], 0); t_putc(10, 0);
+}
+fn t_acpi() {
+    if (!acpi_ok) { t_puts("acpi: no valid tables found\n", 2); return; }
+    t_puts("ACPI ", 3); t_puts(&acpi_oem[0], 0); t_puts("  revision ", 0); t_putdec(acpi_rev, 0); t_putc(10, 0);
+    t_puts("tables:", 3);
+    var i = 0;
+    while (i < acpi_nt) { t_putc(' ', 0); var s = 0; while (s < 4) { t_putc((at_sig[i] >> (s * 8)) & 255, 0); s++; } i++; }
+    t_putc(10, 0);
+    t_puts("PM1a_CNT 0x", 3); t_hexc(acpi_pm1a, 4, 0); t_puts("  SMI_CMD 0x", 0); t_hexc(acpi_smi, 4, 0); t_puts("  SCI irq ", 0); t_putdec(acpi_sci, 0); t_putc(10, 0);
+    if (acpi_slp_a >= 0) { t_puts("S5 soft-off: SLP_TYP ", 3); t_putdec(acpi_slp_a, 0); t_putc(',', 0); t_putdec(acpi_slp_b, 0); t_putc(10, 0); }
+    else { t_puts("S5 soft-off: not found in the DSDT (QEMU port fallback is used)\n", 0); }
+    t_puts("CPUs ", 3); t_putdec(acpi_ncpu, 0); t_puts("   I/O APICs ", 0); t_putdec(acpi_nioapic, 0);
+    if (acpi_rst_space >= 0) { t_puts("   reset register present", 0); }
+    t_putc(10, 0);
+}
+fn t_lsmem() {
+    var i = 0;
+    var tot = 0;
+    while (i < e820_count()) {
+        t_puts("0x", 0); t_hexc(e820_base(i), 9, 3); t_puts(" - 0x", 0); t_hexc(e820_base(i) + e820_len(i) - 1, 9, 3); t_puts("  ", 0);
+        let ty = e820_type(i);
+        if (ty == 1) { t_puts("usable   ", 4); tot = tot + e820_len(i); } else if (ty == 2) { t_puts("reserved ", 0); } else if (ty == 3) { t_puts("ACPI data", 0); } else if (ty == 4) { t_puts("ACPI NVS ", 0); } else { t_puts("other    ", 0); }
+        t_putc(' ', 0); t_putdec(e820_len(i) / 1024, 0); t_puts(" KiB\n", 0);
+        i++;
+    }
+    t_puts("usable: ", 3); t_putdec(tot / 1048576, 0); t_puts(" MiB\n", 0);
+}
+
+fn t_usb() {
+    if (!usb_ok) { t_puts("usb: no UHCI controller (QEMU: add -usb)\n", 2); return; }
+    if (targc >= 3 && kstreq(t_av(1), "read")) {
+        let lba = katoi(t_av(2));
+        var sec: u8[512];
+        if (!usb_ms_read(lba, 1, &sec[0])) { t_puts("usb: read failed (no USB disk, or sector out of range)\n", 2); return; }
+        var r = 0;
+        while (r < 8) {
+            var c = 0;
+            while (c < 16) {
+                let v = sec[r * 16 + c] as int;
+                let hi = v >> 4; let lo = v & 15;
+                if (hi < 10) { t_putc('0' + hi, 0); } else { t_putc('a' + hi - 10, 0); }
+                if (lo < 10) { t_putc('0' + lo, 0); } else { t_putc('a' + lo - 10, 0); }
+                t_putc(' ', 0);
+                c++;
+            }
+            t_putc(10, 0);
+            r++;
+        }
+        return;
+    }
+    t_puts("UHCI controller, ", 0); t_putdec(usb_nports, 0); t_puts(" ports, ", 0); t_putdec(usb_count(), 0); t_puts(" device(s)\n", 0);
+    var k = 0;
+    while (k < usb_count()) {
+        let d = usb_nth(k);
+        t_puts("  port ", 3); t_putdec(ud_port[d] + 1, 3); t_puts("  ", 0); t_puts(usb_kind_name(ud_kind[d]), 0); t_puts("  ", 0); t_puts(ud_namep(d), 0);
+        if (ud_kind[d] == UK_STORAGE) { t_puts("  ", 0); t_putdec(ud_blocks[d] / 2048, 0); t_puts(" MiB", 0); }
+        t_putc(10, 0);
+        k++;
+    }
+}
+
+fn t_neofetch() {
+    var b: u8[64];
+    t_puts("   .-\"\"-.     ", 1); t_puts("peacock", 3); t_puts("@", 4); t_puts("os\n", 3);
+    t_puts("  / (  ) \\    ", 1); t_puts("OS:     ", 3); t_puts(os_version(), 0); t_puts("\n", 0);
+    t_puts(" | ( () ) |   ", 1); t_puts("Kernel: ", 3); t_puts("kcc --target kcos\n", 0);
+    t_puts("  \\ (  ) /    ", 1); t_puts("CPU:    ", 3); t_cpu_brand(&b[0]); t_puts(&b[0], 0); t_putc(10, 0);
+    t_puts("   '-..-'     ", 1); t_puts("Screen: ", 3); t_putdec(fb_w, 0); t_puts("x", 0); t_putdec(fb_h, 0); t_puts("x", 0); t_putdec(fb_bpp, 0); t_putc(10, 0);
+    t_puts("      ||      ", 1); t_puts("Uptime: ", 3); t_putdec(ticks / 100, 0); t_puts(" s\n", 0);
+}
+
+fn t_exec() {
+    term_split();
+    if (targc == 0) { return; }
+    let c = t_av(0);
+    if (kstreq(c, "help")) { t_help(); }
+    else if (kstreq(c, "clear")) { term_clear(); }
+    else if (kstreq(c, "echo")) { t_echo(); }
+    else if (kstreq(c, "ver") || kstreq(c, "uname")) { t_puts(os_version(), 0); t_puts(" x86-64, written in KingCobra (kernel by kcc, boot stage by KingCobra)\n", 0); }
+    else if (kstreq(c, "date")) {
+        var t: int[6]; rtc_read(&t[0]);
+        t_putdec(t[0], 0); t_putc('-', 0); if (t[1] < 10) { t_putc('0', 0); } t_putdec(t[1], 0); t_putc('-', 0); if (t[2] < 10) { t_putc('0', 0); } t_putdec(t[2], 0);
+        t_putc(' ', 0); t_puts(&clock_txt[0], 0); t_putc(10, 0);
+    }
+    else if (kstreq(c, "uptime")) { t_putdec(ticks / 100, 0); t_puts(" seconds\n", 0); }
+    else if (kstreq(c, "mem")) {
+        var h: int[4]; heap_stats(&h[0]);
+        t_puts("RAM usable: ", 3); t_putdec(ram_usable / 1048576, 0); t_puts(" MiB   free frames: ", 3); t_putdec(pm_free * 4 / 1024, 0); t_puts(" MiB\n", 0);
+        t_puts("heap used:  ", 3); t_putdec(h[0] / 1024, 0); t_puts(" KiB   free: ", 3); t_putdec(h[1] / 1024, 0); t_puts(" KiB\n", 0);
+    }
+    else if (kstreq(c, "cpu")) { var v: u8[16]; var b: u8[64]; t_cpu_vendor(&v[0]); t_cpu_brand(&b[0]); t_puts(&v[0], 0); t_puts("  ", 0); t_puts(&b[0], 0); t_putc(10, 0); }
+    else if (kstreq(c, "neofetch")) { t_neofetch(); }
+    else if (kstreq(c, "ls")) { t_ls(); }
+    else if (kstreq(c, "pwd")) { fs_path(fs_cwd, &t_cwd_name[0]); t_puts(&t_cwd_name[0], 0); t_putc(10, 0); }
+    else if (kstreq(c, "cd")) {
+        var d = 0;
+        if (targc > 1) { d = fs_resolve(t_av(1)); }
+        if (d < 0 || fs_nodes[d].kind != K_DIR) { t_puts("cd: not a directory\n", 2); } else { fs_cwd = d; }
+    }
+    else if (kstreq(c, "cat")) {
+        if (targc < 2) { t_puts("usage: cat <file>\n", 2); }
+        else { let n = fs_resolve(t_av(1)); if (n < 0 || fs_nodes[n].kind != K_FILE) { t_puts("cat: no such file\n", 2); } else { t_cat_file(n); } }
+    }
+    else if (kstreq(c, "mkdir")) { if (targc < 2 || fs_create(t_av(1), K_DIR) < 0) { t_puts("mkdir: failed\n", 2); } }
+    else if (kstreq(c, "touch")) { if (targc < 2 || (fs_resolve(t_av(1)) < 0 && fs_create(t_av(1), K_FILE) < 0)) { t_puts("touch: failed\n", 2); } }
+    else if (kstreq(c, "sync")) { t_sync(); }
+    else if (kstreq(c, "open")) { t_open(); }
+    else if (kstreq(c, "theme")) { th_cmd(); }
+    else if (kstreq(c, "usb")) { t_usb(); }
+    else if (kstreq(c, "lspci")) { t_lspci(); }
+    else if (kstreq(c, "lscpu")) { t_lscpu(); }
+    else if (kstreq(c, "acpi")) { t_acpi(); }
+    else if (kstreq(c, "lsmem")) { t_lsmem(); }
+    else if (kstreq(c, "beep")) { speaker_on(880); pit_sleep_ms(120); speaker_off(); }
+    else if (kstreq(c, "reboot")) { fs_flush(); sys_reboot(); }
+    else if (kstreq(c, "poweroff") || kstreq(c, "shutdown")) { fs_flush(); sys_poweroff(); }
+    else if (!sh_exec(c)) { t_puts(c, 2); t_puts(": command not found (try 'help')\n", 2); }
+}
+
+fn term_hist_show(n: int) {                      // replace the input line with history entry n
+    while (tin_len > 0) { t_putc(8, 0); tin_len--; }
+    kstrncpy(&tin[0], &thist[n * 128], 128);
+    tin_len = kstrlen(&tin[0]);
+    t_puts(&tin[0], 0);
+}
+
+fn t_complete() {
+    var ts = tin_len;
+    while (ts > 0 && tin[ts - 1] != ' ') { ts--; }
+    var ls = -1; var i = ts;
+    while (i < tin_len) { if (tin[i] == '/') { ls = i; } i++; }
+    var dirnode = fs_cwd; var pstart = ts;
+    if (ls >= 0) {
+        var dp: u8[128]; var n = 0;
+        i = ts;
+        while (i <= ls && n < 120) { dp[n] = tin[i]; n++; i++; }
+        dp[n] = 0;
+        dirnode = fs_resolve(&dp[0]);
+        pstart = ls + 1;
+    }
+    if (dirnode < 0 || fs_nodes[dirnode].kind != K_DIR) { return; }
+    let pl = tin_len - pstart;
+    var cnt = 0; var first = -1; var cl = 0; var common: u8[32];
+    i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == dirnode) {
+            var m = 0;
+            while (m < pl && fs_nodes[i].name[m] == tin[pstart + m]) { m++; }
+            if (m == pl) {
+                if (cnt == 0) { kstrncpy(&common[0], &fs_nodes[i].name[0], 32); cl = kstrlen(&common[0]); }
+                else { var q = 0; while (q < cl && common[q] == fs_nodes[i].name[q]) { q++; } cl = q; }
+                cnt++; first = i;
+            }
+        }
+        i++;
+    }
+    if (cnt == 0) { return; }
+    var k = pl;
+    while (k < cl && tin_len < 120) { tin[tin_len] = common[k]; tin_len++; t_putc(common[k] as int, 0); k++; }
+    if (cnt == 1) { if (fs_nodes[first].kind == K_DIR && tin_len < 120) { tin[tin_len] = '/'; tin_len++; t_putc('/', 0); } }
+    else if (cl == pl) {
+        t_putc(10, 0);
+        i = 1;
+        while (i < FS_MAX) {
+            if (fs_nodes[i].kind != K_FREE && fs_nodes[i].parent == dirnode) {
+                var m2 = 0;
+                while (m2 < pl && fs_nodes[i].name[m2] == tin[pstart + m2]) { m2++; }
+                if (m2 == pl) { t_puts(&fs_nodes[i].name[0], fs_nodes[i].kind == K_DIR ? 3 : 0); t_puts("  ", 0); }
+            }
+            i++;
+        }
+        t_putc(10, 0);
+        t_prompt();
+        tin[tin_len] = 0;
+        t_puts(&tin[0], 0);
+    }
+}
+
+fn term_key(k: int) {
+    if (k == KEY_PGUP) { t_off = imin(t_off + TROWS - 2, sb_n); ui_inval_all(APP_TERM); return; }
+    if (k == KEY_PGDN) { t_off = imax(t_off - (TROWS - 2), 0); ui_inval_all(APP_TERM); return; }
+    if (t_job != 0) { if (k == 3) { sh_job_cancel(); ui_inval_all(APP_TERM); } return; }
+    let was_off = t_off; let r0 = t_row; let s0 = sb_n;
+    t_off = 0;
+    if (k == 9) { t_complete(); }
+    else if (k == 10) {
+        t_putc(10, 0);
+        tin[tin_len] = 0;
+        if (tin_len > 0) {
+            kstrncpy(&thist[(thist_n & 7) * 128], &tin[0], 128);
+            thist_n++; thist_pos = thist_n;
+        }
+        t_exec();
+        t_prompt();
+        tin_len = 0;
+    } else if (k == 8) { if (tin_len > 0) { tin_len--; t_putc(8, 0); } }
+    else if (k == 12) { term_clear(); t_prompt(); tin[tin_len] = 0; t_puts(&tin[0], 0); }
+    else if (k == 3) { t_puts("^C\n", 4); t_prompt(); tin_len = 0; }
+    else if (k == 21) { while (tin_len > 0) { t_putc(8, 0); tin_len--; } }
+    else if (k == KEY_UP) { if (thist_pos > 0 && thist_pos > thist_n - 8) { thist_pos--; term_hist_show(thist_pos & 7); } }
+    else if (k == KEY_DOWN) {
+        if (thist_pos < thist_n - 1) { thist_pos++; term_hist_show(thist_pos & 7); }
+        else { thist_pos = thist_n; while (tin_len > 0) { t_putc(8, 0); tin_len--; } }
+    }
+    else if (k >= 32 && k < 127 && tin_len < 120) { tin[tin_len] = k as u8; tin_len++; t_putc(k, 0); }
+    if (was_off == 0 && t_row == r0 && sb_n == s0 && (k == 8 || (k >= 32 && k < 127))) { ui_inval(APP_TERM, 0, 2 + r0 * 16, TCOLS * 8 + 8, 20); }   // typing touches one line
+    else { ui_inval_all(APP_TERM); }
+}
+
+fn term_tick() -> bool {
+    if (t_job != 0 && sh_job_tick()) { return true; }
+    let b = blink_on();
+    if (b != t_blink) { t_blink = b; return true; }
+    return false;
+}
+
+fn term_color(a: int) -> int {
+    if (a == 1) { return 0x2EE6C8; }
+    if (a == 2) { return 0xFF6B6B; }
+    if (a == 3) { return 0xF1C24B; }
+    if (a == 4) { return 0x8A97AD; }
+    return 0xD6E2F0;
+}
+
+fn term_draw(x: int, y: int, w: int, h: int, foc: bool) {
+    var r = 0;
+    while (r < TROWS) {
+        let ln = sb_n - t_off + r;
+        var cp = &tch[0]; var ap = &tat[0];
+        if (ln < sb_n) {
+            let idx = ((sb_head - sb_n + ln) % SB_MAX + SB_MAX) % SB_MAX;
+            cp = sb_ch + idx * TCOLS; ap = sb_at + idx * TCOLS;
+        } else { cp = &tch[(ln - sb_n) * TCOLS]; ap = &tat[(ln - sb_n) * TCOLS]; }
+        var c = 0;
+        while (c < TCOLS) {
+            let ch = cp[c] as int;
+            if (ch != ' ') { draw_char(x + 4 + c * 8, y + 4 + r * 16, ch, term_color(ap[c] as int)); }
+            c++;
+        }
+        r++;
+    }
+    if (t_off > 0) {
+        fill(x + w - 190, y + 2, 186, 16, 0x30415C);
+        var e = draw_text(x + w - 186, y + 2, "scrollback ", 0xF1C24B);
+        e = draw_num(e, y + 2, t_off, 0xF1C24B);
+        draw_text(e, y + 2, " up", 0xF1C24B);
+    }
+    else if (t_blink || !foc) { fill(x + 4 + t_col * 8, y + 4 + t_row * 16 + 13, 8, 2, 0x2EE6C8); }
+}
+
+// (Notes lives in notepad.kc)
+
+// ================================================================= Paint
+const PW = 400; const PH = 260; const PTOP = 66;
+var pcanvas: *u8;
+var p_color = 0;
+var p_size = 3;
+var p_drawing = false;
+var p_lx = 0; var p_ly = 0;
+var p_pal: int[16] = [0x000000, 0x7F7F7F, 0xC0392B, 0xE67E22, 0xF1C40F, 0x2ECC71, 0x17A38F, 0x3498DB,
+                      0xFFFFFF, 0xBDC3C7, 0xE74C3C, 0xF39C12, 0xF9E79F, 0x82E0AA, 0x5DADE2, 0x8E44AD];
+
+fn paint_init() {
+    pcanvas = kmalloc(PW * PH);
+    if (pcanvas != (0 as *u8)) { kmemset(pcanvas, 8, PW * PH); }
+    p_color = 0; p_size = 3; p_drawing = false;
+}
+fn paint_free() { if (pcanvas != (0 as *u8)) { kfree(pcanvas); pcanvas = 0 as *u8; } }
+
+fn p_dot(cx: int, cy: int) {
+    let r = p_size / 2;
+    var yy = cy - r;
+    while (yy <= cy + r) {
+        var xx = cx - r;
+        while (xx <= cx + r) { if (xx >= 0 && xx < PW && yy >= 0 && yy < PH) { pcanvas[yy * PW + xx] = p_color as u8; } xx++; }
+        yy++;
+    }
+}
+
+fn p_line(x0: int, y0: int, x1: int, y1: int) {
+    var dx = x1 - x0; var dy = y1 - y0;
+    var n = imax(iabs(dx), iabs(dy));
+    if (n == 0) { p_dot(x0, y0); return; }
+    var i = 0;
+    while (i <= n) { p_dot(x0 + dx * i / n, y0 + dy * i / n); i++; }
+}
+
+fn paint_mouse(mx: int, my: int, ev: int) {
+    if (pcanvas == (0 as *u8) || ev == 4) { return; }
+    if (ev == 1 && my < PTOP - 4) {
+        // palette: 2 rows x 8 swatches of 20x20 starting at (8, 6)
+        if (mx >= 8 && mx < 168 && my >= 6 && my < 46) { p_color = ((my - 6) / 20) * 8 + (mx - 8) / 20; ui_inval(APP_PAINT, 0, 0, PW + 16, PTOP); return; }
+        // brush sizes at x = 180.. (4 buttons of 28), clear at 300
+        if (my >= 8 && my < 36) {
+            if (mx >= 180 && mx < 292) { let b = (mx - 180) / 28; p_size = 1 + b * 3; ui_inval(APP_PAINT, 0, 0, PW + 16, PTOP); return; }
+            if (mx >= 300 && mx < 360) { kmemset(pcanvas, 8, PW * PH); ui_inval_all(APP_PAINT); return; }
+        }
+        return;
+    }
+    let cx = mx - 8; let cy = my - PTOP;
+    if (ev == 1) { if (cx >= 0 && cx < PW && cy >= 0 && cy < PH) { p_drawing = true; p_lx = cx; p_ly = cy; p_dot(cx, cy); ui_inval(APP_PAINT, 8 + cx - p_size, PTOP + cy - p_size, p_size * 2 + 2, p_size * 2 + 2); } }
+    else if (ev == 2 && p_drawing) {
+        p_line(p_lx, p_ly, cx, cy);
+        let x0 = imin(p_lx, cx) - p_size; let y0 = imin(p_ly, cy) - p_size;
+        ui_inval(APP_PAINT, 8 + x0, PTOP + y0, iabs(cx - p_lx) + p_size * 2 + 2, iabs(cy - p_ly) + p_size * 2 + 2);
+        p_lx = cx; p_ly = cy;
+    } else if (ev == 3) { p_drawing = false; }
+}
+
+fn paint_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, PTOP, 0xEEF1F7);
+    hline(x, y + PTOP - 1, w, 0xDCE1EC);
+    var i = 0;
+    while (i < 16) {
+        let sx = x + 8 + (i % 8) * 20; let sy = y + 6 + (i / 8) * 20;
+        if (i == p_color) { disc(sx + 10, sy + 10, 10, th_acc); disc(sx + 10, sy + 10, 8, 0xFFFFFF); }
+        disc(sx + 10, sy + 10, 7, p_pal[i]);
+        i++;
+    }
+    draw_text(x + 8, y + 44, "colour", 0x8A94AB); draw_text(x + 180, y + 44, "brush", 0x8A94AB);
+    i = 0;
+    while (i < 4) {
+        let bx = x + 180 + i * 28;
+        rfill(bx, y + 8, 26, 28, 7, p_size == 1 + i * 3 ? th_acc : 0xDCE1EC, false);
+        rfill(bx + 1, y + 9, 24, 26, 6, p_size == 1 + i * 3 ? th_sel() : 0xFFFFFF, false);
+        disc(bx + 13, y + 22, 1 + i, 0x1B2433);
+        i++;
+    }
+    a2_btn(x + 300, y + 8, 60, 28, "Clear", 0xFFFFFF);
+    fill(x, y + PTOP, w, h - PTOP, 0xEEF1F7);
+    frame(x + 7, y + PTOP - 1, PW + 2, PH + 2, 0xC9D0DF);
+    if (pcanvas == (0 as *u8)) { return; }
+    let x0 = imax(clip_x0, x + 8); let x1 = imin(clip_x1, x + 8 + PW);
+    let y0 = imax(clip_y0, y + PTOP); let y1 = imin(clip_y1, y + PTOP + PH);
+    var yy = y0;
+    while (yy < y1) {
+        var xx = x0;
+        let row = (yy - y - PTOP) * PW;
+        while (xx < x1) { bb[yy * fb_w + xx] = p64(p_pal[pcanvas[row + xx - x - 8] as int]) as u64; xx++; }
+        yy++;
+    }
+}
+
+// ================================================================= Calculator (fixed point, 3 decimals)
+var c_acc = 0; var c_cur = 0; var c_op = 0; var c_entering = false; var c_dec = -1; var c_err = false; var c_have = false;
+
+fn calc_reset() { c_acc = 0; c_cur = 0; c_op = 0; c_entering = false; c_dec = -1; c_err = false; c_have = false; }
+
+fn c_apply() {
+    if (c_op == 0) { c_acc = c_cur; return; }
+    if (c_op == '+') { c_acc = c_acc + c_cur; }
+    else if (c_op == '-') { c_acc = c_acc - c_cur; }
+    else if (c_op == '*') { c_acc = c_acc * c_cur / 1000; }
+    else if (c_op == '/') { if (c_cur == 0) { c_err = true; return; } c_acc = c_acc * 1000 / c_cur; }
+    if (iabs(c_acc) > 999999999999) { c_err = true; }
+}
+
+fn c_digit(d: int) {
+    if (c_err) { calc_reset(); }
+    if (!c_entering) { c_cur = 0; c_dec = -1; c_entering = true; }
+    if (c_dec < 0) { if (iabs(c_cur) < 100000000000) { c_cur = c_cur * 10 + d * 1000; } }
+    else if (c_dec < 3) {
+        c_dec++;
+        var place = 1000;
+        var k = 0;
+        while (k < c_dec) { place = place / 10; k++; }
+        c_cur = c_cur + d * place;
+    }
+}
+
+fn c_operator(op: int) {
+    if (c_err) { return; }
+    if (c_entering || !c_have) { if (c_have && c_op != 0) { c_apply(); } else { c_acc = c_cur; } c_have = true; }
+    c_op = op; c_entering = false;
+}
+
+fn c_equals() {
+    if (c_err) { return; }
+    if (c_op != 0 && (c_entering || c_have)) { c_apply(); c_cur = c_acc; }
+    c_op = 0; c_entering = false; c_have = false;
+}
+
+fn calc_press(label: int) {
+    if (label >= '0' && label <= '9') { c_digit(label - '0'); }
+    else if (label == '.') { if (c_err) { calc_reset(); } if (!c_entering) { c_cur = 0; c_entering = true; } if (c_dec < 0) { c_dec = 0; } }
+    else if (label == 'C') { calc_reset(); }
+    else if (label == '<') {
+        if (c_entering) {
+            if (c_dec > 0) { var place = 1; var k = c_dec; while (k < 3) { place = place * 10; k++; } c_cur = (c_cur / (place * 10)) * (place * 10); c_dec--; }
+            else if (c_dec == 0) { c_dec = -1; }
+            else { c_cur = (c_cur / 10000) * 1000; }
+        }
+    }
+    else if (label == '+' || label == '-' || label == '*' || label == '/') { c_operator(label); }
+    else if (label == '=') { c_equals(); }
+    ui_inval_all(APP_CALC);
+}
+
+fn calc_key(k: int) {
+    if (k == 10) { calc_press('='); return; }
+    if (k == 8) { calc_press('<'); return; }
+    if (k == 'c' || k == 'C' || k == 27) { calc_press('C'); return; }
+    if (k == 'x') { calc_press('*'); return; }
+    calc_press(k);
+}
+
+fn c_label(r: int, c: int) -> int {
+    if (r == 0) { if (c == 0) { return 'C'; } if (c == 1) { return '<'; } if (c == 2) { return '.'; } return '/'; }
+    if (r == 1) { if (c == 3) { return '*'; } return '7' + c; }
+    if (r == 2) { if (c == 3) { return '-'; } return '4' + c; }
+    if (r == 3) { if (c == 3) { return '+'; } return '1' + c; }
+    if (c == 0) { return '0'; }
+    if (c == 1) { return '0'; }
+    if (c == 2) { return '.'; }
+    return '=';
+}
+
+fn calc_mouse(mx: int, my: int, ev: int) {
+    if (ev != 1) { return; }
+    let r = (my - 72) / 44; let c = (mx - 8) / 56;
+    if (my < 72 || mx < 8 || r < 0 || r > 4 || c < 0 || c > 3) { return; }
+    calc_press(c_label(r, c));
+}
+
+fn c_format(v: int, out: *u8) {
+    var o = 0;
+    var u = v;
+    if (u < 0) { out[o] = '-'; o++; u = -u; }
+    var ip = u / 1000; var fp = u % 1000;
+    var tmp: u8[24];
+    o = o + itoa(ip, &tmp[0]);
+    var i = 0;
+    var base = o - kstrlen(&tmp[0]);
+    while (tmp[i] != 0) { out[base + i] = tmp[i]; i++; }
+    if (c_entering && c_dec >= 0) {
+        out[o] = '.'; o++;
+        var d = 0;
+        var place = 100;
+        while (d < c_dec) { out[o] = ('0' + (fp / place) % 10) as u8; o++; place = place / 10; d++; }
+    } else if (fp != 0) {
+        out[o] = '.'; o++;
+        out[o] = ('0' + fp / 100) as u8; o++;
+        if (fp % 100 != 0) { out[o] = ('0' + (fp / 10) % 10) as u8; o++; if (fp % 10 != 0) { out[o] = ('0' + fp % 10) as u8; o++; } }
+    }
+    out[o] = 0;
+}
+
+fn calc_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    a2_card(x + 8, y + 8, w - 16, 56);
+    var s: u8[40];
+    if (c_err) { kstrncpy(&s[0], "Error", 40); }
+    else if (c_entering || !c_have) { c_format(c_cur, &s[0]); }
+    else { c_format(c_acc, &s[0]); }
+    var sc = 2;
+    if (kstrlen(&s[0]) * 16 > w - 28) { sc = 1; }
+    let tw = kstrlen(&s[0]) * 8 * sc;
+    draw_text_sc(x + w - 18 - tw, y + 22 + (sc == 2 ? 0 : 8), &s[0], C_INK, sc);
+    if (c_op != 0) { var ob: u8[2]; ob[0] = c_op as u8; ob[1] = 0; rfill(x + 14, y + 13, 20, 18, 8, th_sel(), false); draw_text(x + 20, y + 13, &ob[0], th_acc_dk); }
+    var r = 0;
+    while (r < 5) {
+        var c = 0;
+        while (c < 4) {
+            let lb = c_label(r, c);
+            if (!(r == 4 && c == 1)) {
+                var bw = 52;
+                if (r == 4 && c == 0) { bw = 108; }
+                var col = 0xFFFFFF; var ink = C_INK;
+                if (lb == '+' || lb == '-' || lb == '*' || lb == '/') { col = th_sel(); ink = th_acc_dk; }
+                if (lb == '=') { col = th_acc; ink = 0xFFFFFF; }
+                if (lb == 'C') { col = 0xFBE3E1; ink = 0xB3261E; }
+                let bx = x + 8 + c * 56; let by = y + 72 + r * 44;
+                rfill(bx, by + 1, bw, 40, 10, 0xD3D9E6, false);
+                rfill(bx, by, bw, 40, 10, col, false);
+                var cg = 0;
+                if (lb == '+') { cg = G_PLUS; } else if (lb == '-') { cg = G_MINIMIZE; } else if (lb == '*') { cg = G_MULTIPLY; }
+                else if (lb == '/') { cg = G_DIVIDE; } else if (lb == '=') { cg = G_EQUALS; } else if (lb == 'C') { cg = G_CLOSE; }
+                else if (lb == '<') { cg = G_BACKSPACE; }
+                if (cg != 0) { ui_glyph(cg, bx, by, bw, 40, 22, ink); }
+                else { var t: u8[2]; t[0] = lb as u8; t[1] = 0; draw_text_sc(bx + (bw - 16) / 2, by + 4, &t[0], ink, 2); }
+            }
+            c++;
+        }
+        r++;
+    }
+}
+
+// ================================================================= System Info
+var i_vendor: u8[16];
+var i_brand: u8[64];
+var i_sec = -1;
+
+fn info_init() { t_cpu_vendor(&i_vendor[0]); t_cpu_brand(&i_brand[0]); i_sec = -1; }
+fn info_tick() -> bool { let s = ticks / 100; if (s != i_sec) { i_sec = s; return true; } return false; }
+
+fn info_row(x: int, y: int, k: *u8, v: *u8) { draw_text(x, y, k, 0x5B6784); draw_text(x + 120, y, v, C_INK); }
+fn info_row_n(x: int, y: int, k: *u8, v: int, unit: *u8) {
+    draw_text(x, y, k, 0x5B6784);
+    let e = draw_num(x + 120, y, v, C_INK);
+    draw_text(e, y, unit, C_INK);
+}
+
+fn info_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    vgrad(x, y, w, 64, 0x1F4FA8, 0x0E7C86);
+    feather(x + 36, y + 32, 14);
+    draw_text_sc(x + 66, y + 8, "Peacock", 0xFFFFFF, 2);
+    draw_text(x + 68, y + 42, "a small OS written in KingCobra", 0xDFF3F0);
+    var ry = y + 78;
+    info_row(x + 14, ry, "OS", "Peacock OS 1.9"); ry = ry + 20;
+    info_row(x + 14, ry, "Author", "Divyanshu Sinha"); ry = ry + 20;
+    info_row(x + 14, ry, "Kernel", "KingCobra via kcc"); ry = ry + 20;
+    info_row(x + 14, ry, "CPU", &i_vendor[0]); ry = ry + 20;
+    draw_text_n(x + 14, ry, &i_brand[0], 48, C_INK); ry = ry + 20;
+    info_row_n(x + 14, ry, "RAM usable", ram_usable / 1048576, " MiB"); ry = ry + 20;
+    var hs: int[4];
+    heap_stats(&hs[0]);
+    info_row_n(x + 14, ry, "Heap used", hs[0] / 1024, " KiB"); ry = ry + 20;
+    draw_text(x + 14, ry, "Display", 0x5B6784);
+    var e = draw_num(x + 134, ry, fb_w, C_INK); e = draw_text(e, ry, "x", C_INK); e = draw_num(e, ry, fb_h, C_INK);
+    e = draw_text(e, ry, "  64 bpp compose, ", C_INK); e = draw_num(e, ry, fb_bpp, C_INK); draw_text(e, ry, " bpp out", C_INK); ry = ry + 20;
+    info_row_n(x + 14, ry, "Uptime", ticks / 100, " s");
+}

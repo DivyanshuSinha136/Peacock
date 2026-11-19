@@ -1,0 +1,133 @@
+// glass.kc -- frosted-glass ("backdrop blur") effect on the back buffer.
+// glass_grab(slot, x, y, w, h) snapshots and blurs what is currently drawn in that rectangle (downsample 4x, box blur, keep small);
+// glass_put(...) later paints the blurred backdrop, tinted, with bilinear upsampling.  Two slots so a window can frost its title bar
+// and its body.  Author of Peacock: Divyanshu Sinha (MIT License)
+
+const G_CAP0 = 8192; const G_CAP1 = 32768;
+var g_buf: *u32; var g_tmp: *u32;
+var g_ok: int[2]; var g_x: int[2]; var g_y: int[2]; var g_w: int[2]; var g_h: int[2]; var g_sw: int[2]; var g_sh: int[2];
+var glass_on = true;
+
+fn glass_alloc() -> bool {
+    if (g_buf == (0 as *u32)) {
+        g_buf = kzalloc((G_CAP0 + G_CAP1) * 4) as *u32;
+        g_tmp = kzalloc(G_CAP1 * 4) as *u32;
+    }
+    return g_buf != (0 as *u32) && g_tmp != (0 as *u32);
+}
+
+fn glass_grab(slot: int, x: int, y: int, w0: int, h0: int) {
+    g_ok[slot] = 0;
+    if (!glass_on || !glass_alloc()) { return; }
+    let x0 = imax(x, 0); let y0 = imax(y, 0);
+    let w = imin(x + w0, fb_w) - x0; let h = imin(y + h0, fb_h) - y0;
+    if (w < 8 || h < 8) { return; }
+    let sw = (w + 3) / 4; let sh = (h + 3) / 4;
+    var cap = G_CAP0; var base = 0;
+    if (slot == 1) { cap = G_CAP1; base = G_CAP0; }
+    if (sw * sh > cap) { return; }
+    // 1. downsample 4x4 -> tmp
+    var ty = 0;
+    while (ty < sh) {
+        var tx = 0;
+        while (tx < sw) {
+            var sr = 0; var sg = 0; var sb = 0; var n = 0;
+            var yy = ty * 4;
+            let ye = imin(ty * 4 + 4, h); let xe = imin(tx * 4 + 4, w);
+            while (yy < ye) {
+                var xx = tx * 4;
+                while (xx < xe) {
+                    let c = px32(bb[(y0 + yy) * fb_w + x0 + xx] as int);
+                    sr = sr + ((c >> 16) & 255); sg = sg + ((c >> 8) & 255); sb = sb + (c & 255); n++;
+                    xx++;
+                }
+                yy++;
+            }
+            g_tmp[ty * sw + tx] = (((sr / n) << 16) | ((sg / n) << 8) | (sb / n)) as u32;
+            tx++;
+        }
+        ty++;
+    }
+    // 2. box blur (radius 2): horizontal tmp -> buf, vertical buf -> tmp, copy back
+    ty = 0;
+    while (ty < sh) {
+        var tx = 0;
+        while (tx < sw) {
+            var sr = 0; var sg = 0; var sb = 0;
+            var k = -2;
+            while (k <= 2) {
+                let c = g_tmp[ty * sw + imax(0, imin(sw - 1, tx + k))] as int;
+                sr = sr + ((c >> 16) & 255); sg = sg + ((c >> 8) & 255); sb = sb + (c & 255);
+                k++;
+            }
+            g_buf[base + ty * sw + tx] = (((sr / 5) << 16) | ((sg / 5) << 8) | (sb / 5)) as u32;
+            tx++;
+        }
+        ty++;
+    }
+    ty = 0;
+    while (ty < sh) {
+        var tx = 0;
+        while (tx < sw) {
+            var sr = 0; var sg = 0; var sb = 0;
+            var k = -2;
+            while (k <= 2) {
+                let c = g_buf[base + imax(0, imin(sh - 1, ty + k)) * sw + tx] as int;
+                sr = sr + ((c >> 16) & 255); sg = sg + ((c >> 8) & 255); sb = sb + (c & 255);
+                k++;
+            }
+            g_tmp[ty * sw + tx] = (((sr / 5) << 16) | ((sg / 5) << 8) | (sb / 5)) as u32;
+            tx++;
+        }
+        ty++;
+    }
+    var i = 0;
+    while (i < sw * sh) { g_buf[base + i] = g_tmp[i]; i++; }
+    g_ok[slot] = 1; g_x[slot] = x0; g_y[slot] = y0; g_w[slot] = w; g_h[slot] = h; g_sw[slot] = sw; g_sh[slot] = sh;
+}
+
+/// paint the blurred backdrop of `slot` over (x, y, w, h) (inside the grabbed rectangle), tinted with `tint` at alpha 0..256;
+/// r = corner radius (rows near the top, and near the bottom unless top_only, are cut to a rounded shape).  Falls back to a flat tint.
+fn glass_put(slot: int, x: int, y: int, w: int, h: int, tint: int, alpha: int, r: int, top_only: bool) {
+    var i = 0;
+    while (i < h) {
+        let yy = y + i;
+        if (yy >= clip_y0 && yy < clip_y1) {
+            var ins = 0;
+            if (i < r) { ins = r_inset(i, r); }
+            else if (!top_only && i >= h - r) { ins = r_inset(h - 1 - i, r); }
+            if (g_ok[slot] == 0) { fill(x + ins, yy, w - 2 * ins, 1, tint); }
+            else {
+                let sw = g_sw[slot]; let sh = g_sh[slot];
+                var base = 0;
+                if (slot == 1) { base = G_CAP0; }
+                let py = yy - g_y[slot];
+                let yq = imax(py * 4 - 8, 0);
+                let iy = imin(yq >> 4, sh - 1); let iy1 = imin(iy + 1, sh - 1); let fy = yq & 15;
+                var j = ins;
+                while (j < w - ins) {
+                    let xx = x + j;
+                    if (xx >= clip_x0 && xx < clip_x1) {
+                        let xq = imax((xx - g_x[slot]) * 4 - 8, 0);
+                        let ix = imin(xq >> 4, sw - 1); let ix1 = imin(ix + 1, sw - 1); let fx = xq & 15;
+                        let c00 = g_buf[base + iy * sw + ix] as int; let c01 = g_buf[base + iy * sw + ix1] as int;
+                        let c10 = g_buf[base + iy1 * sw + ix] as int; let c11 = g_buf[base + iy1 * sw + ix1] as int;
+                        var out = 0; var s = 16;
+                        while (s >= 0) {
+                            let t = (((c00 >> s) & 255) * (16 - fx) + ((c01 >> s) & 255) * fx) * (16 - fy) + (((c10 >> s) & 255) * (16 - fx) + ((c11 >> s) & 255) * fx) * fy;
+                            out = out | (((t >> 8) & 255) << s);
+                            s = s - 8;
+                        }
+                        bb[yy * fb_w + xx] = mixp(p64(out), tint, alpha) as u64;
+                    }
+                    j++;
+                }
+            }
+        }
+        i++;
+    }
+}
+
+fn rect_hit(ax: int, ay: int, aw: int, ah: int) -> bool {
+    return dmg_on && ax < dmg_x1 && ax + aw > dmg_x0 && ay < dmg_y1 && ay + ah > dmg_y0;
+}

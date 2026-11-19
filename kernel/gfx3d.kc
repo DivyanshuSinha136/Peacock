@@ -1,0 +1,440 @@
+// gfx3d.kc -- Peacock's software 3D renderer: meshes, rotation, perspective, z-buffer, lighting, 2x anti-aliasing.
+// Author: Divyanshu Sinha (MIT License)
+// Integer only (no FPU needed).  Model units: 256 = 1.0, y is up, the camera looks along +z.
+// Needs: gfx.kc (bb, fb_w, clip_*, mix, px helpers), mm.kc (kmalloc).
+//
+//   g3_render(x, y, w, h, model, yaw, pitch, style, color)    draws into the back buffer inside the given rectangle
+//   angles are in 1/256 turn; style: 0 solid, 1 wireframe, 2 solid + edges
+//   globals: g3_zoom (256 = 1.0), g3_shadow (draw a soft ground shadow)
+
+const G3_MODELS = 7;
+const G3_MAXV = 256; const G3_MAXT = 640; const G3_MAXE = 512;
+const G3_MAXS = 700000;                // samples (colour + depth, 4 bytes each)
+
+var ui_depth = 2;                      // UI style for buttons and cards: 0 flat, 1 soft, 2 3D (saved in /etc/depth)
+var g3_ok = false;
+var g3_zoom = 256;
+var g3_shadow = true;
+var g3_model = -1;                     // model currently built
+var g3_nv = 0; var g3_nt = 0; var g3_ne = 0; var g3_smooth = false;
+var g3_mx: *int; var g3_my: *int; var g3_mz: *int;          // model vertices
+var g3_nx: *int; var g3_ny: *int; var g3_nz: *int;          // model vertex normals (smooth models), length 256
+var g3_ta: *int; var g3_tb: *int; var g3_tc: *int;          // triangles
+var g3_ea: *int; var g3_eb: *int;                           // edges
+var g3_rx: *int; var g3_ry: *int; var g3_rz: *int;          // rotated vertices
+var g3_sx: *int; var g3_sy: *int; var g3_si: *int;          // screen sample coords, vertex intensity
+var g3_col: *u32; var g3_zb: *u32;                          // sample buffers
+var g3_sin: int[256];                                       // sine * 4096, 256 steps per turn
+var g3_ss = 1;                                              // samples per pixel side (1 or 2)
+var g3_bw = 0; var g3_bh = 0;                               // sample buffer size
+var g3_tris = 0;                                            // triangles drawn by the last render (statistics)
+
+fn g3_isqrt(n: int) -> int {
+    if (n <= 0) { return 0; }
+    var x = n; var y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return x;
+}
+fn g3_s(a: int) -> int { return g3_sin[a & 255]; }
+fn g3_c(a: int) -> int { return g3_sin[(a + 64) & 255]; }
+
+fn g3_init() -> bool {
+    if (g3_ok) { return true; }
+    let pool = kmalloc(8 * (9 * G3_MAXV + 3 * G3_MAXT + 2 * G3_MAXE + 3 * G3_MAXV)) as *int;
+    if (pool == (0 as *int)) { return false; }
+    var o = 0;
+    g3_mx = &pool[o]; o += G3_MAXV; g3_my = &pool[o]; o += G3_MAXV; g3_mz = &pool[o]; o += G3_MAXV;
+    g3_nx = &pool[o]; o += G3_MAXV; g3_ny = &pool[o]; o += G3_MAXV; g3_nz = &pool[o]; o += G3_MAXV;
+    g3_rx = &pool[o]; o += G3_MAXV; g3_ry = &pool[o]; o += G3_MAXV; g3_rz = &pool[o]; o += G3_MAXV;
+    g3_ta = &pool[o]; o += G3_MAXT; g3_tb = &pool[o]; o += G3_MAXT; g3_tc = &pool[o]; o += G3_MAXT;
+    g3_ea = &pool[o]; o += G3_MAXE; g3_eb = &pool[o]; o += G3_MAXE;
+    g3_sx = &pool[o]; o += G3_MAXV; g3_sy = &pool[o]; o += G3_MAXV; g3_si = &pool[o]; o += G3_MAXV;
+    g3_col = kmalloc(G3_MAXS * 4) as *u32;
+    g3_zb = kmalloc(G3_MAXS * 4) as *u32;
+    if (g3_col == (0 as *u32) || g3_zb == (0 as *u32)) { return false; }
+    // sine table by rotation recurrence (16.16), refined by symmetry
+    var s = 0; var c = 65536; var i = 0;
+    var q: int[65];
+    while (i <= 64) {
+        q[i] = s >> 4;                               // 65536 -> 4096
+        s = s + ((c * 1608) >> 16);                  // 2*pi/256 = 0.02454
+        c = c - ((s * 1608) >> 16);
+        i++;
+    }
+    q[64] = 4096; q[0] = 0;
+    i = 0;
+    while (i < 256) {
+        let a = i & 127;
+        var v = 0;
+        if (a <= 64) { v = q[a]; } else { v = q[128 - a]; }
+        if (i >= 128) { v = 0 - v; }
+        g3_sin[i] = v;
+        i++;
+    }
+    g3_ok = true;
+    return true;
+}
+
+// ---------------------------------------------------------------- mesh builders
+fn g3_v(x: int, y: int, z: int) -> int {
+    if (g3_nv >= G3_MAXV) { return g3_nv - 1; }
+    g3_mx[g3_nv] = x; g3_my[g3_nv] = y; g3_mz[g3_nv] = z; g3_nx[g3_nv] = 0; g3_ny[g3_nv] = 0; g3_nz[g3_nv] = 0;
+    g3_nv++;
+    return g3_nv - 1;
+}
+fn g3_vn(x: int, y: int, z: int, nx: int, ny: int, nz: int) -> int {
+    let i = g3_v(x, y, z);
+    g3_nx[i] = nx; g3_ny[i] = ny; g3_nz[i] = nz;
+    return i;
+}
+fn g3_t(a: int, b: int, c: int) {
+    if (g3_nt >= G3_MAXT) { return; }
+    g3_ta[g3_nt] = a; g3_tb[g3_nt] = b; g3_tc[g3_nt] = c; g3_nt++;
+}
+fn g3_e(a: int, b: int) {
+    if (g3_ne >= G3_MAXE) { return; }
+    g3_ea[g3_ne] = a; g3_eb[g3_ne] = b; g3_ne++;
+}
+/// quad a,b,c,d (in order around) -> two triangles and its four edges
+fn g3_q(a: int, b: int, c: int, d: int) {
+    g3_t(a, b, c); g3_t(a, c, d);
+    g3_e(a, b); g3_e(b, c); g3_e(c, d); g3_e(d, a);
+}
+/// every edge of a consistently wound triangle list once
+fn g3_tri_edges() {
+    var i = 0;
+    while (i < g3_nt) {
+        if (g3_ta[i] < g3_tb[i]) { g3_e(g3_ta[i], g3_tb[i]); }
+        if (g3_tb[i] < g3_tc[i]) { g3_e(g3_tb[i], g3_tc[i]); }
+        if (g3_tc[i] < g3_ta[i]) { g3_e(g3_tc[i], g3_ta[i]); }
+        i++;
+    }
+}
+
+fn g3_name(m: int) -> *u8 {
+    if (m == 0) { return "Cube"; }
+    if (m == 1) { return "Pyramid"; }
+    if (m == 2) { return "Octahedron"; }
+    if (m == 3) { return "Icosahedron"; }
+    if (m == 4) { return "Sphere"; }
+    if (m == 5) { return "Torus"; }
+    return "Cylinder";
+}
+
+fn g3_build(m: int) {
+    g3_nv = 0; g3_nt = 0; g3_ne = 0; g3_smooth = false;
+    if (m == 0) {
+        let h = 150;
+        let a = g3_v(0 - h, 0 - h, 0 - h); let b = g3_v(h, 0 - h, 0 - h); let c = g3_v(h, h, 0 - h); let d = g3_v(0 - h, h, 0 - h);
+        let e = g3_v(0 - h, 0 - h, h); let f = g3_v(h, 0 - h, h); let g = g3_v(h, h, h); let k = g3_v(0 - h, h, h);
+        g3_q(a, b, c, d); g3_q(f, e, k, g); g3_q(e, a, d, k); g3_q(b, f, g, c); g3_q(d, c, g, k); g3_q(e, f, b, a);
+    } else if (m == 1) {
+        let a = g3_v(0 - 170, 0 - 120, 0 - 170); let b = g3_v(170, 0 - 120, 0 - 170);
+        let c = g3_v(170, 0 - 120, 170); let d = g3_v(0 - 170, 0 - 120, 170); let t = g3_v(0, 210, 0);
+        g3_q(a, b, c, d);
+        g3_t(a, t, b); g3_t(b, t, c); g3_t(c, t, d); g3_t(d, t, a);
+        g3_e(a, t); g3_e(b, t); g3_e(c, t); g3_e(d, t);
+    } else if (m == 2) {
+        let r = 235;
+        let px_ = g3_v(r, 0, 0); let nx_ = g3_v(0 - r, 0, 0); let py = g3_v(0, r, 0); let ny = g3_v(0, 0 - r, 0);
+        let pz = g3_v(0, 0, r); let nz = g3_v(0, 0, 0 - r);
+        g3_t(py, px_, pz); g3_t(py, pz, nx_); g3_t(py, nx_, nz); g3_t(py, nz, px_);
+        g3_t(ny, pz, px_); g3_t(ny, nx_, pz); g3_t(ny, nz, nx_); g3_t(ny, px_, nz);
+        g3_tri_edges();
+    } else if (m == 3) {
+        let a = 130; let b = 210;
+        g3_v(0 - a, b, 0); g3_v(a, b, 0); g3_v(0 - a, 0 - b, 0); g3_v(a, 0 - b, 0);
+        g3_v(0, 0 - a, b); g3_v(0, a, b); g3_v(0, 0 - a, 0 - b); g3_v(0, a, 0 - b);
+        g3_v(b, 0, 0 - a); g3_v(b, 0, a); g3_v(0 - b, 0, 0 - a); g3_v(0 - b, 0, a);
+        g3_t(0, 11, 5); g3_t(0, 5, 1); g3_t(0, 1, 7); g3_t(0, 7, 10); g3_t(0, 10, 11);
+        g3_t(1, 5, 9); g3_t(5, 11, 4); g3_t(11, 10, 2); g3_t(10, 7, 6); g3_t(7, 1, 8);
+        g3_t(3, 9, 4); g3_t(3, 4, 2); g3_t(3, 2, 6); g3_t(3, 6, 8); g3_t(3, 8, 9);
+        g3_t(4, 9, 5); g3_t(2, 4, 11); g3_t(6, 2, 10); g3_t(8, 6, 7); g3_t(9, 8, 1);
+        g3_tri_edges();
+    } else if (m == 4) {
+        g3_smooth = true;
+        let r = 235; let S = 16; let R = 8;
+        let sp = g3_vn(0, 0 - r, 0, 0, 0 - 256, 0);
+        var j = 1;
+        while (j < R) {
+            let lat = 0 - 64 + j * 16;
+            var k = 0;
+            while (k < S) {
+                let lon = k * (256 / S);
+                let cy = g3_c(lat); let sy = g3_s(lat);
+                let nx = (cy * g3_c(lon)) >> 16; let nz = (cy * g3_s(lon)) >> 16; let ny = sy >> 4;
+                g3_vn((nx * r) >> 8, (ny * r) >> 8, (nz * r) >> 8, nx, ny, nz);
+                k++;
+            }
+            j++;
+        }
+        let np = g3_vn(0, r, 0, 0, 256, 0);
+        var k2 = 0;
+        while (k2 < S) {
+            let k3 = (k2 + 1) % S;
+            g3_t(sp, 1 + k3, 1 + k2); g3_e(sp, 1 + k2);
+            g3_t(np, 1 + (R - 2) * S + k2, 1 + (R - 2) * S + k3); g3_e(np, 1 + (R - 2) * S + k2);
+            var jj = 1;
+            while (jj < R - 1) {
+                let a = 1 + (jj - 1) * S + k2; let b = 1 + (jj - 1) * S + k3; let c = 1 + jj * S + k3; let d = 1 + jj * S + k2;
+                g3_t(a, b, c); g3_t(a, c, d); g3_e(a, d); g3_e(a, b);
+                jj++;
+            }
+            g3_e(1 + (R - 2) * S + k2, 1 + (R - 2) * S + k3);
+            k2++;
+        }
+    } else if (m == 5) {
+        g3_smooth = true;
+        let R0 = 165; let r0 = 72; let U = 16; let V = 10;
+        var u = 0;
+        while (u < U) {
+            var v = 0;
+            while (v < V) {
+                let cu = g3_c(u * (256 / U)); let su = g3_s(u * (256 / U));
+                let cv = g3_c(v * (256 / V)); let sv = g3_s(v * (256 / V));
+                let nx = (cv * cu) >> 16; let nz = (cv * su) >> 16; let ny = sv >> 4;
+                let rr = R0 + ((r0 * cv) >> 12);
+                g3_vn((rr * cu) >> 12, (r0 * sv) >> 12, (rr * su) >> 12, nx, ny, nz);
+                v++;
+            }
+            u++;
+        }
+        u = 0;
+        while (u < U) {
+            let u2 = (u + 1) % U;
+            var v2 = 0;
+            while (v2 < V) {
+                let v3 = (v2 + 1) % V;
+                let a = u * V + v2; let b = u2 * V + v2; let c = u2 * V + v3; let d = u * V + v3;
+                g3_t(a, b, c); g3_t(a, c, d); g3_e(a, b); g3_e(a, d);
+                v2++;
+            }
+            u++;
+        }
+    } else {
+        let r = 170; let h = 190; let S = 16;
+        let tc = g3_v(0, h, 0); let bc = g3_v(0, 0 - h, 0);
+        var k = 0;
+        while (k < S) {
+            let cu = g3_c(k * (256 / S)); let su = g3_s(k * (256 / S));
+            g3_v((r * cu) >> 12, h, (r * su) >> 12);
+            g3_v((r * cu) >> 12, 0 - h, (r * su) >> 12);
+            k++;
+        }
+        k = 0;
+        while (k < S) {
+            let k2 = (k + 1) % S;
+            let t0 = 2 + k * 2; let b0 = 3 + k * 2; let t1 = 2 + k2 * 2; let b1 = 3 + k2 * 2;
+            g3_t(tc, t1, t0); g3_t(bc, b0, b1); g3_t(t0, t1, b1); g3_t(t0, b1, b0);
+            g3_e(t0, t1); g3_e(b0, b1);
+            if ((k & 1) == 0) { g3_e(t0, b0); }
+            k++;
+        }
+    }
+    g3_model = m;
+}
+
+// ---------------------------------------------------------------- rasteriser
+/// colour of intensity i (0..256) on a base colour: shadow -> base -> highlight
+fn g3_shade(base: int, i: int) -> int {
+    if (i < 0) { i = 0; }
+    if (i >= 192) { return mix(base, 0xFFFFFF, imin((i - 192) * 2, 128)); }
+    return mix(0x0A0C18, base, (i * 256) / 192);
+}
+
+fn g3_plot(x: int, y: int, z: int, c: int) {
+    if (x < 0 || y < 0 || x >= g3_bw || y >= g3_bh) { return; }
+    let i = y * g3_bw + x;
+    if (z <= (g3_zb[i] as int)) { g3_zb[i] = z as u32; g3_col[i] = (c | 0x01000000) as u32; }
+}
+
+/// z-buffered triangle; vertex intensities i0..i2 (Gouraud) when smooth, else all equal to flat intensity
+fn g3_tri(x0: int, y0: int, z0: int, i0: int, x1: int, y1: int, z1: int, i1: int, x2: int, y2: int, z2: int, i2: int, base: int, smooth: bool) {
+    var area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area == 0) { return; }
+    var minx = imin(x0, imin(x1, x2)); var maxx = imax(x0, imax(x1, x2));
+    var miny = imin(y0, imin(y1, y2)); var maxy = imax(y0, imax(y1, y2));
+    if (minx < 0) { minx = 0; } if (miny < 0) { miny = 0; }
+    if (maxx > g3_bw - 1) { maxx = g3_bw - 1; } if (maxy > g3_bh - 1) { maxy = g3_bh - 1; }
+    if (minx > maxx || miny > maxy) { return; }
+    g3_tris++;
+    // attribute planes (16.16)
+    let dzx = (((z1 - z0) * (y2 - y0) - (z2 - z0) * (y1 - y0)) * 65536) / area;
+    let dzy = (((z2 - z0) * (x1 - x0) - (z1 - z0) * (x2 - x0)) * 65536) / area;
+    let dix = (((i1 - i0) * (y2 - y0) - (i2 - i0) * (y1 - y0)) * 65536) / area;
+    let diy = (((i2 - i0) * (x1 - x0) - (i1 - i0) * (x2 - x0)) * 65536) / area;
+    var flatc = 0;
+    if (!smooth) { flatc = g3_shade(base, i0); }
+    let sgn = area < 0 ? -1 : 1;
+    var y = miny;
+    while (y <= maxy) {
+        var x = minx;
+        while (x <= maxx) {
+            // edge functions at the sample centre (x+0.5, y+0.5) doubled to stay integral
+            let px2 = 2 * x + 1; let py2 = 2 * y + 1;
+            let e0 = ((x1 - x0) * (py2 - 2 * y0) - (y1 - y0) * (px2 - 2 * x0)) * sgn;
+            let e1 = ((x2 - x1) * (py2 - 2 * y1) - (y2 - y1) * (px2 - 2 * x1)) * sgn;
+            let e2 = ((x0 - x2) * (py2 - 2 * y2) - (y0 - y2) * (px2 - 2 * x2)) * sgn;
+            if (e0 >= 0 && e1 >= 0 && e2 >= 0) {
+                let dx = x - x0; let dy = y - y0;
+                let z = z0 * 65536 + dzx * dx + dzy * dy;
+                var c = flatc;
+                if (smooth) { c = g3_shade(base, i0 + ((dix * dx + diy * dy) >> 16)); }
+                g3_plot(x, y, z >> 8, c);
+            }
+            x++;
+        }
+        y++;
+    }
+}
+
+/// z-tested (or not) line in sample space, `t` samples thick
+fn g3_line(x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, c: int, ztest: bool, t: int) {
+    var n = imax(iabs(x1 - x0), iabs(y1 - y0));
+    if (n > 4000) { return; }
+    if (n == 0) { n = 1; }
+    var i = 0;
+    while (i <= n) {
+        let x = x0 + ((x1 - x0) * i) / n; let y = y0 + ((y1 - y0) * i) / n;
+        let z = (z0 + ((z1 - z0) * i) / n) * 256 - 3000;           // small bias toward the viewer
+        var a = 0;
+        while (a < t) {
+            var b = 0;
+            while (b < t) {
+                if (ztest) { g3_plot(x + a, y + b, z >> 8, c); }
+                else if (x + a >= 0 && y + b >= 0 && x + a < g3_bw && y + b < g3_bh) { g3_col[(y + b) * g3_bw + x + a] = (c | 0x01000000) as u32; }
+                b++;
+            }
+            a++;
+        }
+        i++;
+    }
+}
+
+/// intensity (0..256) for a unit-ish normal (length 256): light from the upper left in front
+fn g3_light(nx: int, ny: int, nz: int) -> int {
+    let d = (nx * (0 - 116) + ny * 168 + nz * (0 - 155)) >> 8;       // -256..256
+    var v = 52 + (imax(d, 0) * 204) / 256;
+    // soft fill from below so the dark side is not black
+    v = v + imax(0 - d, 0) / 12;
+    return imin(v, 256);
+}
+
+fn g3_render(vx: int, vy: int, vw: int, vh: int, model: int, yaw: int, pitch: int, style: int, color: int) {
+    if (!g3_init()) { return; }
+    if (model < 0 || model >= G3_MODELS) { model = 0; }
+    if (vw < 8 || vh < 8) { return; }
+    if (model != g3_model) { g3_build(model); }
+    g3_tris = 0;
+    // sample buffer size: 2x when it fits
+    var ss = 2;
+    if (vw * vh * 4 > G3_MAXS) { ss = 1; }
+    var bw = vw * ss; var bh = vh * ss;
+    if (bw * bh > G3_MAXS) { bh = G3_MAXS / bw; }
+    g3_ss = ss; g3_bw = bw; g3_bh = bh;
+    // ground shadow first (it lives in the real back buffer, under the object)
+    let vmin = imin(vw, vh);
+    if (g3_shadow) {
+        let sw = (vmin * 36) / 100; let sh = vmin / 11;
+        let scx = vx + vw / 2; let scy = vy + vh / 2 + (vmin * 40) / 100;
+        var k = 0;                                   // soft: three nested ellipses of increasing darkness
+        while (k < 3) {
+            let rw = sw - k * (sw / 4); let rh = sh - k * (sh / 4);
+            var yy = 0 - rh;
+            while (yy <= rh) {
+                let t = (yy * 256) / (rh > 0 ? rh : 1);
+                let half = (rw * g3_isqrt(65536 - t * t)) / 256;
+                shade(scx - half, scy + yy, half * 2, 1, 0x000000, 26);
+                yy++;
+            }
+            k++;
+        }
+    }
+    // clear sample buffer
+    var n = bw * bh; var i = 0;
+    while (i < n) { g3_col[i] = 0; g3_zb[i] = 0xFFFFFFFF; i++; }
+    // transform
+    let cyw = g3_c(yaw); let syw = g3_s(yaw); let cxp = g3_c(pitch); let sxp = g3_s(pitch);
+    let F = ((vmin * ss * 400) / 256) * g3_zoom / 256;               // focal length in samples: object ~0.44 of the view
+    let cx = bw / 2; let cy = bh / 2;
+    let dist = 960;
+    i = 0;
+    while (i < g3_nv) {
+        let x = g3_mx[i]; let y = g3_my[i]; let z = g3_mz[i];
+        let x1 = (x * cyw + z * syw) >> 12; let z1 = ((0 - x) * syw + z * cyw) >> 12;
+        let y2 = (y * cxp - z1 * sxp) >> 12; let z2 = (y * sxp + z1 * cxp) >> 12;
+        g3_rx[i] = x1; g3_ry[i] = y2; g3_rz[i] = z2 + dist;
+        g3_sx[i] = cx + (x1 * F) / (z2 + dist);
+        g3_sy[i] = cy - (y2 * F) / (z2 + dist);
+        if (g3_smooth) {
+            let nx = g3_nx[i]; let ny = g3_ny[i]; let nz = g3_nz[i];
+            let a1 = (nx * cyw + nz * syw) >> 12; let b1 = ((0 - nx) * syw + nz * cyw) >> 12;
+            let a2 = (ny * cxp - b1 * sxp) >> 12; let b2 = (ny * sxp + b1 * cxp) >> 12;
+            g3_si[i] = g3_light(a1, a2, b2);
+        }
+        i++;
+    }
+    // solid pass
+    if (style != 1) {
+        var t = 0;
+        while (t < g3_nt) {
+            let a = g3_ta[t]; let b = g3_tb[t]; let c = g3_tc[t];
+            var fi = 0;
+            if (!g3_smooth) {
+                let ux = g3_rx[b] - g3_rx[a]; let uy = g3_ry[b] - g3_ry[a]; let uz = g3_rz[b] - g3_rz[a];
+                let wx = g3_rx[c] - g3_rx[a]; let wy = g3_ry[c] - g3_ry[a]; let wz = g3_rz[c] - g3_rz[a];
+                var nx = uy * wz - uz * wy; var ny = uz * wx - ux * wz; var nz = ux * wy - uy * wx;
+                let len = g3_isqrt(nx * nx + ny * ny + nz * nz);
+                if (len > 0) {
+                    nx = (nx * 256) / len; ny = (ny * 256) / len; nz = (nz * 256) / len;
+                    if (nz > 0) { nx = 0 - nx; ny = 0 - ny; nz = 0 - nz; }     // two-sided: face the viewer
+                    fi = g3_light(nx, ny, nz);
+                }
+            }
+            var ia = fi; var ib = fi; var ic = fi;
+            if (g3_smooth) { ia = g3_si[a]; ib = g3_si[b]; ic = g3_si[c]; }
+            g3_tri(g3_sx[a], g3_sy[a], g3_rz[a], ia, g3_sx[b], g3_sy[b], g3_rz[b], ib, g3_sx[c], g3_sy[c], g3_rz[c], ic, color, g3_smooth);
+            t++;
+        }
+    }
+    // edges
+    if (style != 0) {
+        var ec = 0x101828;
+        if (style == 1) { ec = mix(color, 0xFFFFFF, 90); }
+        var e = 0;
+        while (e < g3_ne) {
+            let a = g3_ea[e]; let b = g3_eb[e];
+            g3_line(g3_sx[a], g3_sy[a], g3_rz[a], g3_sx[b], g3_sy[b], g3_rz[b], ec, style == 2, ss);
+            e++;
+        }
+    }
+    // resolve: average the covered samples of each pixel and blend over the back buffer
+    var py = 0;
+    while (py < vh) {
+        var pxl = 0;
+        while (pxl < vw) {
+            let X = vx + pxl; let Y = vy + py;
+            if (X >= clip_x0 && X < clip_x1 && Y >= clip_y0 && Y < clip_y1 && (py * ss + ss - 1) < bh) {
+                var cnt = 0; var r = 0; var g = 0; var b = 0;
+                var sy = 0;
+                while (sy < ss) {
+                    var sxx = 0;
+                    while (sxx < ss) {
+                        let v = g3_col[(py * ss + sy) * bw + pxl * ss + sxx] as int;
+                        if ((v & 0x01000000) != 0) { cnt++; r += (v >> 16) & 255; g += (v >> 8) & 255; b += v & 255; }
+                        sxx++;
+                    }
+                    sy++;
+                }
+                if (cnt > 0) {
+                    let col = ((r / cnt) << 16) | ((g / cnt) << 8) | (b / cnt);
+                    let tot = ss * ss;
+                    if (cnt == tot) { bb[Y * fb_w + X] = p64(col) as u64; }
+                    else { bb[Y * fb_w + X] = mixp(bb[Y * fb_w + X] as int, col, (cnt * 256) / tot) as u64; }
+                }
+            }
+            pxl++;
+        }
+        py++;
+    }
+}

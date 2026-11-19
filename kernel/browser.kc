@@ -1,0 +1,1185 @@
+// browser.kc -- the Browser: tabs, address bar with suggestions, bookmarks, history, find in page, downloads, progress, and
+// http:// pages through the network stack (net.kc), file:// pages and folder listings from KCFS, about: pages.
+// Author: Divyanshu Sinha (MIT License)
+// Needs: html.kc (layout), net.kc (fetch engine), fs.kc, gfx.kc, ui.kc (wins, ui_inval_all).
+//
+// Keys:  Ctrl+T new tab  Ctrl+W close tab  [ ] previous/next tab (page focus)  Ctrl+L address bar  Ctrl+F find  Ctrl+D bookmark
+//        Ctrl+R reload  Ctrl+S save page to /home/Downloads  Backspace back  Space/PgDn/PgUp/Home/End scroll
+// Files: /etc/bookmarks and /etc/history (one "url<TAB>title" per line).  Downloads go to /home/Downloads.
+
+const WEB_W = 800; const WEB_H = 560;
+const WB_TABS = 28; const WB_BAR = 38; const WB_BMBAR = 26; const WB_STATUS = 22; const WB_SB = 14; const WB_FIND = 30;
+const WB_MAXTAB = 6; const WB_HIST = 16; const WB_URL = 300; const WB_CACHE = 900000;
+const BM_MAX = 48; const HS_MAX = 80; const SG_MAX = 6;
+
+struct Tab {
+    used: int, hn: int, hpos: int, scroll: int, ctype: int, srclen: int, src: *u8,
+    title: u8[48], url: u8[300], hist: u8[4800], hscr: int[16]
+}
+
+var tabs: *Tab; var wt = 0;                                                          // all tabs, the active one
+var web_url: u8[300]; var web_edit: u8[300]; var web_elen = 0; var web_ecur = 0; var web_esel = false;
+var web_focus = 0;                                                                   // 0 address bar, 1 page, 2 find bar
+var web_scroll = 0; var web_loading = false; var web_job = false; var web_redirects = 0;
+var web_status: u8[100]; var web_sig = -1; var web_drag = false; var web_hov = -1;
+var web_gen: *u8; var web_glen = 0; const WEB_GEN = 65536;
+var web_req: u8[300];                                                                // address of the request in flight
+var web_ready = false; var web_bmbar = true;
+
+var bm_url: *u8; var bm_title: *u8; var bm_n = 0;                                    // bookmarks (200 / 40 bytes each)
+var hs_url: *u8; var hs_title: *u8; var hs_n = 0;                                    // history, newest first
+var sg_n = 0; var sg_idx: int[6]; var sg_sel = -1;                                   // address bar suggestions (bookmark index, or 100 + history index)
+var find_on = false; var find_q: u8[48]; var find_ql = 0; var find_n = 0; var find_cur = 0;
+var find_item: int[500]; var find_span: int[500];
+
+fn web_say(s: *u8) { kstrncpy(&web_status[0], s, 100); }
+fn wb_top() -> int { var t = WB_TABS + WB_BAR; if (web_bmbar && bm_n > 0) { t = t + WB_BMBAR; } return t; }
+fn wb_findh() -> int { if (find_on) { return WB_FIND; } return 0; }
+fn web_vh() -> int { return WEB_H - wb_top() - WB_STATUS - wb_findh(); }
+fn web_vw() -> int { return WEB_W - WB_SB - 16; }
+fn web_maxscroll() -> int { return imax(0, w_height - web_vh()); }
+fn web_tabs_ok() -> bool { return tabs != (0 as *Tab); }
+
+fn web_ensure() {
+    if (web_ready) { return; }
+    tabs = kzalloc(WB_MAXTAB * sizeof(Tab)) as *Tab;
+    bm_url = kzalloc(BM_MAX * 200); bm_title = kzalloc(BM_MAX * 40);
+    hs_url = kzalloc(HS_MAX * 200); hs_title = kzalloc(HS_MAX * 40);
+    web_ready = true;
+}
+
+// ---------------------------------------------------------------- generated pages
+fn g_reset() { if (web_gen == (0 as *u8)) { web_gen = kmalloc(WEB_GEN + 8); } web_glen = 0; if (web_gen != (0 as *u8)) { web_gen[0] = 0; } }
+fn g_puts(s: *u8) {
+    if (web_gen == (0 as *u8)) { return; }
+    var i = 0;
+    while (s[i] != 0 && web_glen < WEB_GEN - 2) { web_gen[web_glen] = s[i]; web_glen++; i++; }
+    web_gen[web_glen] = 0;
+}
+fn g_esc(s: *u8) {
+    if (web_gen == (0 as *u8)) { return; }
+    var i = 0;
+    while (s[i] != 0 && web_glen < WEB_GEN - 8) {
+        if (s[i] == '<') { g_puts("&lt;"); } else if (s[i] == '>') { g_puts("&gt;"); } else if (s[i] == '&') { g_puts("&amp;"); }
+        else if (s[i] == '\'') { g_puts("&#39;"); }
+        else { web_gen[web_glen] = s[i]; web_glen++; web_gen[web_glen] = 0; }
+        i++;
+    }
+}
+fn wg_num(v: int) { var b: u8[16]; itoa(v, &b[0]); g_puts(&b[0]); }
+fn g_link(url: *u8, text: *u8) { g_puts("<a href='"); g_esc(url); g_puts("'>"); g_esc(text); g_puts("</a>"); }
+
+// ---------------------------------------------------------------- bookmarks and history (persisted)
+fn web_file_put(path: *u8, buf: *u8, len: int) {
+    var n = fs_resolve(path);
+    if (n < 0) { n = fs_create(path, K_FILE); }
+    if (n >= 0) { fs_write(n, buf, len, false); }
+}
+fn web_line_put(out: *u8, o: int, url: *u8, title: *u8) -> int {
+    var i = 0;
+    while (url[i] != 0 && o < 399000) { out[o] = url[i]; o++; i++; }
+    out[o] = 9; o++;
+    i = 0;
+    while (title[i] != 0 && title[i] != 9 && title[i] != 10 && o < 399000) { out[o] = title[i]; o++; i++; }
+    out[o] = 10; o++;
+    return o;
+}
+fn bm_save() {
+    let buf = kmalloc(BM_MAX * 260 + 16);
+    if (buf == (0 as *u8)) { return; }
+    var o = 0; var i = 0;
+    while (i < bm_n) { o = web_line_put(buf, o, bm_url + i * 200, bm_title + i * 40); i++; }
+    web_file_put("/etc/bookmarks", buf, o);
+    kfree(buf);
+}
+fn hs_save() {
+    let buf = kmalloc(HS_MAX * 260 + 16);
+    if (buf == (0 as *u8)) { return; }
+    var o = 0; var i = 0;
+    while (i < hs_n) { o = web_line_put(buf, o, hs_url + i * 200, hs_title + i * 40); i++; }
+    web_file_put("/etc/history", buf, o);
+    kfree(buf);
+}
+/// read "url<TAB>title" lines of a file into a table
+fn web_table_load(path: *u8, urls: *u8, titles: *u8, max: int) -> int {
+    let n = fs_resolve(path);
+    if (n < 0) { return 0; }
+    var count = 0; var i = 0;
+    let d = fs_nodes[n].data; let len = fs_nodes[n].size;
+    while (i < len && count < max) {
+        var e = i;
+        while (e < len && d[e] != 10) { e++; }
+        var t = i;
+        while (t < e && d[t] != 9) { t++; }
+        if (t > i) {
+            var k = 0;
+            while (i + k < t && k < 199) { urls[count * 200 + k] = d[i + k]; k++; }
+            urls[count * 200 + k] = 0;
+            k = 0;
+            while (t + 1 + k < e && k < 39) { titles[count * 40 + k] = d[t + 1 + k]; k++; }
+            titles[count * 40 + k] = 0;
+            count++;
+        }
+        i = e + 1;
+    }
+    return count;
+}
+fn web_load_lists() {
+    bm_n = web_table_load("/etc/bookmarks", bm_url, bm_title, BM_MAX);
+    hs_n = web_table_load("/etc/history", hs_url, hs_title, HS_MAX);
+}
+fn bm_find(url: *u8) -> int {
+    var i = 0;
+    while (i < bm_n) { if (kstreq(bm_url + i * 200, url)) { return i; } i++; }
+    return -1;
+}
+fn bm_add(url: *u8, title: *u8) {
+    if (bm_n >= BM_MAX || url[0] == 0) { return; }
+    kstrncpy(bm_url + bm_n * 200, url, 199);
+    if (title[0] == 0) { kstrncpy(bm_title + bm_n * 40, url, 39); } else { kstrncpy(bm_title + bm_n * 40, title, 39); }
+    bm_n++;
+    bm_save();
+}
+fn bm_remove(i: int) {
+    if (i < 0 || i >= bm_n) { return; }
+    var k = i;
+    while (k + 1 < bm_n) { kmemcpy(bm_url + k * 200, bm_url + (k + 1) * 200, 200); kmemcpy(bm_title + k * 40, bm_title + (k + 1) * 40, 40); k++; }
+    bm_n--;
+    bm_save();
+}
+fn bm_toggle() {
+    if (web_url[0] == 0 || kmatch_ci(&web_url[0], "about:error")) { return; }
+    let i = bm_find(&web_url[0]);
+    if (i >= 0) { bm_remove(i); web_say("bookmark removed"); }
+    else { bm_add(&web_url[0], &tabs[wt].title[0]); web_say("bookmarked"); }
+}
+fn hs_add(url: *u8, title: *u8) {
+    if (url[0] == 0 || kmatch_ci(url, "about:") || kstreq(title, "Error")) { return; }
+    if (hs_n > 0 && kstreq(hs_url, url)) { if (title[0] != 0) { kstrncpy(hs_title, title, 39); } return; }
+    var i = 0;
+    while (i < hs_n) { if (kstreq(hs_url + i * 200, url)) { break; } i++; }       // seen before: move it to the top
+    if (i == hs_n) { if (hs_n < HS_MAX) { hs_n++; } i = hs_n - 1; }
+    var k = i;
+    while (k > 0) { kmemcpy(hs_url + k * 200, hs_url + (k - 1) * 200, 200); kmemcpy(hs_title + k * 40, hs_title + (k - 1) * 40, 40); k--; }
+    kstrncpy(hs_url, url, 199);
+    if (title[0] == 0) { kstrncpy(hs_title, url, 39); } else { kstrncpy(hs_title, title, 39); }
+    hs_save();
+}
+
+// ---------------------------------------------------------------- tab bookkeeping and the page cache
+fn web_tab_title(i: int) -> *u8 {
+    if (tabs[i].title[0] != 0) { return &tabs[i].title[0]; }
+    if (tabs[i].url[0] != 0) { return &tabs[i].url[0]; }
+    return "New tab";
+}
+fn web_title(t: *u8) {
+    if (web_tabs_ok()) { kstrncpy(&tabs[wt].title[0], t, 48); }
+    let wi = win_of_kind(APP_WEB);
+    if (wi < 0) { return; }
+    kstrncpy(&wins[wi].title[0], "Browser", 32);
+    if (t[0] != 0) {
+        kstrncpy(&wins[wi].title[0], "Browser - ", 32);
+        var o = 10; var k = 0;
+        while (t[k] != 0 && o < 31) { wins[wi].title[o] = t[k]; o++; k++; }
+        wins[wi].title[o] = 0;
+    }
+    win_rect_dmg(wi);
+}
+/// keep a copy of what the tab shows (ctype 1 html, 2 text, 3 markdown) so tabs can be switched without fetching again
+fn web_cache_set(ctype: int, b: *u8, len: int) {
+    if (!web_tabs_ok()) { return; }
+    if (tabs[wt].src != (0 as *u8)) { kfree(tabs[wt].src); tabs[wt].src = 0 as *u8; }
+    tabs[wt].ctype = ctype; tabs[wt].srclen = 0;
+    if (len <= 0 || len > WB_CACHE) { return; }
+    let c = kmalloc(len + 2);
+    if (c == (0 as *u8)) { return; }
+    kmemcpy(c, b, len); c[len] = 0;
+    tabs[wt].src = c; tabs[wt].srclen = len;
+}
+fn web_layout(ctype: int, b: *u8, len: int, base: *u8) {
+    if (!w_alloc()) { web_say("out of memory"); return; }
+    w_reset(web_vw(), base);
+    if (ctype == 1) { w_html(b, len); } else { w_plain(b, len, ctype == 3); }
+    find_n = 0; find_cur = 0;
+}
+fn web_show_html(b: *u8, len: int, base: *u8) {
+    web_cache_set(1, b, len);
+    web_layout(1, b, len, base);
+    web_scroll = 0;
+    if (w_title[0] != 0) { web_title(&w_title[0]); } else { web_title(""); }
+}
+fn web_show_plain(b: *u8, len: int, base: *u8, md: bool) {
+    var ct = 2; if (md) { ct = 3; }
+    web_cache_set(ct, b, len);
+    web_layout(ct, b, len, base);
+    web_scroll = 0;
+    web_title("");
+}
+fn web_show_gen(base: *u8) { web_show_html(web_gen, web_glen, base); }
+fn web_find_refresh() { if (find_on) { web_find_run(false); } }
+
+fn web_error(head: *u8, detail: *u8, extra: *u8) {
+    g_reset();
+    g_puts("<h1>"); g_esc(head); g_puts("</h1><p>"); g_esc(web_req); g_puts("</p><p>"); g_esc(detail); g_puts("</p>");
+    if (extra[0] != 0) { g_puts(extra); }
+    g_puts("<hr><p>");
+    if (kmatch_ci(&web_req[0], "http://")) { g_link(&web_req[0], "Try again"); g_puts("  |  "); }
+    g_link("about:home", "Home page"); g_puts("</p>");
+    web_show_gen(&web_req[0]);
+    web_title("Error");
+    web_loading = false;
+    web_say(head);
+}
+
+fn web_home() {
+    g_reset();
+    g_puts("<h1>Peacock Browser</h1>");
+    g_puts("<p>A small web browser written in KingCobra: tabs, bookmarks, history, find in page and downloads. It speaks HTTP over the RTL8139 network driver (DHCP, DNS, TCP) and renders HTML with basic colours, but no images, scripts or full CSS.</p>");
+    if (bm_n > 0) {
+        g_puts("<h2>Bookmarks</h2><ul>");
+        var i = 0;
+        while (i < bm_n && i < 8) { g_puts("<li>"); g_link(bm_url + i * 200, bm_title + i * 40); g_puts("</li>"); i++; }
+        g_puts("</ul><p>"); g_link("about:bookmarks", "All bookmarks"); g_puts("</p>");
+    }
+    g_puts("<h2>Try these</h2><ul>");
+    g_puts("<li><a href='http://10.0.2.2:8000/'>http://10.0.2.2:8000/</a> - your own computer, when Peacock runs in QEMU (start <code>python3 -m http.server</code> there)</li>");
+    g_puts("<li><a href='http://example.com/'>example.com</a></li>");
+    g_puts("<li><a href='http://info.cern.ch/'>info.cern.ch</a> - the first web site</li>");
+    g_puts("<li><a href='http://neverssl.com/'>neverssl.com</a></li>");
+    g_puts("</ul><h2>On this disk</h2><ul>");
+    g_puts("<li><a href='file:///'>Browse the Peacock filesystem</a></li>");
+    g_puts("<li><a href='file:///usr/src/kingcobra/README.md'>KingCobra README</a> (after running <code>install</code> in the terminal)</li>");
+    g_puts("<li><a href='file:///usr/src/kingcobra/docs/'>KingCobra docs</a></li>");
+    g_puts("<li><a href='file:///home/Downloads/'>Downloads</a></li>");
+    g_puts("</ul><h2>Your pages</h2><p><a href='about:history'>History</a>  |  <a href='about:bookmarks'>Bookmarks</a></p>");
+    g_puts("<h2>Good to know</h2><ul>");
+    g_puts("<li>https:// sites cannot be opened: Peacock has no TLS yet, and most of the modern web is https-only.</li>");
+    g_puts("<li>Ctrl+T new tab, Ctrl+W close tab, Ctrl+L address bar, Ctrl+F find, Ctrl+D bookmark, Ctrl+S save the page, Ctrl+R reload.</li>");
+    g_puts("<li>With the page focused, [ and ] switch tabs and Backspace goes back. Type words (not an address) in the bar to search your bookmarks and history.</li>");
+    g_puts("<li>Run <code>ifconfig</code> in the terminal to see whether the network is up.</li>");
+    g_puts("</ul>");
+    web_show_gen("about:home");
+    web_title("Home");
+    web_say("Peacock Browser");
+}
+
+fn web_page_bookmarks() {
+    g_reset();
+    g_puts("<h1>Bookmarks</h1>");
+    if (bm_n == 0) { g_puts("<p>No bookmarks yet. Press Ctrl+D or click the star on a page.</p>"); }
+    else {
+        g_puts("<ul>");
+        var i = 0;
+        while (i < bm_n) {
+            g_puts("<li>"); g_link(bm_url + i * 200, bm_title + i * 40);
+            g_puts("  <small>"); g_esc(bm_url + i * 200); g_puts("</small>  ");
+            var rm: u8[24]; kstrncpy(&rm[0], "about:rmbm?", 24); itoa(i, &rm[11]);
+            g_link(&rm[0], "[remove]");
+            g_puts("</li>");
+            i++;
+        }
+        g_puts("</ul>");
+    }
+    g_puts("<hr><p>"); g_link("about:home", "Home page"); g_puts("</p>");
+    web_show_gen("about:bookmarks");
+    web_title("Bookmarks");
+    web_say("Bookmarks");
+}
+fn web_page_history() {
+    g_reset();
+    g_puts("<h1>History</h1>");
+    if (hs_n == 0) { g_puts("<p>Nothing visited yet.</p>"); }
+    else {
+        g_puts("<ul>");
+        var i = 0;
+        while (i < hs_n) { g_puts("<li>"); g_link(hs_url + i * 200, hs_title + i * 40); g_puts("  <small>"); g_esc(hs_url + i * 200); g_puts("</small></li>"); i++; }
+        g_puts("</ul><p>"); g_link("about:clearhistory", "Clear history"); g_puts("</p>");
+    }
+    g_puts("<hr><p>"); g_link("about:home", "Home page"); g_puts("</p>");
+    web_show_gen("about:history");
+    web_title("History");
+    web_say("History");
+}
+
+/// words of `q` all appear in text (case-insensitive)
+fn web_match(text: *u8, q: *u8) -> bool {
+    var i = 0;
+    while (q[i] != 0) {
+        while (q[i] == ' ') { i++; }
+        if (q[i] == 0) { break; }
+        var j = i; var w: u8[48]; var n = 0;
+        while (q[j] != 0 && q[j] != ' ' && n < 47) { w[n] = q[j]; n++; j++; }
+        w[n] = 0;
+        var found = false; var t = 0;
+        while (text[t] != 0) { if (kmatch_ci(text + t, &w[0])) { found = true; break; } t++; }
+        if (!found) { return false; }
+        i = j;
+    }
+    return true;
+}
+fn web_page_search(q: *u8) {
+    g_reset();
+    g_puts("<h1>Search</h1><p>Looking for <b>"); g_esc(q); g_puts("</b> in your bookmarks and history. There is no web search engine: Peacock can only open plain http:// sites.</p>");
+    var found = 0; var i = 0;
+    g_puts("<ul>");
+    while (i < bm_n) { if (web_match(bm_url + i * 200, q) || web_match(bm_title + i * 40, q)) { g_puts("<li>[bookmark] "); g_link(bm_url + i * 200, bm_title + i * 40); g_puts("</li>"); found++; } i++; }
+    i = 0;
+    while (i < hs_n) { if (web_match(hs_url + i * 200, q) || web_match(hs_title + i * 40, q)) { g_puts("<li>"); g_link(hs_url + i * 200, hs_title + i * 40); g_puts("</li>"); found++; } i++; }
+    g_puts("</ul>");
+    if (found == 0) { g_puts("<p>No matches. To open a site, type its address, for example <code>example.com</code>.</p>"); }
+    g_puts("<hr><p>"); g_link("about:home", "Home page"); g_puts("</p>");
+    web_show_gen("about:search");
+    web_title("Search");
+    web_say("Search");
+}
+
+// ---------------------------------------------------------------- history of one tab
+fn web_hist_put(url: *u8) {
+    tabs[wt].hn = tabs[wt].hpos + 1;
+    if (tabs[wt].hn >= WB_HIST) {
+        kmemmove(&tabs[wt].hist[0], &tabs[wt].hist[WB_URL], (WB_HIST - 1) * WB_URL);
+        var k = 0; while (k + 1 < WB_HIST) { tabs[wt].hscr[k] = tabs[wt].hscr[k + 1]; k++; }
+        tabs[wt].hn = WB_HIST - 1;
+    }
+    kstrncpy(&tabs[wt].hist[tabs[wt].hn * WB_URL], url, WB_URL);
+    tabs[wt].hscr[tabs[wt].hn] = 0;
+    tabs[wt].hn++; tabs[wt].hpos = tabs[wt].hn - 1;
+}
+
+// ---------------------------------------------------------------- navigation
+fn web_dir_listing(path: *u8, node: int) {
+    g_reset();
+    g_puts("<h2>Index of "); g_esc(path); g_puts("</h2><ul>");
+    if (node != 0) { g_puts("<li><a href='file://"); var pp: u8[128]; fs_path(fs_nodes[node].parent, &pp[0]); g_puts(&pp[0]); g_puts("'>../</a></li>"); }
+    var pass = 0;
+    while (pass < 2) {
+        var i = 1;
+        while (i < FS_MAX) {
+            let k = fs_nodes[i].kind;
+            if (k != K_FREE && fs_nodes[i].parent == node && ((pass == 0 && k == K_DIR) || (pass == 1 && k == K_FILE))) {
+                g_puts("<li><a href='file://");
+                if (node == 0) { g_puts("/"); } else { g_puts(path); g_puts("/"); }
+                g_puts(&fs_nodes[i].name[0]);
+                g_puts("'>"); g_esc(&fs_nodes[i].name[0]);
+                if (k == K_DIR) { g_puts("/"); }
+                g_puts("</a>");
+                if (k == K_FILE) { g_puts("  <small>"); wg_num(fs_nodes[i].size); g_puts(" bytes</small>"); }
+                g_puts("</li>");
+            }
+            i++;
+        }
+        pass++;
+    }
+    g_puts("</ul>");
+}
+
+fn web_ends(s: *u8, suffix: *u8) -> bool {
+    let a = kstrlen(s); let b = kstrlen(suffix);
+    if (b > a) { return false; }
+    var i = 0;
+    while (i < b) { if (http_lower(s[a - b + i] as int) != (suffix[i] as int)) { return false; } i++; }
+    return true;
+}
+
+fn web_open_file(path: *u8, url: *u8) {
+    let n = fs_resolve(path);
+    if (n < 0) { web_error("File not found", "There is nothing at that path on the Peacock filesystem.", ""); return; }
+    if (fs_nodes[n].kind == K_DIR) {
+        var ab: u8[128]; fs_path(n, &ab[0]);
+        web_dir_listing(&ab[0], n);
+        web_show_gen(url);
+        web_title(&ab[0]);
+    } else if (web_ends(path, ".html") || web_ends(path, ".htm")) {
+        web_show_html(fs_nodes[n].data, fs_nodes[n].size, url);
+        if (w_title[0] == 0) { web_title(&fs_nodes[n].name[0]); }
+    } else {
+        web_show_plain(fs_nodes[n].data, fs_nodes[n].size, url, web_ends(path, ".md"));
+        web_title(&fs_nodes[n].name[0]);
+    }
+    web_loading = false;
+    web_say(&fs_nodes[n].name[0]);
+}
+
+fn web_set_url(u: *u8) {
+    kstrncpy(&web_url[0], u, 300);
+    kstrncpy(&web_edit[0], u, 300);
+    web_elen = kstrlen(&web_edit[0]); web_ecur = web_elen; web_esel = false;
+    if (web_tabs_ok()) { kstrncpy(&tabs[wt].url[0], u, 300); }
+}
+
+fn web_start_fetch(host: *u8, port: int, path: *u8) {
+    if (fetch_busy() && !web_job) { web_error("Network busy", "Another download (wget in the terminal?) is running. Try again in a moment.", ""); return; }
+    if (web_job) { fetch_cancel(); }
+    fetch_release();
+    web_job = true; web_loading = true; web_sig = -1;
+    fetch_start(host, port, path);
+    web_say("Loading ...");
+}
+
+fn web_about(path: *u8) {
+    if (kstreq(path, "") || kstreq(path, "home") || kstreq(path, "blank")) { web_home(); }
+    else if (kstreq(path, "bookmarks")) { web_page_bookmarks(); }
+    else if (kstreq(path, "history")) { web_page_history(); }
+    else if (kmatch_ci(path, "rmbm?")) { bm_remove(katoi(path + 5)); web_page_bookmarks(); }
+    else if (kstreq(path, "clearhistory")) { hs_n = 0; hs_save(); web_page_history(); }
+    else if (kmatch_ci(path, "search?")) { web_page_search(path + 7); }
+    else { web_error("Unknown page", "There is no such about: page.", ""); }
+}
+
+/// go to an address; push = record it in the history
+fn web_nav(url: *u8, push: bool) {
+    web_ensure();
+    if (!web_tabs_ok()) { return; }
+    if (tabs[wt].used == 0) { tabs[wt].used = 1; tabs[wt].hpos = -1; tabs[wt].hn = 0; }
+    var full: u8[300];
+    var typed: u8[300];
+    kstrncpy(&typed[0], url, 300);
+    // words, not an address: search bookmarks and history
+    var has_space = false; var q = 0;
+    while (typed[q] == ' ') { q++; }
+    var e = kstrlen(&typed[0]);
+    while (e > q && typed[e - 1] == ' ') { e--; }
+    typed[e] = 0;
+    var k = q;
+    while (typed[k] != 0) { if (typed[k] == ' ') { has_space = true; } k++; }
+    if (has_space && !kmatch_ci(&typed[q], "about:") && !kmatch_ci(&typed[q], "file:") && !kmatch_ci(&typed[q], "http")) {
+        var sr: u8[300]; kstrncpy(&sr[0], "about:search?", 300); kstrncpy(&sr[13], &typed[q], 280);
+        kstrncpy(&typed[0], &sr[0], 300);
+        q = 0;
+    }
+    let sch = url_parse(&typed[q]);
+    var host: u8[72]; var path: u8[300];
+    kstrncpy(&host[0], &pu_host[0], 72); kstrncpy(&path[0], &pu_path[0], 300);
+    let port = pu_port;
+    var o = url_origin(&full[0]);
+    if (sch == 4) { url_put(&full[0], o, &path[0]); }
+    else if (sch == 5) { kstrncpy(&full[0], &typed[q], 300); }
+    else { url_put(&full[0], o, &path[0]); }
+    kstrncpy(&web_req[0], &full[0], 300);
+    if (sch == 5) { web_say("this kind of link is not supported"); return; }
+    tabs[wt].scroll = web_scroll;
+    if (tabs[wt].hpos >= 0) { tabs[wt].hscr[tabs[wt].hpos] = web_scroll; }
+    if (push) { web_hist_put(&full[0]); }
+    if (web_job) { fetch_cancel(); web_job = false; }
+    web_set_url(&full[0]);
+    web_scroll = 0; web_hov = -1; sg_n = 0;
+    if (sch == 4) { web_loading = false; web_about(&path[0]); }
+    else if (sch == 3) { web_open_file(&path[0], &full[0]); }
+    else if (sch == 2) {
+        var alt: u8[300]; var a = url_put(&alt[0], 0, "http://");
+        a = url_put(&alt[0], a, &host[0]); url_put(&alt[0], a, &path[0]);
+        g_reset(); g_puts("<p>You can try the plain-http address, but most sites redirect it right back to https:</p><p><a href='"); g_puts(&alt[0]); g_puts("'>"); g_esc(&alt[0]); g_puts("</a></p>");
+        var ex: u8[400]; kmemcpy(&ex[0], web_gen, imin(web_glen, 399)); ex[imin(web_glen, 399)] = 0;
+        web_error("https:// is not supported", "Peacock has no TLS, so it cannot open encrypted pages. Plain http:// sites and local files work.", &ex[0]);
+    }
+    else if (host[0] == 0) { web_error("No address", "Type a web address such as example.com.", ""); }
+    else { web_start_fetch(&host[0], port, &path[0]); }
+    if (!web_job) { hs_add(&web_url[0], &tabs[wt].title[0]); }
+    ui_inval_all(APP_WEB);
+}
+
+fn web_body_is_html() -> bool {
+    if (kmatch_ci(&resp_type[0], "text/html") || kmatch_ci(&resp_type[0], "application/xhtml")) { return true; }
+    if (resp_type[0] != 0) { return false; }
+    var i = 0;
+    while (i < resp_len && kisspace(rb_buf[resp_off + i] as int)) { i++; }
+    return i < resp_len && rb_buf[resp_off + i] == '<';
+}
+
+fn http_status_text(code: int) -> *u8 {
+    if (code == 200) { return "OK"; } if (code == 204) { return "No Content"; } if (code == 301) { return "Moved Permanently"; }
+    if (code == 302) { return "Found"; } if (code == 304) { return "Not Modified"; } if (code == 400) { return "Bad Request"; }
+    if (code == 401) { return "Unauthorized"; } if (code == 403) { return "Forbidden"; } if (code == 404) { return "Not Found"; }
+    if (code == 405) { return "Method Not Allowed"; } if (code == 410) { return "Gone"; } if (code == 429) { return "Too Many Requests"; }
+    if (code == 500) { return "Server Error"; } if (code == 502) { return "Bad Gateway"; } if (code == 503) { return "Service Unavailable"; }
+    if (code == 504) { return "Gateway Timeout"; }
+    return "";
+}
+
+/// file name for a download: Content-Disposition, else the last part of the address
+fn web_download_name(out: *u8) {
+    out[0] = 0;
+    if (resp_name[0] != 0) { kstrncpy(out, &resp_name[0], 31); }
+    else {
+        var e = kstrlen(&web_req[0]);
+        var q = 0; while (web_req[q] != 0) { if (web_req[q] == '?') { e = q; break; } q++; }
+        var s = e;
+        while (s > 0 && web_req[s - 1] != '/') { s--; }
+        var o = 0;
+        while (s < e && o < 30) { out[o] = web_req[s]; o++; s++; }
+        out[o] = 0;
+        if (o == 0) { kstrncpy(out, "download", 31); }
+    }
+    var i = 0;                                                       // keep the name safe: no slashes
+    while (out[i] != 0) { if (out[i] == '/' || out[i] == '\\' || out[i] < 32) { out[i] = '_'; } i++; }
+}
+/// save bytes into /home/Downloads under a free name; the chosen name goes to `name`, false when it did not work
+fn web_save_download(name: *u8, data: *u8, len: int) -> bool {
+    let dir = fs_mkdirs("/home/Downloads");
+    var d = fs_resolve("/home/Downloads");
+    if (d < 0) { d = dir; }
+    if (d < 0) { return false; }
+    var uniq: u8[40];
+    fs_unique_name(d, name, &uniq[0]);
+    var path: u8[96];
+    kstrncpy(&path[0], "/home/Downloads/", 96); kstrncpy(&path[16], &uniq[0], 40);
+    let n = fs_create(&path[0], K_FILE);
+    if (n < 0) { return false; }
+    if (!fs_write(n, data, len, false)) { return false; }
+    kstrncpy(name, &uniq[0], 40);
+    return true;
+}
+
+fn web_on_done() {
+    web_job = false; web_loading = false;
+    let code = resp_code;
+    if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && resp_loc[0] != 0) {
+        web_redirects++;
+        if (web_redirects > 6) { fetch_release(); web_error("Too many redirects", "The server keeps redirecting.", ""); return; }
+        var nu: u8[300];
+        url_resolve(&web_req[0], &resp_loc[0], &nu[0]);
+        fetch_release();
+        if (tabs[wt].hpos >= 0) { kstrncpy(&tabs[wt].hist[tabs[wt].hpos * WB_URL], &nu[0], 300); }
+        web_nav(&nu[0], false);
+        return;
+    }
+    web_redirects = 0;
+    var st: u8[100];
+    var s = url_put(&st[0], 0, "HTTP ");
+    var cb: u8[8]; itoa(code, &cb[0]);
+    s = url_put(&st[0], s, &cb[0]);
+    if (http_status_text(code)[0] != 0) { s = url_put(&st[0], s, " "); s = url_put(&st[0], s, http_status_text(code)); }
+    if (resp_len > 0) {
+        var lb: u8[16]; s = url_put(&st[0], s, "   ");
+        if (resp_len >= 1024) { itoa(resp_len / 1024, &lb[0]); s = url_put(&st[0], s, &lb[0]); s = url_put(&st[0], s, " KiB"); }
+        else { itoa(resp_len, &lb[0]); s = url_put(&st[0], s, &lb[0]); s = url_put(&st[0], s, " bytes"); }
+    }
+    if (rb_trunc) { url_put(&st[0], s, "  (page cut at 4 MiB)"); }
+    if (resp_enc != 0) { fetch_release(); web_error("Compressed response", "The server sent a compressed page that Peacock cannot unpack.", ""); return; }
+    if (resp_len == 0 && code >= 400) { fetch_release(); web_error("The server returned an error", &st[0], ""); return; }
+    if (web_body_is_html()) { web_show_html(rb_buf + resp_off, resp_len, &web_req[0]); }
+    else if (resp_name[0] == 0 && (resp_type[0] == 0 || kmatch_ci(&resp_type[0], "text/") || kmatch_ci(&resp_type[0], "application/json") || kmatch_ci(&resp_type[0], "application/xml") || kmatch_ci(&resp_type[0], "application/javascript"))) {
+        web_show_plain(rb_buf + resp_off, resp_len, &web_req[0], web_ends(&web_req[0], ".md"));
+        web_title("");
+    } else {
+        var nm: u8[40]; web_download_name(&nm[0]);
+        let ok = web_save_download(&nm[0], rb_buf + resp_off, resp_len);
+        g_reset();
+        if (ok) {
+            g_puts("<h2>Downloaded</h2><p>"); g_esc(&nm[0]); g_puts(" ("); wg_num(resp_len); g_puts(" bytes, ");
+            g_esc(&resp_type[0]); g_puts(") was saved to <a href='file:///home/Downloads/"); g_esc(&nm[0]); g_puts("'>/home/Downloads/"); g_esc(&nm[0]); g_puts("</a>.</p>");
+            g_puts("<p><a href='file:///home/Downloads/'>Open the Downloads folder</a></p>");
+            kstrncpy(&st[0], "saved to /home/Downloads", 100);
+        } else {
+            g_puts("<h2>Could not save the file</h2><p>The disk is full or the file is too large for the Peacock file system.</p>");
+            kstrncpy(&st[0], "download failed", 100);
+        }
+        web_show_gen(&web_req[0]);
+        web_title("Download");
+    }
+    if (w_title[0] != 0 || tabs[wt].title[0] != 0) { }
+    fetch_release();
+    web_say(&st[0]);
+    hs_add(&web_url[0], &tabs[wt].title[0]);
+    web_find_refresh();
+}
+
+fn web_tick() -> bool {
+    if (!web_job) { return false; }
+    if (fx_state == F_DONE) { web_on_done(); return true; }
+    if (fx_state == F_ERR) {
+        web_job = false; web_loading = false;
+        var m: u8[72]; kstrncpy(&m[0], &fx_msg[0], 72);
+        fetch_release();
+        web_error("Cannot open the page", &m[0], "");
+        return true;
+    }
+    let sig = fx_state * 1000000 + rb_len / 512 + (tc_state * 7) + (ticks / 12) * 13;
+    if (sig != web_sig) {
+        web_sig = sig;
+        var st: u8[100]; kstrncpy(&st[0], &fx_msg[0], 100);
+        if (rb_len > 0) { var o = kstrlen(&st[0]); var nb: u8[12]; itoa(rb_len / 1024, &nb[0]); o = url_put(&st[0], o, "  "); o = url_put(&st[0], o, &nb[0]); url_put(&st[0], o, " KiB"); }
+        web_say(&st[0]);
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- tabs
+fn web_tab_count() -> int { var n = 0; var i = 0; while (i < WB_MAXTAB) { if (tabs[i].used != 0) { n++; } i++; } return n; }
+
+/// show the tab `i`: from its cached copy when it has one, otherwise by loading its address again
+fn web_activate(i: int) {
+    if (i < 0 || i >= WB_MAXTAB || tabs[i].used == 0) { return; }
+    if (i != wt && tabs[wt].used != 0) { tabs[wt].scroll = web_scroll; }
+    if (web_job) { fetch_cancel(); web_job = false; web_loading = false; fetch_release(); }
+    wt = i; web_hov = -1; sg_n = 0; web_focus = 1;
+    kstrncpy(&web_url[0], &tabs[i].url[0], 300); kstrncpy(&web_edit[0], &tabs[i].url[0], 300);
+    web_elen = kstrlen(&web_edit[0]); web_ecur = web_elen; web_esel = false;
+    let sc = tabs[i].scroll;
+    if (tabs[i].src != (0 as *u8)) {
+        web_layout(tabs[i].ctype, tabs[i].src, tabs[i].srclen, &tabs[i].url[0]);
+        web_scroll = imax(0, imin(sc, web_maxscroll()));
+        web_title(&tabs[i].title[0]);
+        web_say(&tabs[i].url[0]);
+        web_find_refresh();
+    } else if (tabs[i].url[0] != 0) {
+        var u: u8[300]; kstrncpy(&u[0], &tabs[i].url[0], 300);
+        web_redirects = 0; web_nav(&u[0], false);
+        web_scroll = sc;
+    } else { web_nav("about:home", true); }
+    ui_inval_all(APP_WEB);
+}
+fn web_new_tab() {
+    web_ensure();
+    var i = 0;
+    while (i < WB_MAXTAB && tabs[i].used != 0) { i++; }
+    if (i == WB_MAXTAB) { web_say("too many tabs (6 at most)"); return; }
+    if (tabs[wt].used != 0) { tabs[wt].scroll = web_scroll; }
+    tabs[i].used = 1; tabs[i].hn = 0; tabs[i].hpos = -1; tabs[i].scroll = 0; tabs[i].title[0] = 0; tabs[i].url[0] = 0; tabs[i].src = 0 as *u8; tabs[i].srclen = 0;
+    if (web_job) { fetch_cancel(); web_job = false; web_loading = false; fetch_release(); }
+    wt = i; web_scroll = 0;
+    web_nav("about:home", true);
+    web_focus = 0; web_esel = true; web_edit[0] = 0; web_elen = 0; web_ecur = 0;
+}
+fn web_close_tab(i: int) {
+    if (i < 0 || i >= WB_MAXTAB || tabs[i].used == 0) { return; }
+    if (web_tab_count() <= 1) { web_nav("about:home", true); return; }
+    if (i == wt && web_job) { fetch_cancel(); web_job = false; web_loading = false; fetch_release(); }
+    if (tabs[i].src != (0 as *u8)) { kfree(tabs[i].src); }
+    tabs[i].src = 0 as *u8; tabs[i].used = 0; tabs[i].url[0] = 0; tabs[i].title[0] = 0; tabs[i].srclen = 0;
+    if (i == wt) {
+        var n = i; var found = -1; var c = 0;
+        while (c < WB_MAXTAB) { n = (n + WB_MAXTAB - 1) % WB_MAXTAB; if (tabs[n].used != 0) { found = n; break; } c++; }
+        wt = found;
+        tabs[wt].scroll = tabs[wt].scroll;
+        web_activate(wt);
+    }
+    ui_inval_all(APP_WEB);
+}
+fn web_next_tab(dir: int) {
+    var n = wt; var c = 0;
+    while (c < WB_MAXTAB) { n = (n + WB_MAXTAB + dir) % WB_MAXTAB; if (tabs[n].used != 0) { web_activate(n); return; } c++; }
+}
+
+fn web_init() {
+    web_ensure();
+    web_job = false; web_loading = false; web_focus = 0; web_redirects = 0; find_on = false; web_hov = -1; sg_n = 0; web_scroll = 0;
+    var i = 0;
+    while (i < WB_MAXTAB) { tabs[i].used = 0; tabs[i].src = 0 as *u8; i++; }
+    wt = 0; tabs[0].used = 1; tabs[0].hn = 0; tabs[0].hpos = -1; tabs[0].url[0] = 0; tabs[0].title[0] = 0;
+    web_load_lists();
+    web_say("");
+    web_nav("about:home", true);
+}
+fn web_close() {
+    if (web_job) { fetch_cancel(); web_job = false; }
+    fetch_release();
+    w_free();
+    if (web_gen != (0 as *u8)) { kfree(web_gen); web_gen = 0 as *u8; }
+    if (web_tabs_ok()) {
+        var i = 0;
+        while (i < WB_MAXTAB) { if (tabs[i].src != (0 as *u8)) { kfree(tabs[i].src); tabs[i].src = 0 as *u8; } tabs[i].used = 0; i++; }
+    }
+}
+
+fn web_back() {
+    if (tabs[wt].hpos > 0) {
+        tabs[wt].hscr[tabs[wt].hpos] = web_scroll;
+        tabs[wt].hpos--;
+        var u: u8[300]; kstrncpy(&u[0], &tabs[wt].hist[tabs[wt].hpos * WB_URL], 300);
+        let sc = tabs[wt].hscr[tabs[wt].hpos];
+        web_redirects = 0; web_nav(&u[0], false);
+        if (!web_job) { web_scroll = imax(0, imin(sc, web_maxscroll())); }
+    }
+}
+fn web_forward() {
+    if (tabs[wt].hpos + 1 < tabs[wt].hn) {
+        tabs[wt].hscr[tabs[wt].hpos] = web_scroll;
+        tabs[wt].hpos++;
+        var u: u8[300]; kstrncpy(&u[0], &tabs[wt].hist[tabs[wt].hpos * WB_URL], 300);
+        let sc = tabs[wt].hscr[tabs[wt].hpos];
+        web_redirects = 0; web_nav(&u[0], false);
+        if (!web_job) { web_scroll = imax(0, imin(sc, web_maxscroll())); }
+    }
+}
+fn web_reload() {
+    if (tabs[wt].hpos >= 0) {
+        var u: u8[300]; kstrncpy(&u[0], &tabs[wt].hist[tabs[wt].hpos * WB_URL], 300);
+        let sc = web_scroll;
+        web_redirects = 0; web_nav(&u[0], false);
+        if (!web_job) { web_scroll = imax(0, imin(sc, web_maxscroll())); }
+    }
+}
+
+// ---------------------------------------------------------------- saving the page
+fn web_save_page() {
+    if (!web_tabs_ok() || tabs[wt].src == (0 as *u8)) { web_say("nothing to save"); return; }
+    var nm: u8[40];
+    var o = 0; var i = 0;
+    let t = web_tab_title(wt);
+    while (t[i] != 0 && o < 24) {
+        let c = t[i] as int;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') { nm[o] = c as u8; o++; } else if (o > 0 && nm[o - 1] != '_') { nm[o] = '_'; o++; }
+        i++;
+    }
+    if (o == 0) { kstrncpy(&nm[0], "page", 8); o = 4; }
+    nm[o] = 0;
+    if (tabs[wt].ctype == 1) { kstrncpy(&nm[o], ".html", 8); } else if (tabs[wt].ctype == 3) { kstrncpy(&nm[o], ".md", 8); } else { kstrncpy(&nm[o], ".txt", 8); }
+    if (web_save_download(&nm[0], tabs[wt].src, tabs[wt].srclen)) {
+        var m: u8[100]; var a = url_put(&m[0], 0, "saved /home/Downloads/"); url_put(&m[0], a, &nm[0]); web_say(&m[0]);
+    } else { web_say("could not save the page"); }
+}
+
+// ---------------------------------------------------------------- find in page
+fn web_find_clear() {
+    var i = 0;
+    while (i < wn) { wit[i].flags = wit[i].flags & ~(WF_HL | WF_HLCUR); i++; }
+    find_n = 0;
+}
+fn web_find_mark_cur() {
+    var m = 0;
+    while (m < find_n) {
+        var k = 0;
+        while (k < find_span[m]) {
+            let it = find_item[m] + k;
+            if (m == find_cur) { wit[it].flags = (wit[it].flags | WF_HLCUR) & ~WF_HL; } else { wit[it].flags = (wit[it].flags | WF_HL) & ~WF_HLCUR; }
+            k++;
+        }
+        m++;
+    }
+}
+fn web_find_show() {
+    if (find_n == 0) { return; }
+    let it = find_item[find_cur];
+    web_scroll = imax(0, imin(wit[it].y - web_vh() / 3, web_maxscroll()));
+}
+/// search the display list for the query (case-insensitive; phrases of up to a few words work across word boundaries)
+fn web_find_run(jump: bool) {
+    web_find_clear();
+    if (find_ql == 0 || wn == 0) { find_cur = 0; return; }
+    var joined: u8[420];
+    var i = 0;
+    while (i < wn && find_n < 500) {
+        if ((wit[i].flags & (WF_RULE | WF_BOX)) == 0) {
+            // item i and the next two words joined by spaces
+            var len = 0; var starts: int[4]; var cnt = 0;
+            var k = i;
+            while (k < wn && cnt < 3) {
+                if ((wit[k].flags & (WF_RULE | WF_BOX)) != 0) { break; }
+                starts[cnt] = len;
+                let s = wpool + wit[k].off;
+                var j = 0;
+                while (s[j] != 0 && len < 400) { joined[len] = s[j]; len++; j++; }
+                joined[len] = ' '; len++;
+                cnt++; k++;
+            }
+            joined[len] = 0;
+            var firstend = len - 1;
+            if (cnt > 1) { firstend = starts[1] - 1; }
+            var o = 0; var hit = false;
+            while (o < firstend) {
+                if (kmatch_ci(&joined[o], &find_q[0])) { hit = true; break; }
+                o++;
+            }
+            if (hit) {
+                let endp = o + find_ql;
+                var span = 1; var c2 = 1;
+                while (c2 < cnt) { if (endp > starts[c2]) { span = c2 + 1; } c2++; }
+                find_item[find_n] = i; find_span[find_n] = span; find_n++;
+                i = i + span - 1;
+            }
+        }
+        i++;
+    }
+    if (find_cur >= find_n) { find_cur = 0; }
+    web_find_mark_cur();
+    if (jump) { web_find_show(); }
+}
+fn web_find_open() {
+    find_on = true; web_focus = 2;
+    web_scroll = imax(0, imin(web_scroll, web_maxscroll()));
+    web_find_run(false);
+}
+fn web_find_close() {
+    find_on = false; web_find_clear(); if (web_focus == 2) { web_focus = 1; }
+    web_scroll = imax(0, imin(web_scroll, web_maxscroll()));
+}
+fn web_find_step(d: int) {
+    if (find_n == 0) { return; }
+    find_cur = (find_cur + find_n + d) % find_n;
+    web_find_mark_cur(); web_find_show();
+}
+
+// ---------------------------------------------------------------- suggestions
+fn web_sg_url(i: int) -> *u8 { if (sg_idx[i] < 100) { return bm_url + sg_idx[i] * 200; } return hs_url + (sg_idx[i] - 100) * 200; }
+fn web_sg_title(i: int) -> *u8 { if (sg_idx[i] < 100) { return bm_title + sg_idx[i] * 40; } return hs_title + (sg_idx[i] - 100) * 40; }
+fn web_suggest() {
+    sg_n = 0; sg_sel = -1;
+    if (web_elen == 0 || web_esel) { return; }
+    web_edit[web_elen] = 0;
+    var i = 0;
+    while (i < bm_n && sg_n < SG_MAX) { if (web_match(bm_url + i * 200, &web_edit[0]) || web_match(bm_title + i * 40, &web_edit[0])) { sg_idx[sg_n] = i; sg_n++; } i++; }
+    i = 0;
+    while (i < hs_n && sg_n < SG_MAX) {
+        if (web_match(hs_url + i * 200, &web_edit[0]) || web_match(hs_title + i * 40, &web_edit[0])) {
+            var dup = false; var d = 0;
+            while (d < sg_n) { if (kstreq(web_sg_url(d), hs_url + i * 200)) { dup = true; } d++; }
+            if (!dup) { sg_idx[sg_n] = 100 + i; sg_n++; }
+        }
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------- input
+fn web_go_typed() {
+    web_edit[web_elen] = 0;
+    if (web_elen == 0) { return; }
+    web_redirects = 0;
+    var u: u8[300];
+    if (sg_sel >= 0 && sg_sel < sg_n) { kstrncpy(&u[0], web_sg_url(sg_sel), 300); } else { kstrncpy(&u[0], &web_edit[0], 300); }
+    web_focus = 1; sg_n = 0;
+    web_nav(&u[0], true);
+}
+
+fn web_edit_ins(c: int) {
+    if (web_esel) { web_elen = 0; web_ecur = 0; web_esel = false; }
+    if (web_elen >= 290) { return; }
+    var i = web_elen;
+    while (i > web_ecur) { web_edit[i] = web_edit[i - 1]; i--; }
+    web_edit[web_ecur] = c as u8; web_elen++; web_ecur++; web_edit[web_elen] = 0;
+}
+fn web_edit_del(back: bool) {
+    if (web_esel) { web_elen = 0; web_ecur = 0; web_esel = false; web_edit[0] = 0; return; }
+    if (back) { if (web_ecur == 0) { return; } web_ecur--; }
+    if (web_ecur >= web_elen) { return; }
+    var i = web_ecur;
+    while (i < web_elen) { web_edit[i] = web_edit[i + 1]; i++; }
+    web_elen--;
+}
+
+fn web_key_address(k: int) {
+    if (k == 10) { web_go_typed(); return; }
+    if (k == 8) { web_edit_del(true); }
+    else if (k == KEY_DEL) { web_edit_del(false); }
+    else if (k == KEY_LEFT) { web_esel = false; if (web_ecur > 0) { web_ecur--; } }
+    else if (k == KEY_RIGHT) { web_esel = false; if (web_ecur < web_elen) { web_ecur++; } }
+    else if (k == KEY_HOME) { web_esel = false; web_ecur = 0; }
+    else if (k == KEY_END) { web_esel = false; web_ecur = web_elen; }
+    else if (k == KEY_DOWN) { if (sg_n > 0) { sg_sel = (sg_sel + 1) % sg_n; } return; }
+    else if (k == KEY_UP) { if (sg_n > 0) { if (sg_sel <= 0) { sg_sel = sg_n - 1; } else { sg_sel--; } } return; }
+    else if (k == 1) { web_esel = true; return; }
+    else if (k == 21) { web_elen = 0; web_ecur = 0; web_edit[0] = 0; web_esel = false; }
+    else if (k == 9 || k == 27) {
+        if (sg_n > 0 && k == 27) { sg_n = 0; return; }
+        web_focus = 1;
+        if (k == 27) { kstrncpy(&web_edit[0], &web_url[0], 300); web_elen = kstrlen(&web_edit[0]); web_ecur = web_elen; web_esel = false; }
+        sg_n = 0;
+        return;
+    }
+    else if (k >= 32 && k < 127) { web_edit_ins(k); }
+    else { return; }
+    web_suggest();
+}
+
+fn web_key_find(k: int) {
+    if (k == 27) { web_find_close(); return; }
+    if (k == 10 || k == KEY_DOWN) { web_find_step(1); return; }
+    if (k == KEY_UP) { web_find_step(-1); return; }
+    if (k == 8) { if (find_ql > 0) { find_ql--; find_q[find_ql] = 0; find_cur = 0; web_find_run(true); } return; }
+    if (k == 21) { find_ql = 0; find_q[0] = 0; web_find_run(false); return; }
+    if (k >= 32 && k < 127 && find_ql < 44) { find_q[find_ql] = k as u8; find_ql++; find_q[find_ql] = 0; find_cur = 0; web_find_run(true); }
+}
+
+fn web_key(k: int) {
+    web_ensure();
+    // shortcuts that work everywhere
+    if (k == 20) { web_new_tab(); ui_inval_all(APP_WEB); return; }
+    if (k == 23) { web_close_tab(wt); ui_inval_all(APP_WEB); return; }
+    if (k == 6) { web_find_open(); ui_inval_all(APP_WEB); return; }
+    if (k == 4) { bm_toggle(); ui_inval_all(APP_WEB); return; }
+    if (k == 18) { web_reload(); ui_inval_all(APP_WEB); return; }
+    if (k == 19) { web_save_page(); ui_inval_all(APP_WEB); return; }
+    if (k == 12) { web_focus = 0; web_esel = true; web_suggest(); ui_inval_all(APP_WEB); return; }
+    if (web_focus == 0) { web_key_address(k); }
+    else if (web_focus == 2) { web_key_find(k); if (find_on && web_focus == 2 && (k == 9)) { web_focus = 1; } }
+    else {
+        let step = 48; let page = web_vh() - 32;
+        if (k == KEY_DOWN) { web_scroll = web_scroll + step; }
+        else if (k == KEY_UP) { web_scroll = web_scroll - step; }
+        else if (k == KEY_PGDN || k == ' ') { web_scroll = web_scroll + page; }
+        else if (k == KEY_PGUP) { web_scroll = web_scroll - page; }
+        else if (k == KEY_HOME) { web_scroll = 0; }
+        else if (k == KEY_END) { web_scroll = web_maxscroll(); }
+        else if (k == 8) { web_back(); }
+        else if (k == '[') { web_next_tab(-1); }
+        else if (k == ']') { web_next_tab(1); }
+        else if (k == 9 || k == '/') { web_focus = 0; web_esel = true; }
+        else if (k == 'r' || k == 'R') { web_reload(); }
+        else if (k == 27 && find_on) { web_find_close(); }
+        else { return; }
+    }
+    web_scroll = imax(0, imin(web_scroll, web_maxscroll()));
+    ui_inval_all(APP_WEB);
+}
+
+fn web_set_scroll_from(my: int) {
+    let vh = web_vh();
+    let total = imax(w_height, vh);
+    let th = imax(24, vh * vh / total);
+    let span = vh - th;
+    if (span <= 0) { return; }
+    web_scroll = (my - wb_top() - th / 2) * web_maxscroll() / span;
+    web_scroll = imax(0, imin(web_scroll, web_maxscroll()));
+}
+
+fn web_tab_w() -> int {
+    let n = imax(1, web_tab_count());
+    return imin(176, (WEB_W - 52) / n);
+}
+fn web_bm_chip_w(i: int) -> int { return imin(132, 24 + kstrlen(bm_title + i * 40) * 8); }
+
+fn web_anchor_jump(u: *u8) {
+    let y = w_anchor_y(u + 1);
+    if (y >= 0) { web_scroll = imax(0, imin(y - 8, web_maxscroll())); }
+    else if (u[1] == 0) { web_scroll = 0; }
+}
+
+fn web_mouse(mx: int, my: int, ev: int) {
+    web_ensure();
+    if (ev == 3) { web_drag = false; return; }
+    if (ev == 5) {                                                          // hover: show the link address under the pointer
+        var h = -1;
+        if (my >= wb_top() && my < WEB_H - WB_STATUS - wb_findh() && mx < WEB_W - WB_SB) { h = w_link_at(mx - 8, my - wb_top() + web_scroll); }
+        if (h != web_hov) { web_hov = h; ui_inval_all(APP_WEB); }
+        return;
+    }
+    if (ev == 2) { if (web_drag) { web_set_scroll_from(my); ui_inval_all(APP_WEB); } return; }
+    if (ev != 1) { return; }
+    let top = wb_top();
+    // suggestion list (drawn over the page)
+    if (sg_n > 0 && web_focus == 0 && my >= WB_TABS + WB_BAR - 2 && my < WB_TABS + WB_BAR - 2 + sg_n * 24 && mx >= 140 && mx < WEB_W - 84) {
+        let i = (my - (WB_TABS + WB_BAR - 2)) / 24;
+        if (i >= 0 && i < sg_n) { sg_sel = i; web_go_typed(); }
+        ui_inval_all(APP_WEB);
+        return;
+    }
+    sg_n = 0;
+    if (my < WB_TABS) {
+        let tw = web_tab_w();
+        var i = 0; var slot = 0;
+        while (i < WB_MAXTAB) {
+            if (tabs[i].used != 0) {
+                let tx = 6 + slot * tw;
+                if (mx >= tx && mx < tx + tw - 2) {
+                    if (mx >= tx + tw - 22) { web_close_tab(i); } else if (i != wt) { web_activate(i); }
+                    ui_inval_all(APP_WEB); return;
+                }
+                slot++;
+            }
+            i++;
+        }
+        if (mx >= 6 + slot * tw && mx < 6 + slot * tw + 26) { web_new_tab(); }
+    } else if (my < WB_TABS + WB_BAR) {
+        let by = my - WB_TABS;
+        if (in_rect(mx, by, 8, 4, 28, 30)) { web_back(); }
+        else if (in_rect(mx, by, 40, 4, 28, 30)) { web_forward(); }
+        else if (in_rect(mx, by, 72, 4, 28, 30)) { if (web_job) { fetch_cancel(); web_job = false; web_loading = false; fetch_release(); web_say("stopped"); } else { web_reload(); } }
+        else if (in_rect(mx, by, 104, 4, 28, 30)) { web_nav("about:home", true); }
+        else if (in_rect(mx, by, WEB_W - 76, 4, 30, 30)) { if (find_on) { web_find_close(); } else { web_find_open(); } }
+        else if (in_rect(mx, by, WEB_W - 44, 4, 30, 30)) { bm_toggle(); }
+        else if (in_rect(mx, by, 140, 4, WEB_W - 224, 30)) {
+            if (web_focus != 0) { web_esel = true; }
+            else {
+                // click to place the caret
+                let col = (mx - 140 - 40) / 8;
+                var off = 0; let cols = (WEB_W - 224 - 56) / 8;
+                if (web_elen > cols) { off = imax(0, web_ecur - cols + 1); if (off > web_elen - cols) { off = web_elen - cols; } }
+                web_ecur = imax(0, imin(web_elen, off + col)); web_esel = false;
+            }
+            web_focus = 0; web_suggest();
+        }
+    } else if (web_bmbar && bm_n > 0 && my < top) {
+        var x = 8; var i = 0;
+        while (i < bm_n && x + web_bm_chip_w(i) < WEB_W - 8) {
+            let cw = web_bm_chip_w(i);
+            if (mx >= x && mx < x + cw) { var u: u8[300]; kstrncpy(&u[0], bm_url + i * 200, 300); web_redirects = 0; web_nav(&u[0], true); ui_inval_all(APP_WEB); return; }
+            x = x + cw + 6; i++;
+        }
+    } else if (my < WEB_H - WB_STATUS - wb_findh()) {
+        if (mx >= WEB_W - WB_SB) { web_drag = true; web_set_scroll_from(my); }
+        else {
+            web_focus = 1;
+            let li = w_link_at(mx - 8, my - top + web_scroll);
+            if (li >= 0) {
+                var u2: u8[300]; kstrncpy(&u2[0], wpool + wl_off[li], 300);
+                if (u2[0] == '#') { web_anchor_jump(&u2[0]); }
+                else { web_redirects = 0; web_nav(&u2[0], true); }
+            }
+        }
+    } else if (find_on && my < WEB_H - WB_STATUS) {
+        let fy = my - (WEB_H - WB_STATUS - WB_FIND);
+        web_focus = 2;
+        if (in_rect(mx, fy, WEB_W - 36, 3, 26, 24)) { web_find_close(); }
+        else if (in_rect(mx, fy, WEB_W - 100, 3, 28, 24)) { web_find_step(1); }
+        else if (in_rect(mx, fy, WEB_W - 132, 3, 28, 24)) { web_find_step(-1); }
+    }
+    web_scroll = imax(0, imin(web_scroll, web_maxscroll()));
+    ui_inval_all(APP_WEB);
+}
+
+/// which cursor over the window (for ui.kc): 0 arrow, 1 hand, 2 text beam
+fn web_cursor(mx: int, my: int) -> int {
+    if (my < WB_TABS) { return 1; }
+    if (my < WB_TABS + WB_BAR) { if (mx >= 140 && mx < WEB_W - 84) { return 2; } return 1; }
+    if (web_bmbar && bm_n > 0 && my < wb_top()) { return 1; }
+    if (mx < WEB_W - WB_SB && my < WEB_H - WB_STATUS - wb_findh() && w_link_at(mx - 8, my - wb_top() + web_scroll) >= 0) { return 1; }
+    if (find_on && my >= WEB_H - WB_STATUS - WB_FIND && my < WEB_H - WB_STATUS) { if (mx < WEB_W - 140) { return 2; } return 1; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- drawing
+fn web_tool_btn(x: int, y: int, w: int, g: int, on: bool, hot: bool) {
+    if (hot) { rfill(x, y, w, 30, 8, 0xDDE6F8, false); }
+    ui_glyph(g, x, y, w, 30, 18, on ? C_INK : 0xB4BDD0);
+}
+
+fn web_draw_tabs(x: int, y: int, w: int) {
+    fill(x, y, w, WB_TABS, 0xDCE1EC);
+    let tw = web_tab_w();
+    var i = 0; var slot = 0;
+    while (i < WB_MAXTAB) {
+        if (tabs[i].used != 0) {
+            let tx = x + 6 + slot * tw;
+            let act = i == wt;
+            if (act) { rfill(tx, y + 3, tw - 2, WB_TABS - 3, 8, 0xF3F5F9, true); }
+            else { rfill(tx + 1, y + 6, tw - 4, WB_TABS - 8, 7, 0xCDD4E3, true); }
+            if (act && web_loading) { fill(tx + 8, y + WB_TABS - 5, 12, 2, th_acc); }
+            let tt = web_tab_title(i);
+            let cols = (tw - 36) / 8;
+            draw_text_n(tx + 10, y + 7, tt, cols, act ? C_INK : 0x5B6784);
+            ui_glyph(G_CLOSE, tx + tw - 22, y + 5, 18, 20, 10, act ? 0x5B6784 : 0x8A97AD);
+            slot++;
+        }
+        i++;
+    }
+    if (web_tab_count() < WB_MAXTAB) { rfill(x + 6 + slot * tw + 2, y + 5, 22, 20, 7, 0xCDD4E3, false); ui_glyph(G_PLUS, x + 6 + slot * tw + 2, y + 5, 22, 20, 12, 0x3A4660); }
+}
+
+fn web_draw_bar(x: int, y: int, w: int) {
+    fill(x, y, w, WB_BAR, 0xF3F5F9);
+    web_tool_btn(x + 8, y + 4, 28, G_BACK, tabs[wt].hpos > 0, false);
+    web_tool_btn(x + 40, y + 4, 28, G_FORWARD, tabs[wt].hpos + 1 < tabs[wt].hn, false);
+    if (web_job) { web_tool_btn(x + 72, y + 4, 28, G_STOP, true, false); } else { web_tool_btn(x + 72, y + 4, 28, G_REFRESH, true, false); }
+    web_tool_btn(x + 104, y + 4, 28, G_HOME, true, false);
+    // address bar: scheme chip, text, caret
+    let bx = x + 140; let bw = w - 224;
+    rrect(bx, y + 5, bw, 28, 9, web_focus == 0 ? th_acc : 0xC3CAD8, 0xFFFFFF, false);
+    var chip = "page"; var chipc = 0x8A97AD;
+    if (kmatch_ci(&web_url[0], "http://")) { chip = "http"; chipc = 0xB26A00; }
+    else if (kmatch_ci(&web_url[0], "file:")) { chip = "file"; chipc = 0x3A7A4F; }
+    else if (kmatch_ci(&web_url[0], "about:")) { chip = "about"; chipc = 0x4A66B0; }
+    rfill(bx + 6, y + 10, 40, 18, 7, mix(chipc, 0xFFFFFF, 205), false);
+    text_c(bx + 6, 40, y + 11, chip, chipc);
+    let tx = bx + 52; let cols = (bw - 62) / 8;
+    var off = 0;
+    if (web_elen > cols) { off = imax(0, web_ecur - cols + 1); if (off > web_elen - cols) { off = web_elen - cols; } }
+    if (web_esel && web_focus == 0 && web_elen > 0) { fill(tx - 1, y + 9, imin(web_elen, cols) * 8 + 2, 20, mix(th_acc, 0xFFFFFF, 190)); }
+    draw_text_n(tx, y + 13, &web_edit[off], cols, C_INK);
+    if (web_focus == 0 && !web_esel && ((ticks / 50) & 1) == 0) { fill(tx + (web_ecur - off) * 8, y + 11, 2, 16, C_INK); }
+    // find, bookmark
+    web_tool_btn(x + w - 76, y + 4, 30, G_SEARCH, true, find_on);
+    let starred = bm_find(&web_url[0]) >= 0;
+    ui_glyph(G_STAR, x + w - 44, y + 4, 30, 30, 20, starred ? 0xE8A400 : 0xA8B3C8);
+    // progress
+    if (web_loading) {
+        fill(x, y + WB_BAR - 3, w, 3, 0xDCE4F4);
+        var pct = -1;
+        if (hdr_clen > 0 && hdr_end >= 0 && rb_len >= hdr_end) { pct = imin(100, (rb_len - hdr_end) * 100 / hdr_clen); }
+        if (pct >= 0) { fill(x, y + WB_BAR - 3, w * pct / 100, 3, th_acc); }
+        else { let seg = w / 4; let pos = ((ticks * 5) % (w + seg)) - seg; var sx = x + imax(0, pos); var ex = x + imin(w, pos + seg); if (ex > sx) { fill(sx, y + WB_BAR - 3, ex - sx, 3, th_acc); } }
+    } else { hline(x, y + WB_BAR - 1, w, 0xD3D9E6); }
+}
+
+fn web_draw_bmbar(x: int, y: int, w: int) {
+    fill(x, y, w, WB_BMBAR, 0xEEF1F7);
+    hline(x, y + WB_BMBAR - 1, w, 0xD8DDE9);
+    var cx = x + 8; var i = 0;
+    while (i < bm_n && cx + web_bm_chip_w(i) < x + w - 8) {
+        let cw = web_bm_chip_w(i);
+        rfill(cx, y + 3, cw, 20, 8, 0xFFFFFF, false);
+        ui_glyph(G_STAR, cx + 2, y + 3, 20, 20, 11, 0xE8A400);
+        draw_text_n(cx + 20, y + 5, bm_title + i * 40, (cw - 24) / 8, C_INK);
+        cx = cx + cw + 6; i++;
+    }
+}
+
+fn web_draw_find(x: int, y: int, w: int) {
+    fill(x, y, w, WB_FIND, 0xE9EDF6);
+    hline(x, y, w, 0xD0D7E6);
+    draw_text(x + 10, y + 7, "Find", 0x5B6784);
+    rrect(x + 52, y + 3, w - 200, 24, 7, web_focus == 2 ? th_acc : 0xC3CAD8, 0xFFFFFF, false);
+    draw_text_n(x + 60, y + 7, &find_q[0], (w - 216) / 8, C_INK);
+    if (web_focus == 2 && ((ticks / 50) & 1) == 0) { fill(x + 60 + imin(find_ql, (w - 216) / 8) * 8, y + 6, 2, 16, C_INK); }
+    var cnt: u8[24]; var o = 0;
+    if (find_ql == 0) { cnt[0] = 0; }
+    else if (find_n == 0) { kstrncpy(&cnt[0], "no matches", 24); }
+    else { o = itoa(find_cur + 1, &cnt[0]); o = url_put(&cnt[0], o, " of "); itoa(find_n, &cnt[o]); }
+    draw_text(x + w - 330 + 130 - text_w(&cnt[0]) , y + 7, &cnt[0], find_n == 0 && find_ql > 0 ? 0xC0392B : 0x5B6784);
+    a2_btn(x + w - 132, y + 3, 28, 24, "<", 0xFFFFFF);
+    a2_btn(x + w - 100, y + 3, 28, 24, ">", 0xFFFFFF);
+    a2_btn(x + w - 36, y + 3, 26, 24, "Dismiss", 0xFFFFFF);
+}
+
+fn web_draw_suggest(x: int, y: int, w: int) {
+    if (sg_n == 0 || web_focus != 0) { return; }
+    let bx = x + 140; let bw = w - 224;
+    rfill(bx - 1, y - 1, bw + 2, sg_n * 24 + 4, 8, 0xC3CAD8, false);
+    rfill(bx, y, bw, sg_n * 24 + 2, 7, 0xFFFFFF, false);
+    var i = 0;
+    while (i < sg_n) {
+        let ry = y + 1 + i * 24;
+        if (i == sg_sel) { fill(bx + 2, ry, bw - 4, 24, 0xE3ECFB); }
+        ui_glyph(sg_idx[i] < 100 ? G_STAR : G_CLOCK, bx + 4, ry, 22, 24, 12, sg_idx[i] < 100 ? 0xE8A400 : 0x8A97AD);
+        draw_text_n(bx + 30, ry + 4, web_sg_title(i), 16, C_INK);
+        draw_text_n(bx + 30 + 16 * 8 + 10, ry + 4, web_sg_url(i), (bw - 30 - 16 * 8 - 20) / 8, 0x7A8599);
+        i++;
+    }
+}
+
+fn web_draw(x: int, y: int, w: int, h: int) {
+    web_ensure();
+    if (!web_tabs_ok() || tabs[wt].used == 0) { fill(x, y, w, h, C_PANEL); return; }
+    fill(x, y, w, h, C_PANEL);
+    web_draw_tabs(x, y, w);
+    web_draw_bar(x, y + WB_TABS, w);
+    let top = wb_top();
+    if (web_bmbar && bm_n > 0) { web_draw_bmbar(x, y + WB_TABS + WB_BAR, w); }
+    // page
+    let cy = y + top; let vh = web_vh();
+    fill(x, cy, w - WB_SB, vh, w_bg);
+    var sv: int[4];
+    clip_push(&sv[0], x, cy, x + w - WB_SB, cy + vh);
+    w_draw(x + 8, cy, web_scroll, vh);
+    clip_pop(&sv[0]);
+    // scrollbar
+    let sx = x + w - WB_SB;
+    fill(sx, cy, WB_SB, vh, 0xE3E9F4);
+    let total = imax(w_height, vh);
+    let th = imax(24, vh * vh / total);
+    var ty = 0;
+    if (web_maxscroll() > 0) { ty = (vh - th) * web_scroll / web_maxscroll(); }
+    fill(sx + 2, cy + ty, WB_SB - 4, th, web_drag ? 0x5C7BDB : 0x7F9ADB);
+    if (find_on) { web_draw_find(x, y + h - WB_STATUS - WB_FIND, w); }
+    // status bar
+    fill(x, y + h - WB_STATUS, w, WB_STATUS, 0xF1F3F9);
+    hline(x, y + h - WB_STATUS, w, 0xDCE1EC);
+    if (web_loading) { draw_text(x + 8, y + h - WB_STATUS + 3, "*", 0xE8B923); }
+    if (web_hov >= 0 && web_hov < wl_n) { draw_text_n(x + 24, y + h - WB_STATUS + 3, wpool + wl_off[web_hov], (w - 140) / 8, 0x2A4F9A); }
+    else { draw_text_n(x + 24, y + h - WB_STATUS + 3, &web_status[0], (w - 140) / 8, 0x5B6784); }
+    if (w_height > vh) {
+        var e = draw_num(x + w - 96, y + h - WB_STATUS + 3, (web_scroll * 100) / imax(web_maxscroll(), 1), 0x5B6784);
+        draw_text(e, y + h - WB_STATUS + 3, "%", 0x5B6784);
+    }
+    web_draw_suggest(x, y + WB_TABS + WB_BAR - 2, w);
+}

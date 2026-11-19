@@ -1,0 +1,1553 @@
+// apps2.kc -- more Peacock applications: Files, Calendar, Clock (+stopwatch), Snake, Minesweeper, Monitor.
+// Author: Divyanshu Sinha (MIT License)
+// Same conventions as apps.kc: one window per app, state in globals, ui.kc calls the app2_* dispatchers (via apps.kc).
+// Needs: gfx.kc, ui.kc (wins, win_close, ui_inval*), fs.kc, kstr.kc, input.kc and the hooks listed in ui.kc (ticks, rtc_read, heap_stats).
+
+// ================================================================= dispatchers
+fn app2_size(kind: int, out: *int) {
+    if (kind == APP_FILES) { out[0] = 460; out[1] = 340; }
+    else if (kind == APP_CAL) { out[0] = 268; out[1] = 282; }
+    else if (kind == APP_CLOCK) { out[0] = 340; out[1] = 424; }
+    else if (kind == APP_SNAKE) { out[0] = 400; out[1] = 324; }
+    else if (kind == APP_MINES) { out[0] = 336; out[1] = 334; }
+    else if (kind == APP_MON) { out[0] = 440; out[1] = 420; }
+    else if (kind == APP_WEB) { out[0] = WEB_W; out[1] = WEB_H; }
+    else if (kind == APP_BLD) { bd_size(out); }
+    else if (kind == APP_THEME) { th_size(out); }
+    else if (kind == APP_FONT) { fa_size(out); }
+    else if (kind == APP_3D) { s3_size(out); }
+    else if (kind == APP_RUN) { run_size(out); }
+    else { out[0] = 400; out[1] = 290; }
+}
+fn app2_init(kind: int) {
+    if (kind == APP_FILES) { files_init(); }
+    else if (kind == APP_CAL) { cal_init(); }
+    else if (kind == APP_CLOCK) { clk_init(); }
+    else if (kind == APP_SNAKE) { sn_init(); }
+    else if (kind == APP_MINES) { m_init(); }
+    else if (kind == APP_MON) { mon_init(); }
+    else if (kind == APP_WEB) { web_init(); }
+    else if (kind == APP_BLD) { bd_init(); }
+    else if (kind == APP_THEME) { th_init(); }
+    else if (kind == APP_FONT) { fa_init(); }
+    else if (kind == APP_3D) { s3_init(); }
+    else if (kind == APP_RUN) { run_init(); }
+}
+fn app2_close(kind: int) {
+    if (kind == APP_WEB) { web_close(); }
+    else if (kind == APP_BLD) { bd_close(); }
+    else if (kind == APP_THEME) { th_close(); }
+    else if (kind == APP_FONT) { fa_close(); }
+    else if (kind == APP_3D) { s3_close(); }
+    else if (kind == APP_RUN) { run_close(); }
+}
+fn app2_draw(kind: int, x: int, y: int, w: int, h: int, foc: bool) {
+    if (kind == APP_FILES) { files_draw(x, y, w, h); }
+    else if (kind == APP_CAL) { cal_draw(x, y, w, h); }
+    else if (kind == APP_CLOCK) { clk_draw(x, y, w, h); }
+    else if (kind == APP_SNAKE) { sn_draw(x, y, w, h); }
+    else if (kind == APP_MINES) { m_draw(x, y, w, h); }
+    else if (kind == APP_MON) { mon_draw(x, y, w, h); }
+    else if (kind == APP_WEB) { web_draw(x, y, w, h); }
+    else if (kind == APP_BLD) { bd_draw(x, y, w, h); }
+    else if (kind == APP_THEME) { th_draw(x, y, w, h); }
+    else if (kind == APP_FONT) { fa_draw(x, y, w, h); }
+    else if (kind == APP_3D) { s3_draw(x, y, w, h); }
+    else if (kind == APP_RUN) { run_draw(x, y, w, h); }
+}
+fn app2_key(kind: int, k: int) {
+    if (kind == APP_FILES) { files_key(k); }
+    else if (kind == APP_CAL) { cal_key(k); }
+    else if (kind == APP_CLOCK) { clk_key(k); }
+    else if (kind == APP_SNAKE) { sn_key(k); }
+    else if (kind == APP_MINES) { m_key(k); }
+    else if (kind == APP_WEB) { web_key(k); }
+    else if (kind == APP_BLD) { bd_key(k); }
+    else if (kind == APP_THEME) { th_key(k); }
+    else if (kind == APP_FONT) { fa_key(k); }
+    else if (kind == APP_3D) { s3_key(k); }
+    else if (kind == APP_RUN) { run_key(k); }
+}
+/// ev: 1 press, 2 move (left held), 3 release, 4 right-button press
+fn app2_mouse(kind: int, mx: int, my: int, ev: int, w: int, h: int) {
+    if (kind == APP_FILES) { files_mouse(mx, my, ev, w); }
+    else if (kind == APP_CAL) { cal_mouse(mx, my, ev, w); }
+    else if (kind == APP_CLOCK) { clk_mouse(mx, my, ev); }
+    else if (kind == APP_SNAKE) { sn_mouse(mx, my, ev); }
+    else if (kind == APP_MINES) { m_mouse(mx, my, ev); }
+    else if (kind == APP_MON) { mon_mouse(mx, my, ev); }
+    else if (kind == APP_WEB) { web_mouse(mx, my, ev); }
+    else if (kind == APP_BLD) { bd_mouse(mx, my, ev); }
+    else if (kind == APP_THEME) { th_mouse(mx, my, ev); }
+    else if (kind == APP_FONT) { fa_mouse(mx, my, ev); }
+    else if (kind == APP_3D) { s3_mouse(mx, my, ev); }
+    else if (kind == APP_RUN) { run_mouse(mx, my, ev); }
+}
+fn app2_tick(kind: int) -> bool {
+    if (kind == APP_FILES) { return files_tick(); }
+    if (kind == APP_CLOCK) { return clk_tick(); }
+    if (kind == APP_SNAKE) { return sn_tick(); }
+    if (kind == APP_MINES) { return m_tick(); }
+    if (kind == APP_MON) { return mon_tick(); }
+    if (kind == APP_WEB) { return web_tick(); }
+    if (kind == APP_3D) { return s3_tick(); }
+    if (kind == APP_RUN) { return run_tick(); }
+    return false;
+}
+
+// ================================================================= shared helpers
+var rnd_s = 12345;
+fn rnd(n: int) -> int {
+    rnd_s = (rnd_s * 1103515245 + 12345) & 0x7FFFFFFF;
+    return (rnd_s >> 8) % n;
+}
+
+/// the accent-tinted "selected" colour used by buttons, list rows and chips
+fn th_sel() -> int { return mix(0xFFFFFF, th_acc, 96); }
+/// the SVG glyph that stands for a button label (0 = none: the label stays text)
+fn lbl_glyph(l: *u8) -> int {
+    if (kstreq(l, "Dir")) { return G_NEWDIR; }
+    if (kstreq(l, "File")) { return G_NEWFILE; }
+    if (kstreq(l, "Ren")) { return G_EDIT; }
+    if (kstreq(l, "Copy")) { return G_COPY; }
+    if (kstreq(l, "Cut")) { return G_CUT; }
+    if (kstreq(l, "Paste")) { return G_PASTE; }
+    if (kstreq(l, "Lock")) { return G_LOCK; }
+    if (kstreq(l, "Hide")) { return G_EYE; }
+    if (kstreq(l, "Check")) { return G_CHECK; }
+    if (kstreq(l, "<")) { return G_CHEVRON_LEFT; }
+    if (kstreq(l, ">")) { return G_CHEVRON_RIGHT; }
+    if (kstreq(l, "+")) { return G_PLUS; }
+    if (kstreq(l, "-")) { return G_MINIMIZE; }
+    if (kstreq(l, "Up")) { return G_UPDIR; }
+    if (kstreq(l, "New dir")) { return G_NEWDIR; }
+    if (kstreq(l, "New file") || kstreq(l, "New")) { return G_NEWFILE; }
+    if (kstreq(l, "Delete") || kstreq(l, "Del") || kstreq(l, "Clear")) { return G_TRASH; }
+    if (kstreq(l, "Today")) { return G_TODAY; }
+    if (kstreq(l, "Go")) { return G_FORWARD; }
+    if (kstreq(l, "Run >") || kstreq(l, "Start")) { return G_PLAY; }
+    if (kstreq(l, "Save")) { return G_SAVE; }
+    if (kstreq(l, "Find")) { return G_SEARCH; }
+    if (kstreq(l, "Open")) { return G_FOLDER; }
+    if (kstreq(l, "Undo") || kstreq(l, "Reset")) { return G_RESET; }
+    if (kstreq(l, "Sync")) { return G_REFRESH; }
+    if (kstreq(l, "Flag") || kstreq(l, "Lap")) { return G_FLAG; }
+    if (kstreq(l, "Pause")) { return G_PAUSE; }
+    if (kstreq(l, "Stop")) { return G_STOP; }
+    if (kstreq(l, "Dismiss")) { return G_CHECK; }
+    return 0;
+}
+/// modern flat button: soft shadow, hairline border, rounded corners; labels with a known glyph are drawn as the SVG glyph
+fn a2_face(x: int, y: int, w: int, h: int, col: int) {
+    if (ui_depth == 0) {
+        rfill(x, y, w, h, 7, 0xD9DEEA, false);
+        rfill(x + 1, y + 1, w - 2, h - 2, 6, col, false);
+    } else if (ui_depth == 1) {
+        rfill(x, y + 1, w, h, 7, 0xD3D9E6, false);
+        rfill(x, y, w, h, 7, 0xD9DEEA, false);
+        rfill(x + 1, y + 1, w - 2, h - 2, 6, col, false);
+    } else {
+        // raised key: dark ledge underneath, bevelled face, light top edge, darker lower half
+        rfill(x, y + 3, w, h, 7, mix(col, 0x1B2433, 90), false);
+        rfill(x, y, w, h, 7, mix(col, 0x1B2433, 46), false);
+        rfill(x + 1, y + 1, w - 2, h - 2, 6, col, false);
+        shade(x + 2, y + h / 2, w - 4, h - h / 2 - 2, 0x1B2433, 14);
+        hline(x + 4, y + 1, w - 8, mix(col, 0xFFFFFF, 190));
+    }
+}
+fn a2_btn(x: int, y: int, w: int, h: int, label: *u8, col: int) {
+    a2_face(x, y, w, h, col);
+    var ink = C_INK;
+    if (col == 0xFBE3E1) { ink = 0xB3261E; }
+    let g = lbl_glyph(label);
+    if (g != 0) { ui_glyph(g, x, y, w, h, imin(h - 6, 20), ink); return; }
+    draw_text(x + (w - text_w(label)) / 2, y + (h - 16) / 2, label, ink);
+}
+/// icon button: like a2_btn but with a glyph instead of a label (tint = glyph colour)
+fn a2_ibtn(x: int, y: int, w: int, h: int, g: int, col: int, tint: int) {
+    a2_face(x, y, w, h, col);
+    var gs = imin(h - 6, 20);
+    if (gs < 12) { gs = 12; }
+    ui_glyph(g, x, y, w, h, gs, tint);
+}
+/// white rounded card with a hairline border
+fn a2_card(x: int, y: int, w: int, h: int) {
+    if (ui_depth == 2) { rfill(x + 1, y + 2, w, h, 8, 0xC9D0DF, false); }
+    rfill(x, y, w, h, 8, 0xDCE1EC, false);
+    rfill(x + 1, y + 1, w - 2, h - 2, 7, 0xFFFFFF, false);
+}
+fn in_rect(mx: int, my: int, x: int, y: int, w: int, h: int) -> bool {
+    return mx >= x && mx < x + w && my >= y && my < y + h;
+}
+fn text_c(x: int, w: int, y: int, s: *u8, c: int) { draw_text(x + (w - text_w(s)) / 2, y, s, c); }
+
+/// DDA line (clipped by px); a2_line2 is 2 pixels thick
+fn a2_line(x0: int, y0: int, x1: int, y1: int, c: int) {
+    let dx = x1 - x0; let dy = y1 - y0;
+    let n = imax(iabs(dx), iabs(dy));
+    if (n == 0) { px(x0, y0, c); return; }
+    var i = 0;
+    while (i <= n) { px(x0 + dx * i / n, y0 + dy * i / n, c); i++; }
+}
+fn a2_line2(x0: int, y0: int, x1: int, y1: int, c: int) {
+    a2_line(x0, y0, x1, y1, c); a2_line(x0 + 1, y0, x1 + 1, y1, c); a2_line(x0, y0 + 1, x1, y1 + 1, c);
+}
+
+var sin_t: int[16] = [0, 105, 208, 309, 407, 500, 588, 669, 743, 809, 866, 914, 951, 978, 995, 1000];
+/// sine of k * 6 degrees, scaled by 1000
+fn sin60(k: int) -> int {
+    let a = ((k % 60) + 60) % 60;
+    if (a <= 15) { return sin_t[a]; }
+    if (a <= 30) { return sin_t[30 - a]; }
+    if (a <= 45) { return 0 - sin_t[a - 30]; }
+    return 0 - sin_t[60 - a];
+}
+fn cos60(k: int) -> int { return sin60(k + 15); }
+
+// ================================================================= Files
+const F_ROWS = 11; const F_LY = 52; const F_NB = 10;
+var f_dir = 0; var f_si = 0; var f_scroll = 0;
+var f_ltick = 0; var f_lsi = -1;
+var f_msg: u8[56];
+var f_sig = -1;
+var f_ids: *int;                      // sorted listing of f_dir (cached; rebuilt when the tree, the folder or the hidden view changes)
+var f_n = 0; var f_cache = -1; var f_cdir = -1; var f_chid = false;
+var f_hidden = false;                 // show hidden entries
+var f_clip = -1; var f_cut = false;   // clipboard: node + whether it is a cut (move) or a copy
+var f_ren = false; var f_rb: u8[32]; var f_rl = 0;     // inline rename
+var f_arm = -1;                       // folder armed for a recursive delete (press Delete again)
+
+fn f_say(s: *u8) { kstrncpy(&f_msg[0], s, 56); }
+
+fn f_check() {
+    if (f_dir < 0 || f_dir >= FS_MAX || fs_nodes[f_dir].kind != K_DIR) { f_dir = 0; f_si = 0; f_scroll = 0; }
+}
+fn f_refresh() {
+    f_check();
+    if (f_ids == (0 as *int)) { f_ids = kmalloc(FS_MAX * 8) as *int; if (f_ids == (0 as *int)) { f_n = 0; return; } }
+    if (f_cache == fs_rev && f_cdir == f_dir && f_chid == f_hidden) { return; }
+    f_n = fs_list(f_dir, f_ids, FS_MAX, f_hidden);
+    f_cache = fs_rev; f_cdir = f_dir; f_chid = f_hidden;
+}
+fn f_count() -> int { f_refresh(); return f_n; }
+/// n-th entry of the current folder (folders first, name order); -1 when out of range
+fn f_nth(n: int) -> int { f_refresh(); if (n < 0 || n >= f_n) { return -1; } return f_ids[n]; }
+fn f_index_of(node: int) -> int {
+    f_refresh();
+    var i = 0;
+    while (i < f_n) { if (f_ids[i] == node) { return i; } i++; }
+    return 0;
+}
+fn f_fix() {
+    let n = f_count();
+    if (f_si >= n) { f_si = n - 1; }
+    if (f_si < 0) { f_si = 0; }
+    if (f_si < f_scroll) { f_scroll = f_si; }
+    if (f_si >= f_scroll + F_ROWS) { f_scroll = f_si - F_ROWS + 1; }
+    if (f_scroll > imax(0, n - F_ROWS)) { f_scroll = imax(0, n - F_ROWS); }
+    if (f_scroll < 0) { f_scroll = 0; }
+}
+fn files_init() { f_dir = 0; f_si = 0; f_scroll = 0; f_lsi = -1; f_sig = -1; f_ren = false; f_arm = -1; f_say("click = select, double-click = open"); }
+
+fn f_up() {
+    f_ren = false; f_arm = -1;
+    if (f_dir == 0) { f_say("already at the root"); return; }
+    let old = f_dir;
+    f_dir = fs_nodes[f_dir].parent;
+    f_scroll = 0;
+    f_si = f_index_of(old);
+    f_fix();
+    f_say("");
+}
+
+fn f_activate() {
+    f_arm = -1;
+    let n = f_nth(f_si);
+    if (n < 0) { return; }
+    if (fs_nodes[n].kind == K_DIR) { f_dir = n; f_si = 0; f_scroll = 0; f_say(""); }
+    else {
+        var fp: u8[128];
+        fs_path(n, &fp[0]);
+        if (ends_with(&fp[0], ".pea")) {
+            if (!pea_runnable(n)) { f_say("not a valid Peacock executable"); return; }
+            if ((fs_nodes[n].attr & FA_EXEC) == 0) { f_say("not executable - mark it with: attr +x"); return; }
+            if (run_load(&fp[0])) { f_say("running program"); } else { f_say(pea_err_str(pea_last_err)); }
+            return;
+        }
+        app_open(APP_NOTES);
+        n_open(&fp[0]);
+        f_say("opened in Notes");
+    }
+}
+
+fn f_new(kind: int) {
+    f_ren = false; f_arm = -1;
+    var base: u8[32]; var k = 1; var num: u8[24];
+    while (k < 200) {
+        if (kind == K_DIR) { kstrncpy(&base[0], "folder", 32); } else { kstrncpy(&base[0], "new", 32); }
+        if (k > 1) { itoa(k, &num[0]); var o = kstrlen(&base[0]); var q = 0; while (num[q] != 0) { base[o] = num[q]; o++; q++; } base[o] = 0; }
+        if (kind == K_FILE) { var o2 = kstrlen(&base[0]); base[o2] = '.'; base[o2 + 1] = 't'; base[o2 + 2] = 'x'; base[o2 + 3] = 't'; base[o2 + 4] = 0; }
+        if (fs_child(f_dir, &base[0]) < 0) { break; }
+        k++;
+    }
+    var path: u8[128];
+    fs_path(f_dir, &path[0]);
+    var n = kstrlen(&path[0]);
+    if (n > 1) { path[n] = '/'; n++; }
+    var j = 0;
+    while (base[j] != 0 && n < 126) { path[n] = base[j]; n++; j++; }
+    path[n] = 0;
+    let nn = fs_create(&path[0], kind);
+    if (nn < 0) { f_say("cannot create (filesystem full?)"); return; }
+    f_refresh(); f_si = f_index_of(nn); f_fix();
+    f_say(kind == K_DIR ? "new folder - press r to rename" : "new text file - press r to rename");
+}
+
+fn f_delete() {
+    f_ren = false;
+    let n = f_nth(f_si);
+    if (n < 0) { f_say("nothing selected"); return; }
+    if ((fs_nodes[n].attr & FA_RO) != 0) { f_say("read-only: unlock it first"); return; }
+    if (fs_nodes[n].kind == K_DIR && fs_child_count(n) > 0 && f_arm != n) {
+        f_arm = n; f_say("folder is not empty - Delete again to remove all");
+        return;
+    }
+    f_arm = -1;
+    if (fs_remove_tree(n)) { if (f_clip == n) { f_clip = -1; } f_say("deleted"); f_fix(); } else { f_say("cannot delete (contains read-only items)"); }
+}
+
+fn f_rename_start() {
+    let n = f_nth(f_si);
+    if (n < 0) { f_say("nothing selected"); return; }
+    if ((fs_nodes[n].attr & FA_RO) != 0) { f_say("read-only: unlock it first"); return; }
+    f_ren = true; kstrncpy(&f_rb[0], &fs_nodes[n].name[0], 32); f_rl = kstrlen(&f_rb[0]); f_arm = -1;
+    f_say("Enter = ok, Esc = cancel");
+}
+fn f_rename_commit() {
+    f_ren = false;
+    let n = f_nth(f_si);
+    if (n < 0) { return; }
+    if (kstreq(&f_rb[0], &fs_nodes[n].name[0])) { f_say(""); return; }
+    let r = fs_rename(n, &f_rb[0]);
+    if (r == 0) { f_refresh(); f_si = f_index_of(n); f_fix(); f_say("renamed"); }
+    else if (r == 1) { f_say("invalid name"); } else if (r == 2) { f_say("that name already exists here"); } else { f_say("cannot rename"); }
+}
+
+fn f_copy(cut: bool) {
+    f_ren = false; f_arm = -1;
+    let n = f_nth(f_si);
+    if (n < 0) { f_say("nothing selected"); return; }
+    f_clip = n; f_cut = cut;
+    f_say(cut ? "cut - choose a folder and press Paste" : "copied - choose a folder and press Paste");
+}
+fn f_paste() {
+    f_ren = false; f_arm = -1;
+    if (f_clip <= 0 || f_clip >= FS_MAX || fs_nodes[f_clip].kind == K_FREE) { f_clip = -1; f_say("clipboard is empty"); return; }
+    if (f_cut) {
+        let r = fs_move(f_clip, f_dir);
+        if (r == 0) { f_refresh(); f_si = f_index_of(f_clip); f_fix(); f_say("moved"); f_clip = -1; }
+        else if (r == 2) { f_say("an item with that name already exists here"); }
+        else if (r == 3) { f_say("cannot move a folder into itself"); }
+        else { f_say("cannot move (read-only?)"); }
+        return;
+    }
+    if (fs_is_ancestor(f_clip, f_dir)) { f_say("cannot copy a folder into itself"); return; }
+    var name: u8[32];
+    fs_unique_name(f_dir, &fs_nodes[f_clip].name[0], &name[0]);
+    let c = fs_copy(f_clip, f_dir, &name[0], 0);
+    if (c < 0) { f_say("cannot copy (filesystem full?)"); return; }
+    f_refresh(); f_si = f_index_of(c); f_fix();
+    f_say("pasted");
+}
+
+fn f_lock() {
+    f_ren = false;
+    let n = f_nth(f_si);
+    if (n < 0) { f_say("nothing selected"); return; }
+    let on = (fs_nodes[n].attr & FA_RO) == 0;
+    fs_set_attr(n, FA_RO, on);
+    f_say(on ? "locked (read-only)" : "unlocked");
+}
+fn f_hide() {
+    f_ren = false;
+    let n = f_nth(f_si);
+    if (n < 0) { f_say("nothing selected"); return; }
+    let on = (fs_nodes[n].attr & FA_HIDDEN) == 0;
+    fs_set_attr(n, FA_HIDDEN, on);
+    if (on && !f_hidden) { f_say("hidden - press . to show hidden items"); } else { f_say(on ? "marked hidden" : "no longer hidden"); }
+}
+
+fn f_bx(i: int) -> int { return 6 + i * 43; }
+fn f_blabel(i: int) -> *u8 {
+    if (i == 0) { return "Up"; } if (i == 1) { return "Dir"; } if (i == 2) { return "File"; } if (i == 3) { return "Ren"; }
+    if (i == 4) { return "Copy"; } if (i == 5) { return "Cut"; } if (i == 6) { return "Paste"; } if (i == 7) { return "Del"; }
+    if (i == 8) { return "Lock"; }
+    return "Hide";
+}
+fn f_button(i: int) {
+    if (i == 0) { f_up(); } else if (i == 1) { f_new(K_DIR); } else if (i == 2) { f_new(K_FILE); } else if (i == 3) { f_rename_start(); }
+    else if (i == 4) { f_copy(false); } else if (i == 5) { f_copy(true); } else if (i == 6) { f_paste(); } else if (i == 7) { f_delete(); }
+    else if (i == 8) { f_lock(); } else { f_hide(); }
+}
+
+fn files_key(k: int) {
+    if (f_ren) {
+        if (k == 10) { f_rename_commit(); }
+        else if (k == 27) { f_ren = false; f_say("cancelled"); }
+        else if (k == 8) { if (f_rl > 0) { f_rl--; f_rb[f_rl] = 0; } }
+        else if (k >= 32 && k < 127 && f_rl < 27) { f_rb[f_rl] = k as u8; f_rl++; f_rb[f_rl] = 0; }
+        else { return; }
+        ui_inval_all(APP_FILES);
+        return;
+    }
+    if (k == KEY_UP) { if (f_si > 0) { f_si--; } f_arm = -1; }
+    else if (k == KEY_DOWN) { if (f_si < f_count() - 1) { f_si++; } f_arm = -1; }
+    else if (k == KEY_HOME) { f_si = 0; }
+    else if (k == KEY_END) { f_si = f_count() - 1; }
+    else if (k == KEY_PGUP) { f_si = f_si - F_ROWS; }
+    else if (k == KEY_PGDN) { f_si = f_si + F_ROWS; }
+    else if (k == 10) { f_activate(); }
+    else if (k == 8) { f_up(); }
+    else if (k == KEY_DEL) { f_delete(); }
+    else if (k == 'r') { f_rename_start(); }
+    else if (k == 'c') { f_copy(false); }
+    else if (k == 'x') { f_copy(true); }
+    else if (k == 'v') { f_paste(); }
+    else if (k == '.') { f_hidden = !f_hidden; f_say(f_hidden ? "showing hidden items" : "hiding hidden items"); }
+    else { return; }
+    f_fix();
+    ui_inval_all(APP_FILES);
+}
+
+fn files_mouse(mx: int, my: int, ev: int, w: int) {
+    if (ev != 1) { return; }
+    if (my < 28) {
+        var b = 0;
+        while (b < F_NB) { if (in_rect(mx, my, f_bx(b), 3, 40, 22)) { f_button(b); } b++; }
+        f_fix(); ui_inval_all(APP_FILES);
+        return;
+    }
+    if (in_rect(mx, my, 6, F_LY, w - 12, F_ROWS * 16 + 2)) {
+        f_ren = false; f_arm = -1;
+        let idx = (my - F_LY - 1) / 16 + f_scroll;
+        if (idx >= 0 && idx < f_count()) {
+            if (idx == f_lsi && ticks - f_ltick < 50) { f_si = idx; f_activate(); f_lsi = -1; }
+            else { f_si = idx; f_lsi = idx; f_ltick = ticks; }
+            f_fix();
+            ui_inval_all(APP_FILES);
+        }
+    }
+}
+
+fn files_tick() -> bool {
+    var s: int[4];
+    fs_stats(&s[0]);
+    let sig = (s[0] * 1000003 + s[3] * 31 + s[1]) ^ (fs_rev * 7919) ^ (fs_dirty ? 1 : 0);
+    if (sig != f_sig) { f_sig = sig; f_check(); f_fix(); return true; }
+    return false;
+}
+
+fn files_draw(x: int, y: int, w: int, h: int) {
+    f_refresh();
+    fill(x, y, w, h, C_PANEL);
+    fill(x, y, w, 28, 0xFFFFFF);
+    hline(x, y + 27, w, 0xE3E7F0);
+    var b = 0;
+    while (b < F_NB) {
+        var col = 0xFFFFFF;
+        if (b == 7) { col = 0xFBE3E1; }
+        a2_btn(x + f_bx(b), y + 3, 40, 22, f_blabel(b), col);
+        b++;
+    }
+    var p: u8[128];
+    fs_path(f_dir, &p[0]);
+    rfill(x + 6, y + 32, w - 12, 18, 9, 0xE3E7F0, false); rfill(x + 7, y + 33, w - 14, 16, 8, 0xFFFFFF, false);
+    draw_text_n(x + 10, y + 33, &p[0], (w - 24) / 8, 0x5B6784);
+    // list
+    let cnt = f_n;
+    a2_card(x + 6, y + F_LY, w - 12, F_ROWS * 16 + 2);
+    let nch = imax(8, (w - 300) / 8);
+    var r = 0;
+    while (r < F_ROWS) {
+        let idx = f_scroll + r;
+        if (idx < cnt) {
+            let n = f_ids[idx];
+            let ry = y + F_LY + 1 + r * 16;
+            if (idx == f_si) { rfill(x + 9, ry, w - 22, 16, 6, th_sel(), false); }
+            var ink = C_INK;
+            if ((fs_nodes[n].attr & FA_HIDDEN) != 0) { ink = 0x8A97AD; }
+            if (fs_nodes[n].kind == K_DIR) {
+                svg_tint(G_FOLDER, x + 11, ry, 16, 0xE0A91F, 256);
+            } else if ((fs_nodes[n].attr & FA_EXEC) != 0) {
+                svg_tint(G_PLAY, x + 11, ry, 16, 0x1F8A4C, 256);                 // an executable program
+            } else {
+                fill(x + 14, ry + 2, 11, 13, 0xFFFFFF);
+                frame(x + 14, ry + 2, 11, 13, 0x7C8DA8);
+            }
+            if (f_ren && idx == f_si) {
+                rfill(x + 30, ry, nch * 8 + 6, 16, 4, 0x3B6FD8, false); rfill(x + 31, ry + 1, nch * 8 + 4, 14, 3, 0xFFFFFF, false);
+                draw_text_n(x + 33, ry, &f_rb[0], nch, C_INK);
+                let cx = x + 33 + imin(f_rl, nch) * 8;
+                fill(cx, ry + 2, 1, 12, 0x3B6FD8);
+            } else {
+                draw_text_n(x + 32, ry, &fs_nodes[n].name[0], nch, ink);
+            }
+            let ax = x + 32 + nch * 8 + 6;
+            if ((fs_nodes[n].attr & FA_RO) != 0) { draw_text(ax, ry, "R", 0xB3261E); }
+            if ((fs_nodes[n].attr & FA_HIDDEN) != 0) { draw_text(ax + 8, ry, "H", 0x8A97AD); }
+            if (f_clip == n) { draw_text(ax + 16, ry, f_cut ? "x" : "c", 0x3B6FD8); }
+            var ts: u8[24];
+            fs_time_str(fs_nodes[n].mtime, &ts[0]);
+            draw_text(x + w - 24 - 16 * 8 - 64, ry, &ts[0], 0x7A869E);
+            if (fs_nodes[n].kind == K_DIR) { draw_text(x + w - 24 - 40, ry, "<dir>", 0x5B6784); }
+            else {
+                var sb: u8[24];
+                let sl = itoa(fs_nodes[n].size, &sb[0]);
+                let sx = x + w - 24 - (sl + 2) * 8;
+                let e = draw_text(sx, ry, &sb[0], 0x5B6784);
+                draw_text(e, ry, " B", 0x5B6784);
+            }
+        }
+        r++;
+    }
+    if (cnt > F_ROWS) {
+        let th = F_ROWS * 16 * F_ROWS / cnt;
+        let ty = (F_ROWS * 16 - th) * f_scroll / (cnt - F_ROWS);
+        fill(x + w - 14, y + F_LY + 1, 6, F_ROWS * 16, 0xE3E9F4);
+        fill(x + w - 14, y + F_LY + 1 + ty, 6, th, 0x7F9ADB);
+    }
+    // details + preview
+    let py = y + F_LY + F_ROWS * 16 + 6;
+    let ph = h - 22 - (py - y) - 4;
+    a2_card(x + 6, py, w - 12, ph);
+    let sel = f_nth(f_si);
+    if (sel >= 0) {
+        var ts2: u8[24]; var ts3: u8[24];
+        fs_time_str(fs_nodes[sel].ctime, &ts2[0]); fs_time_str(fs_nodes[sel].mtime, &ts3[0]);
+        var xx = draw_text(x + 12, py + 3, "created ", 0x8A97AD);
+        xx = draw_text(xx, py + 3, &ts2[0], 0x5B6784);
+        xx = draw_text(xx, py + 3, "   modified ", 0x8A97AD);
+        xx = draw_text(xx, py + 3, &ts3[0], 0x5B6784);
+        hline(x + 10, py + 21, w - 20, 0xE3E7F0);
+        if (fs_nodes[sel].kind == K_FILE && pea_is_binary(fs_nodes[sel].data, fs_nodes[sel].size)) {
+            var ph: int[6]; var ptt: u8[32];
+            let pw = kzalloc(WD_MAX * sizeof(Wd)) as *Wd;
+            let pk = pea_decode(fs_nodes[sel].data, fs_nodes[sel].size, pw, &ph[0], &ptt[0]);
+            if (pk >= 0) {
+                var e = draw_text(x + 12, py + 24, "Peacock program  ", 0x1F8A4C);
+                e = draw_text(e, py + 24, &ptt[0], C_INK);
+                var e2 = draw_num(x + 12, py + 42, ph[0], 0x5B6784); e2 = draw_text(e2, py + 42, " x ", 0x5B6784); e2 = draw_num(e2, py + 42, ph[1], 0x5B6784);
+                e2 = draw_text(e2, py + 42, ",  ", 0x5B6784); e2 = draw_num(e2, py + 42, pk, 0x5B6784); draw_text(e2, py + 42, " widgets - double-click to run", 0x5B6784);
+            } else { draw_text(x + 12, py + 24, pea_err_str(pk), 0xB3261E); }
+            kfree(pw as *u8);
+        } else if (fs_nodes[sel].kind == K_FILE) {
+            let cols = (w - 24) / 8; let rows = (ph - 28) / 16;
+            var rr = 0; var cc = 0; var i = 0;
+            while (i < fs_nodes[sel].size && i < 800 && rr < rows) {
+                let ch = fs_nodes[sel].data[i] as int;
+                if (ch == 10) { rr++; cc = 0; }
+                else {
+                    if (cc >= cols) { rr++; cc = 0; }
+                    if (rr < rows && ch >= 32 && ch < 127) { draw_char(x + 12 + cc * 8, py + 24 + rr * 16, ch, C_INK); }
+                    cc++;
+                }
+                i++;
+            }
+            if (fs_nodes[sel].size == 0) { draw_text(x + 12, py + 24, "(empty file)", 0x8A97AD); }
+        } else {
+            var items = 0;
+            let bytes = fs_tree_size(sel, &items);
+            let e = draw_text(x + 12, py + 24, "Folder: ", 0x5B6784);
+            let e2 = draw_num(e, py + 24, items, 0x5B6784);
+            let e3 = draw_text(e2, py + 24, " item(s), ", 0x5B6784);
+            let e4 = draw_num(e3, py + 24, bytes, 0x5B6784);
+            draw_text(e4, py + 24, " bytes", 0x5B6784);
+        }
+    } else { draw_text(x + 12, py + 3, "(this folder is empty)", 0x8A97AD); }
+    // status bar
+    fill(x, y + h - 22, w, 22, 0xF1F3F9);
+    hline(x, y + h - 22, w, 0xDCE1EC);
+    draw_text_n(x + 8, y + h - 19, &f_msg[0], (w - 190) / 8, 0x5B6784);
+    if (disk_present) {
+        if (fs_dirty) { draw_text(x + w - 170, y + h - 19, "Unsaved", 0xC77700); } else { draw_text(x + w - 170, y + h - 19, "Saved", 0x2E8B57); }
+    }
+    let e5 = draw_num(x + w - 90, y + h - 19, cnt, 0x5B6784);
+    draw_text(e5, y + h - 19, " items", 0x5B6784);
+}
+
+// ================================================================= Calendar
+var cal_y = 2026; var cal_m = 1; var cal_sel = 0;
+var dow_t: int[12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+
+fn is_leap(y: int) -> bool { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+fn days_in(y: int, m: int) -> int {
+    if (m == 2) { if (is_leap(y)) { return 29; } return 28; }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+    return 31;
+}
+/// 0 = Sunday
+fn day_of_week(y: int, m: int, d: int) -> int {
+    var yy = y;
+    if (m < 3) { yy = y - 1; }
+    return (yy + yy / 4 - yy / 100 + yy / 400 + dow_t[m - 1] + d) % 7;
+}
+fn month_name(m: int) -> *u8 {
+    if (m == 1) { return "January"; } if (m == 2) { return "February"; } if (m == 3) { return "March"; }
+    if (m == 4) { return "April"; } if (m == 5) { return "May"; } if (m == 6) { return "June"; }
+    if (m == 7) { return "July"; } if (m == 8) { return "August"; } if (m == 9) { return "September"; }
+    if (m == 10) { return "October"; } if (m == 11) { return "November"; }
+    return "December";
+}
+fn day_name(d: int) -> *u8 {
+    if (d == 0) { return "Sunday"; } if (d == 1) { return "Monday"; } if (d == 2) { return "Tuesday"; }
+    if (d == 3) { return "Wednesday"; } if (d == 4) { return "Thursday"; } if (d == 5) { return "Friday"; }
+    return "Saturday";
+}
+
+fn cal_today() {
+    var t: int[6];
+    rtc_read(&t[0]);
+    cal_y = t[0]; cal_m = t[1]; cal_sel = t[2];
+}
+fn cal_init() { cal_today(); }
+fn cal_step(dm: int) {
+    cal_m = cal_m + dm;
+    while (cal_m > 12) { cal_m = cal_m - 12; cal_y++; }
+    while (cal_m < 1) { cal_m = cal_m + 12; cal_y--; }
+    if (cal_y < 1900) { cal_y = 1900; }
+    if (cal_y > 2400) { cal_y = 2400; }
+    if (cal_sel > days_in(cal_y, cal_m)) { cal_sel = days_in(cal_y, cal_m); }
+}
+fn cal_key(k: int) {
+    if (k == KEY_LEFT || k == KEY_PGUP) { cal_step(-1); }
+    else if (k == KEY_RIGHT || k == KEY_PGDN) { cal_step(1); }
+    else if (k == KEY_UP) { cal_step(12); }
+    else if (k == KEY_DOWN) { cal_step(-12); }
+    else if (k == KEY_HOME || k == 't' || k == 'T') { cal_today(); }
+    else { return; }
+    ui_inval_all(APP_CAL);
+}
+fn cal_mouse(mx: int, my: int, ev: int, w: int) {
+    if (ev != 1) { return; }
+    if (in_rect(mx, my, 8, 8, 32, 26)) { cal_step(-1); }
+    else if (in_rect(mx, my, w - 40, 8, 32, 26)) { cal_step(1); }
+    else if (in_rect(mx, my, w - 78, 256, 70, 22)) { cal_today(); }
+    else if (my >= 72 && my < 252 && mx >= 8 && mx < 260) {
+        let col = (mx - 8) / 36; let row = (my - 72) / 30;
+        let first = day_of_week(cal_y, cal_m, 1);
+        let d = row * 7 + col - first + 1;
+        if (d >= 1 && d <= days_in(cal_y, cal_m)) { cal_sel = d; }
+    }
+    ui_inval_all(APP_CAL);
+}
+
+fn cal_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    vgrad(x, y, w, 52, 0x1F4FA8, 0x0E7C86);
+    a2_btn(x + 8, y + 8, 32, 26, "<", 0xFFFFFF);
+    a2_btn(x + w - 40, y + 8, 32, 26, ">", 0xFFFFFF);
+    let mn = month_name(cal_m);
+    draw_text_sc(x + (w - text_w(mn) * 2) / 2, y + 8, mn, 0xFFFFFF, 2);
+    var yb: u8[24];
+    itoa(cal_y, &yb[0]);
+    text_c(x, w, y + 32, &yb[0], 0xDFF3F0);
+    // weekday row
+    fill(x + 4, y + 54, w - 8, 18, 0xEEF1F7);
+    var c = 0;
+    while (c < 7) {
+        var wd: u8[3];
+        if (c == 0) { wd[0] = 'S'; wd[1] = 'u'; } else if (c == 1) { wd[0] = 'M'; wd[1] = 'o'; }
+        else if (c == 2) { wd[0] = 'T'; wd[1] = 'u'; } else if (c == 3) { wd[0] = 'W'; wd[1] = 'e'; }
+        else if (c == 4) { wd[0] = 'T'; wd[1] = 'h'; } else if (c == 5) { wd[0] = 'F'; wd[1] = 'r'; }
+        else { wd[0] = 'S'; wd[1] = 'a'; }
+        wd[2] = 0;
+        var col = 0x5B6784;
+        if (c == 0 || c == 6) { col = 0xB03A2E; }
+        draw_text(x + 8 + c * 36 + 10, y + 55, &wd[0], col);
+        c++;
+    }
+    // grid
+    var t: int[6];
+    rtc_read(&t[0]);
+    let first = day_of_week(cal_y, cal_m, 1);
+    let dim = days_in(cal_y, cal_m);
+    var d = 1;
+    while (d <= dim) {
+        let pos = first + d - 1;
+        let cx = x + 8 + (pos % 7) * 36;
+        let cy = y + 72 + (pos / 7) * 30;
+        let is_today = (t[0] == cal_y && t[1] == cal_m && t[2] == d);
+        var bg = 0xFFFFFF;
+        if (is_today) { bg = 0xF7D774; }
+        fill(cx + 1, cy + 1, 34, 28, bg);
+        if (d == cal_sel) { frame(cx + 1, cy + 1, 34, 28, 0x1F4FA8); frame(cx + 2, cy + 2, 32, 26, 0x1F4FA8); }
+        else { frame(cx + 1, cy + 1, 34, 28, 0xD0D8E8); }
+        var tc = C_INK;
+        if (pos % 7 == 0 || pos % 7 == 6) { tc = 0xB03A2E; }
+        var db: u8[8];
+        let dl = itoa(d, &db[0]);
+        draw_text(cx + (36 - dl * 8) / 2, cy + 7, &db[0], tc);
+        d++;
+    }
+    // footer
+    fill(x, y + h - 26, w, 26, 0xF1F3F9);
+    hline(x, y + h - 26, w, 0xDCE1EC);
+    var sd = cal_sel;
+    if (sd < 1) { sd = 1; }
+    let dn = day_name(day_of_week(cal_y, cal_m, sd));
+    var e = draw_text(x + 8, y + h - 21, dn, 0x5B6784);
+    e = draw_text(e, y + h - 21, " ", 0x5B6784);
+    e = draw_num(e, y + h - 21, sd, 0x5B6784);
+    e = draw_text(e, y + h - 21, " ", 0x5B6784);
+    draw_text_n(e, y + h - 21, month_name(cal_m), 3, 0x5B6784);
+    a2_btn(x + w - 78, y + h - 24, 70, 22, "Today", 0xFFFFFF);
+}
+
+// ================================================================= Clock: clock, alarm, timer, stopwatch
+// Alarm and timer live outside the window: they keep running (and ring) while the Clock app is closed.
+var clk_tab = 0;                                   // 0 clock, 1 alarm, 2 timer, 3 stopwatch
+var al_h = 7; var al_m = 30; var al_on = false; var al_ring = 0; var al_fired = -1;
+var tm_total = 30000; var tm_base = 30000; var tm_t0 = 0; var tm_run = false; var tm_ring = 0;
+var sw_run = false; var sw_base = 0; var sw_acc = 0;
+var sw_lap: int[6]; var sw_nl = 0;
+var clk_last_s = -1; var clk_last_e = -1;
+var clk_snd = false; var ring_txt: u8[40];
+
+fn clk_init() { clk_last_s = -1; clk_last_e = -1; }
+fn sw_elapsed() -> int {         // centiseconds
+    if (sw_run) { return sw_acc + ticks - sw_base; }
+    return sw_acc;
+}
+fn sw_toggle() {
+    if (sw_run) { sw_acc = sw_acc + ticks - sw_base; sw_run = false; }
+    else { sw_base = ticks; sw_run = true; }
+}
+fn sw_reset() { sw_acc = 0; sw_base = ticks; sw_nl = 0; }
+fn sw_lap_add() {
+    if (!sw_run) { return; }
+    var i = 5;
+    while (i > 0) { sw_lap[i] = sw_lap[i - 1]; i--; }
+    sw_lap[0] = sw_elapsed();
+    if (sw_nl < 6) { sw_nl++; }
+}
+
+fn tm_left() -> int {            // centiseconds remaining
+    if (!tm_run) { return tm_base; }
+    return imax(0, tm_base - (ticks - tm_t0));
+}
+fn tm_toggle() {
+    if (tm_run) { tm_base = tm_left(); tm_run = false; }
+    else { if (tm_base <= 0) { tm_base = tm_total; } tm_t0 = ticks; tm_run = true; }
+}
+fn tm_reset() { tm_run = false; tm_base = tm_total; tm_ring = 0; }
+fn tm_set(cs: int) { tm_total = cs; tm_run = false; tm_base = cs; tm_ring = 0; }
+fn tm_add(cs: int) {
+    var v = tm_total + cs;
+    if (v < 6000) { v = 6000; }
+    if (v > 359900) { v = 359900; }
+    tm_set(v);
+}
+
+fn clk_ringing() -> bool { return al_ring != 0 || tm_ring != 0; }
+fn clk_dismiss() { al_ring = 0; tm_ring = 0; }
+
+/// once per second from the UI loop: fires the alarm and the timer, even when the Clock window is closed
+fn clock_poll() {
+    var t: int[6];
+    rtc_read(&t[0]);
+    let mid = t[3] * 60 + t[4];
+    if (al_on && t[3] == al_h && t[4] == al_m && al_fired != mid) {
+        al_fired = mid; al_ring = ticks;
+        if (win_of_kind(APP_CLOCK) < 0) { app_open(APP_CLOCK); }
+        clk_tab = 1;
+    }
+    if (tm_run && tm_left() <= 0) {
+        tm_run = false; tm_base = 0; tm_ring = ticks;
+        if (win_of_kind(APP_CLOCK) < 0) { app_open(APP_CLOCK); }
+        clk_tab = 2;
+    }
+    if (al_ring != 0 && ticks - al_ring > 4000) { al_ring = 0; }
+    if (tm_ring != 0 && ticks - tm_ring > 4000) { tm_ring = 0; }
+    if (clk_ringing() && (ticks / 100) % 3 == 0) {
+        if (al_ring != 0) {
+            kstrncpy(&ring_txt[0], "Alarm  00:00", 20);
+            fmt2(al_h, &ring_txt[7]); ring_txt[9] = ':'; fmt2(al_m, &ring_txt[10]); ring_txt[12] = 0;
+        } else { kstrncpy(&ring_txt[0], "Timer finished", 20); }
+        toast(&ring_txt[0]);
+    }
+    if (win_of_kind(APP_CLOCK) >= 0) { ui_inval_all(APP_CLOCK); }
+}
+/// every frame: beep-beep pattern on the PC speaker while something rings
+fn clock_sound() {
+    var want = false;
+    if (clk_ringing()) { let q = (ticks / 12) % 8; want = (q == 0 || q == 2 || q == 4); }
+    if (want && !clk_snd) { speaker_on(1175); clk_snd = true; }
+    else if (!want && clk_snd) { speaker_off(); clk_snd = false; }
+}
+
+// layout (client coordinates)
+const CK_TAB_W = 78; const CK_TAB_X = 8;
+const CK_AH = 92; const CK_AM = 188;               // alarm: x of the +/- button columns
+
+fn clk_key(k: int) {
+    if (k == ' ' || k == 10) {
+        if (clk_ringing()) { clk_dismiss(); }
+        else if (clk_tab == 3) { sw_toggle(); }
+        else if (clk_tab == 2) { tm_toggle(); }
+        else if (clk_tab == 1) { al_on = !al_on; }
+    }
+    else if (k == 'r' || k == 'R') { if (clk_tab == 3) { sw_reset(); } else if (clk_tab == 2) { tm_reset(); } }
+    else if (k == 'l' || k == 'L') { if (clk_tab == 3) { sw_lap_add(); } }
+    else if (k == '1') { clk_tab = 0; } else if (k == '2') { clk_tab = 1; }
+    else if (k == '3') { clk_tab = 2; } else if (k == '4') { clk_tab = 3; }
+    else { return; }
+    ui_inval_all(APP_CLOCK);
+}
+
+fn clk_mouse(mx: int, my: int, ev: int) {
+    if (ev != 1) { return; }
+    var ww: int[2]; app_size(APP_CLOCK, &ww[0]);
+    let ch = ww[1] - TB - 2;
+    if (clk_ringing() && in_rect(mx, my, ww[0] - 4 - 96, ch - 40, 84, 28)) { clk_dismiss(); ui_inval_all(APP_CLOCK); return; }
+    var i = 0;
+    while (i < 4) { if (in_rect(mx, my, CK_TAB_X + i * (CK_TAB_W + 3), 6, CK_TAB_W, 28)) { clk_tab = i; } i++; }
+    if (clk_tab == 1) {
+        if (in_rect(mx, my, CK_AH, 60, 56, 28)) { al_h = (al_h + 1) % 24; al_fired = -1; }
+        else if (in_rect(mx, my, CK_AH, 168, 56, 28)) { al_h = (al_h + 23) % 24; al_fired = -1; }
+        else if (in_rect(mx, my, CK_AM, 60, 56, 28)) { al_m = (al_m + 1) % 60; al_fired = -1; }
+        else if (in_rect(mx, my, CK_AM, 168, 56, 28)) { al_m = (al_m + 59) % 60; al_fired = -1; }
+        else if (in_rect(mx, my, 12, 214, 312, 34)) { al_on = !al_on; al_fired = -1; }
+    } else if (clk_tab == 2) {
+        if (in_rect(mx, my, 12, 96, 56, 32)) { tm_add(-6000); }
+        else if (in_rect(mx, my, 268, 96, 56, 32)) { tm_add(6000); }
+        else if (in_rect(mx, my, 24, 250, 140, 34)) { tm_toggle(); }
+        else if (in_rect(mx, my, 172, 250, 140, 34)) { tm_reset(); }
+        var p = 0;
+        while (p < 5) { if (in_rect(mx, my, 12 + p * 62, 196, 56, 28)) { tm_set(clk_preset(p)); } p++; }
+    } else if (clk_tab == 3) {
+        if (in_rect(mx, my, 24, 150, 140, 34)) { sw_toggle(); }
+        else if (in_rect(mx, my, 172, 150, 140, 34)) { if (sw_run) { sw_lap_add(); } else { sw_reset(); } }
+    }
+    ui_inval_all(APP_CLOCK);
+}
+fn clk_preset(p: int) -> int {
+    if (p == 0) { return 6000; } if (p == 1) { return 30000; } if (p == 2) { return 60000; }
+    if (p == 3) { return 90000; }
+    return 180000;
+}
+fn clk_tick() -> bool {
+    var t: int[6];
+    rtc_read(&t[0]);
+    let e = sw_elapsed() / 3;
+    if (t[5] != clk_last_s || (sw_run && clk_tab == 3 && e != clk_last_e)) { clk_last_s = t[5]; clk_last_e = e; return true; }
+    return false;
+}
+
+/// mm:ss (or mm:ss.cc with cs=true) from centiseconds
+fn clk_fmt(cs: int, with_cs: bool, out: *u8) {
+    let s = cs / 100;
+    fmt2((s / 60) % 100, &out[0]); out[2] = ':'; fmt2(s % 60, &out[3]);
+    if (with_cs) { out[5] = '.'; fmt2(cs % 100, &out[6]); out[8] = 0; } else { out[5] = 0; }
+}
+
+fn clk_pill_btn(x: int, y: int, w: int, h: int, label: *u8, kind: int) {
+    // kind 0 neutral, 1 accent, 2 danger
+    var col = 0xFFFFFF;
+    if (kind == 1) { col = th_acc; }
+    if (kind == 2) { col = 0xFBE3E1; }
+    rfill(x, y + 1, w, h, h / 2, 0xD3D9E6, false);
+    rfill(x, y, w, h, h / 2, col, false);
+    var ink = C_INK;
+    if (kind == 1) { ink = 0xFFFFFF; }
+    if (kind == 2) { ink = 0xB3261E; }
+    let g = lbl_glyph(label);
+    if (g != 0) { ui_glyph(g, x, y, w, h, 20, ink); return; }
+    draw_text(x + (w - text_w(label)) / 2, y + (h - 16) / 2, label, ink);
+}
+
+fn clk_face(cx: int, cy: int, r: int, t: *int, with_sec: bool) {
+    disc(cx, cy, r + 3, th_acc);
+    disc(cx, cy, r, 0x0F1830);
+    var k = 0;
+    while (k < 60) {
+        let sx = sin60(k); let sy = 0 - cos60(k);
+        if (k % 5 == 0) { a2_line2(cx + sx * (r - 16) / 1000, cy + sy * (r - 16) / 1000, cx + sx * (r - 5) / 1000, cy + sy * (r - 5) / 1000, 0xFFFFFF); }
+        else { a2_line(cx + sx * (r - 8) / 1000, cy + sy * (r - 8) / 1000, cx + sx * (r - 5) / 1000, cy + sy * (r - 5) / 1000, 0x6E7AA0); }
+        k++;
+    }
+    let hk = (t[3] % 12) * 5 + t[4] / 12;
+    a2_line2(cx, cy, cx + sin60(hk) * (r * 52 / 100) / 1000, cy - cos60(hk) * (r * 52 / 100) / 1000, 0xFFFFFF);
+    a2_line2(cx, cy, cx + sin60(t[4]) * (r * 78 / 100) / 1000, cy - cos60(t[4]) * (r * 78 / 100) / 1000, 0xD7E3FF);
+    if (with_sec) {
+        a2_line(cx, cy, cx + sin60(t[5]) * (r * 86 / 100) / 1000, cy - cos60(t[5]) * (r * 86 / 100) / 1000, 0xFF6B5E);
+        a2_line(cx + 1, cy, cx + 1 + sin60(t[5]) * (r * 86 / 100) / 1000, cy - cos60(t[5]) * (r * 86 / 100) / 1000, 0xFF6B5E);
+    }
+    disc(cx, cy, 4, 0xFF6B5E); disc(cx, cy, 1, 0x0F1830);
+}
+
+fn clk_draw(x: int, y: int, w: int, h: int) {
+    var t: int[6];
+    rtc_read(&t[0]);
+    fill(x, y, w, h, C_PANEL);
+    // segmented tab bar
+    rfill(x + 4, y + 4, w - 8, 32, 14, 0xE3E7F0, false);
+    var i = 0;
+    while (i < 4) {
+        let tx = x + CK_TAB_X + i * (CK_TAB_W + 3);
+        var tg = G_CLOCK;
+        if (i == 1) { tg = G_ALARM; } else if (i == 2) { tg = G_TIMER; } else if (i == 3) { tg = G_STOPWATCH; }
+        if (i == clk_tab) { rfill(tx, y + 6, CK_TAB_W, 28, 13, th_acc, false); ui_glyph(tg, tx, y + 6, CK_TAB_W, 28, 20, 0xFFFFFF); }
+        else { ui_glyph(tg, tx, y + 6, CK_TAB_W, 28, 20, 0x5B6784); }
+        i++;
+    }
+    if (clk_tab == 0) {
+        clk_face(x + w / 2, y + 128, 82, &t[0], true);
+        var s: u8[16];
+        fmt2(t[3], &s[0]); s[2] = ':'; fmt2(t[4], &s[3]); s[5] = ':'; fmt2(t[5], &s[6]); s[8] = 0;
+        draw_text_sc(x + (w - 8 * 24) / 2, y + 218, &s[0], C_INK, 3);
+        var e = draw_text(x + 60, y + 274, day_name(day_of_week(t[0], t[1], t[2])), 0x5B6784);
+        e = draw_text(e, y + 274, ", ", 0x5B6784);
+        e = draw_num(e, y + 274, t[2], 0x5B6784);
+        e = draw_text(e, y + 274, " ", 0x5B6784);
+        e = draw_text(e, y + 274, month_abbr(t[1]), 0x5B6784);
+        e = draw_text(e, y + 274, " ", 0x5B6784);
+        draw_num(e, y + 274, t[0], 0x5B6784);
+        // summary card: next alarm + timer
+        a2_card(x + 12, y + 304, w - 24, 52);
+        draw_text(x + 24, y + 312, "Alarm", 0x8A94AB);
+        draw_text(x + w / 2 + 6, y + 312, "Timer", 0x8A94AB);
+        var a: u8[8];
+        if (al_on) { fmt2(al_h, &a[0]); a[2] = ':'; fmt2(al_m, &a[3]); a[5] = 0; draw_text_sc(x + 24, y + 332, &a[0], C_INK, 1); }
+        else { draw_text(x + 24, y + 332, "off", 0x8A94AB); }
+        if (tm_run || tm_base != tm_total) { clk_fmt(tm_left(), false, &a[0]); draw_text(x + w / 2 + 6, y + 332, &a[0], C_INK); }
+        else { draw_text(x + w / 2 + 6, y + 332, "not set", 0x8A94AB); }
+    } else if (clk_tab == 1) {
+        let x0 = x + CK_AH;
+        a2_btn(x0, y + 60, 56, 28, "+", 0xFFFFFF); a2_btn(x + CK_AM, y + 60, 56, 28, "+", 0xFFFFFF);
+        a2_btn(x0, y + 168, 56, 28, "-", 0xFFFFFF); a2_btn(x + CK_AM, y + 168, 56, 28, "-", 0xFFFFFF);
+        var s: u8[8];
+        fmt2(al_h, &s[0]); s[2] = ':'; fmt2(al_m, &s[3]); s[5] = 0;
+        var c = C_INK;
+        if (!al_on) { c = 0x8A94AB; }
+        draw_text_sc(x + (w - 160) / 2, y + 96, &s[0], c, 4);
+        // switch row
+        a2_card(x + 12, y + 214, w - 24, 34);
+        draw_text(x + 26, y + 223, "Alarm", C_INK);
+        var sw0 = 0xC9D0DF;
+        if (al_on) { sw0 = th_acc; }
+        rfill(x + w - 76, y + 220, 44, 22, 11, sw0, false);
+        if (al_on) { disc(x + w - 43, y + 231, 8, 0xFFFFFF); } else { disc(x + w - 65, y + 231, 8, 0xFFFFFF); }
+        if (al_on) {
+            var nt: int[6]; rtc_read(&nt[0]);
+            var mins = (al_h * 60 + al_m) - (nt[3] * 60 + nt[4]);
+            if (mins <= 0) { mins = mins + 1440; }
+            var e = draw_text(x + 14, y + 262, "Rings in ", 0x5B6784);
+            if (mins >= 60) { e = draw_num(e, y + 262, mins / 60, 0x5B6784); e = draw_text(e, y + 262, "h ", 0x5B6784); }
+            e = draw_num(e, y + 262, mins % 60, 0x5B6784);
+            draw_text(e, y + 262, "m", 0x5B6784);
+        } else { draw_text(x + 14, y + 262, "Alarm is off", 0x8A94AB); }
+        draw_text(x + 14, y + 284, "Space toggles, daily repeat", 0x8A94AB);
+    } else if (clk_tab == 2) {
+        var s: u8[12];
+        clk_fmt(tm_left(), false, &s[0]);
+        var c = C_INK;
+        if (tm_ring != 0) { c = 0xB3261E; }
+        draw_text_sc(x + (w - 160) / 2, y + 90, &s[0], c, 4);
+        a2_btn(x + 12, y + 96, 56, 32, "-1m", 0xFFFFFF); a2_btn(x + 268, y + 96, 56, 32, "+1m", 0xFFFFFF);
+        // progress
+        rfill(x + 24, y + 170, w - 48, 8, 4, 0xDCE1EC, false);
+        var done = 0;
+        if (tm_total > 0) { done = (tm_total - tm_left()) * (w - 48) / tm_total; }
+        if (done > 0) { rfill(x + 24, y + 170, imax(done, 8), 8, 4, th_acc, false); }
+        var p = 0;
+        while (p < 5) {
+            var lb = "1m";
+            if (p == 1) { lb = "5m"; } else if (p == 2) { lb = "10m"; } else if (p == 3) { lb = "15m"; } else if (p == 4) { lb = "30m"; }
+            var col = 0xFFFFFF;
+            if (tm_total == clk_preset(p)) { col = th_sel(); }
+            a2_btn(x + 12 + p * 62, y + 196, 56, 28, lb, col);
+            p++;
+        }
+        if (tm_run) { clk_pill_btn(x + 24, y + 250, 140, 34, "Pause", 0); } else { clk_pill_btn(x + 24, y + 250, 140, 34, "Start", 1); }
+        clk_pill_btn(x + 172, y + 250, 140, 34, "Reset", 0);
+    } else {
+        var s: u8[12];
+        clk_fmt(sw_elapsed(), true, &s[0]);
+        draw_text_sc(x + (w - 8 * 32) / 2, y + 70, &s[0], C_INK, 4);
+        if (sw_run) { clk_pill_btn(x + 24, y + 150, 140, 34, "Stop", 2); } else { clk_pill_btn(x + 24, y + 150, 140, 34, "Start", 1); }
+        if (sw_run) { clk_pill_btn(x + 172, y + 150, 140, 34, "Lap", 0); } else { clk_pill_btn(x + 172, y + 150, 140, 34, "Reset", 0); }
+        if (sw_nl > 0) {
+            a2_card(x + 12, y + 200, w - 24, 6 * 22 + 8);
+            var r = 0;
+            while (r < sw_nl) {
+                let ry = y + 206 + r * 22;
+                var e = draw_text(x + 26, ry, "Lap ", 0x8A94AB);
+                draw_num(e, ry, sw_nl - r, 0x8A94AB);
+                var lb: u8[12];
+                clk_fmt(sw_lap[r], true, &lb[0]);
+                draw_text(x + w - 24 - 72, ry, &lb[0], C_INK);
+                r++;
+            }
+        }
+    }
+    // ringing banner
+    if (clk_ringing()) {
+        rfill(x + 8, y + h - 44, w - 16, 36, 12, 0xB3261E, false);
+        if (al_ring != 0) { draw_text(x + 20, y + h - 35, "Alarm ringing", 0xFFFFFF); } else { draw_text(x + 20, y + h - 35, "Timer finished", 0xFFFFFF); }
+        rfill(x + w - 96, y + h - 40, 84, 28, 13, 0xFFFFFF, false);
+        ui_glyph(G_CHECK, x + w - 96, y + h - 40, 84, 28, 18, 0xB3261E);
+    }
+}
+
+// ================================================================= Snake
+const SN_W = 24; const SN_H = 18; const SN_C = 16;
+var sn_x: int[433]; var sn_y: int[433];
+var sn_len = 3; var sn_dir = 1; var sn_ndir = 1;
+var sn_fx = 0; var sn_fy = 0;
+var sn_score = 0; var sn_best = 0;
+var sn_state = 0;                 // 0 ready, 1 playing, 2 paused, 3 game over
+var sn_last = 0;
+
+fn sn_on_snake(cx: int, cy: int) -> bool {
+    var i = 0;
+    while (i < sn_len) { if (sn_x[i] == cx && sn_y[i] == cy) { return true; } i++; }
+    return false;
+}
+fn sn_place_food() {
+    var tries = 0;
+    while (tries < 400) {
+        let fx = rnd(SN_W); let fy = rnd(SN_H);
+        if (!sn_on_snake(fx, fy)) { sn_fx = fx; sn_fy = fy; return; }
+        tries++;
+    }
+    var yy = 0;
+    while (yy < SN_H) {
+        var xx = 0;
+        while (xx < SN_W) { if (!sn_on_snake(xx, yy)) { sn_fx = xx; sn_fy = yy; return; } xx++; }
+        yy++;
+    }
+}
+fn sn_reset() {
+    sn_len = 3; sn_dir = 1; sn_ndir = 1;
+    sn_x[0] = SN_W / 2; sn_y[0] = SN_H / 2;
+    sn_x[1] = SN_W / 2 - 1; sn_y[1] = SN_H / 2;
+    sn_x[2] = SN_W / 2 - 2; sn_y[2] = SN_H / 2;
+    sn_score = 0; sn_state = 0;
+    rnd_s = rnd_s + ticks * 7919 + 1;
+    sn_place_food();
+}
+fn sn_init() { sn_reset(); }
+
+fn sn_over() { sn_state = 3; if (sn_score > sn_best) { sn_best = sn_score; } }
+
+fn sn_step() {
+    sn_dir = sn_ndir;
+    var nx = sn_x[0]; var ny = sn_y[0];
+    if (sn_dir == 0) { ny--; } else if (sn_dir == 1) { nx++; } else if (sn_dir == 2) { ny++; } else { nx--; }
+    if (nx < 0 || nx >= SN_W || ny < 0 || ny >= SN_H) { sn_over(); return; }
+    let eat = (nx == sn_fx && ny == sn_fy);
+    var lim = sn_len;
+    if (!eat) { lim = sn_len - 1; }
+    var i = 0;
+    while (i < lim) { if (sn_x[i] == nx && sn_y[i] == ny) { sn_over(); return; } i++; }
+    var j = sn_len;
+    if (!eat) { j = sn_len - 1; }
+    while (j > 0) { sn_x[j] = sn_x[j - 1]; sn_y[j] = sn_y[j - 1]; j--; }
+    sn_x[0] = nx; sn_y[0] = ny;
+    if (eat) {
+        sn_len++; sn_score = sn_score + 10;
+        if (sn_len >= SN_W * SN_H) { sn_over(); return; }
+        sn_place_food();
+    }
+}
+
+fn sn_turn(d: int) {
+    // refuse a 180 degree turn
+    if ((sn_dir + 2) % 4 == d) { return; }
+    sn_ndir = d;
+    if (sn_state == 0) { sn_state = 1; sn_last = ticks; }
+}
+fn sn_key(k: int) {
+    if (k == KEY_UP || k == 'w' || k == 'W') { sn_turn(0); }
+    else if (k == KEY_RIGHT || k == 'd' || k == 'D') { sn_turn(1); }
+    else if (k == KEY_DOWN || k == 's' || k == 'S') { sn_turn(2); }
+    else if (k == KEY_LEFT || k == 'a' || k == 'A') { sn_turn(3); }
+    else if (k == ' ' || k == 'p' || k == 'P') {
+        if (sn_state == 1) { sn_state = 2; } else if (sn_state == 2) { sn_state = 1; sn_last = ticks; }
+        else if (sn_state == 3) { sn_reset(); }
+    }
+    else if (k == 10 || k == 'r' || k == 'R') { sn_reset(); }
+    else { return; }
+    ui_inval_all(APP_SNAKE);
+}
+fn sn_mouse(mx: int, my: int, ev: int) { }
+fn sn_period() -> int { return imax(5, 14 - (sn_len - 3) / 3); }
+fn sn_tick() -> bool {
+    if (sn_state == 1 && ticks - sn_last >= sn_period()) { sn_last = ticks; sn_step(); return true; }
+    return false;
+}
+
+fn sn_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, 0x0B1F1A);
+    vgrad(x, y, w, 28, 0x14423A, 0x0B2A26);
+    draw_text(x + 10, y + 6, "Score", 0x9FE3D6);
+    draw_num(x + 62, y + 6, sn_score, 0xFFFFFF);
+    text_c(x, w, y + 6, "S N A K E", 0xF1C24B);
+    draw_text(x + w - 120, y + 6, "Best", 0x9FE3D6);
+    draw_num(x + w - 72, y + 6, sn_best, 0xFFFFFF);
+    let bx = x + 8; let by = y + 28;
+    var gy = 0;
+    while (gy < SN_H) {
+        var gx = 0;
+        while (gx < SN_W) {
+            var c = 0x0F2E28;
+            if (((gx + gy) & 1) == 1) { c = 0x113530; }
+            fill(bx + gx * SN_C, by + gy * SN_C, SN_C, SN_C, c);
+            gx++;
+        }
+        gy++;
+    }
+    frame(bx - 1, by - 1, SN_W * SN_C + 2, SN_H * SN_C + 2, 0x2EB6A8);
+    // food
+    disc(bx + sn_fx * SN_C + 8, by + sn_fy * SN_C + 8, 6, 0xE74C3C);
+    fill(bx + sn_fx * SN_C + 8, by + sn_fy * SN_C + 1, 2, 3, 0x2ECC71);
+    // snake
+    var i = sn_len - 1;
+    while (i >= 0) {
+        var c1 = 0x2EB66A; var c2 = 0x45C98A;
+        if (i == 0) { c1 = 0xE8B923; c2 = 0xF7D774; }
+        else if (i % 2 == 1) { c2 = 0x2EB66A; c1 = 0x1E8A55; }
+        fill(bx + sn_x[i] * SN_C + 1, by + sn_y[i] * SN_C + 1, SN_C - 2, SN_C - 2, c1);
+        fill(bx + sn_x[i] * SN_C + 3, by + sn_y[i] * SN_C + 3, SN_C - 6, SN_C - 6, c2);
+        i--;
+    }
+    // head eyes
+    let hx = bx + sn_x[0] * SN_C; let hy = by + sn_y[0] * SN_C;
+    fill(hx + 4, hy + 4, 3, 3, 0x081A4A); fill(hx + 9, hy + 4, 3, 3, 0x081A4A);
+    if (sn_state != 1) {
+        shade(bx, by + 100, SN_W * SN_C, 80, 0x000000, 150);
+        if (sn_state == 0) { text_c(bx, SN_W * SN_C, by + 112, "Arrow keys / WASD to start", 0xFFFFFF); text_c(bx, SN_W * SN_C, by + 140, "Space = pause   Enter = restart", 0xBFE8DD); }
+        else if (sn_state == 2) { text_c(bx, SN_W * SN_C, by + 124, "PAUSED - press Space", 0xFFFFFF); }
+        else { text_c(bx, SN_W * SN_C, by + 112, "GAME OVER", 0xFF6B6B); text_c(bx, SN_W * SN_C, by + 140, "Enter or Space to play again", 0xFFFFFF); }
+    }
+}
+
+// ================================================================= Minesweeper
+const M_MAXW = 16; const M_MAXH = 12; const M_CELL = 20; const M_BY = 70;
+var m_mine: u8[192]; var m_st: u8[192]; var m_cnt: u8[192];
+var m_stack: int[192];
+var m_w = 9; var m_h = 9; var m_n = 10; var m_mode = 0;
+var m_state = 0;                  // 0 ready, 1 playing, 2 won, 3 lost
+var m_flags = 0; var m_opened = 0; var m_t0 = 0; var m_time = 0; var m_hit = -1;
+var m_flagmode = false;
+
+fn m_reset() {
+    var i = 0;
+    while (i < 192) { m_mine[i] = 0; m_st[i] = 0; m_cnt[i] = 0; i++; }
+    m_state = 0; m_flags = 0; m_opened = 0; m_time = 0; m_hit = -1;
+}
+fn m_setmode(mode: int) {
+    m_mode = mode;
+    if (mode == 0) { m_w = 9; m_h = 9; m_n = 10; }
+    else if (mode == 1) { m_w = 12; m_h = 10; m_n = 20; }
+    else { m_w = 16; m_h = 12; m_n = 35; }
+    m_reset();
+}
+fn m_init() { m_flagmode = false; rnd_s = rnd_s + ticks * 31 + 7; m_setmode(0); }
+
+fn m_neighbors(i: int, out: *int) -> int {
+    let cx = i % m_w; let cy = i / m_w;
+    var n = 0;
+    var dy = -1;
+    while (dy <= 1) {
+        var dx = -1;
+        while (dx <= 1) {
+            if (dx != 0 || dy != 0) {
+                let nx = cx + dx; let ny = cy + dy;
+                if (nx >= 0 && nx < m_w && ny >= 0 && ny < m_h) { out[n] = ny * m_w + nx; n++; }
+            }
+            dx++;
+        }
+        dy++;
+    }
+    return n;
+}
+
+fn m_place(safe: int) {
+    let sx = safe % m_w; let sy = safe / m_w;
+    var placed = 0; var guard = 0;
+    while (placed < m_n && guard < 20000) {
+        let r = rnd(m_w * m_h);
+        let rx = r % m_w; let ry = r / m_w;
+        var skip = false;
+        if (iabs(rx - sx) <= 1 && iabs(ry - sy) <= 1) { skip = true; }
+        if (m_mine[r] != 0) { skip = true; }
+        if (!skip) { m_mine[r] = 1; placed++; }
+        guard++;
+    }
+    var nb: int[8];
+    var i = 0;
+    while (i < m_w * m_h) {
+        let n = m_neighbors(i, &nb[0]);
+        var c = 0; var k = 0;
+        while (k < n) { if (m_mine[nb[k]] != 0) { c++; } k++; }
+        m_cnt[i] = c as u8;
+        i++;
+    }
+}
+
+fn m_flood(start: int) {
+    var nb: int[8];
+    var sp = 0;
+    m_st[start] = 1; m_opened++;
+    m_stack[0] = start; sp = 1;
+    while (sp > 0) {
+        sp--;
+        let c = m_stack[sp];
+        if (m_cnt[c] == 0) {
+            let n = m_neighbors(c, &nb[0]);
+            var k = 0;
+            while (k < n) {
+                let q = nb[k];
+                if (m_st[q] == 0 && m_mine[q] == 0) { m_st[q] = 1; m_opened++; m_stack[sp] = q; sp++; }
+                k++;
+            }
+        }
+    }
+}
+
+fn m_lose(i: int) { m_state = 3; m_hit = i; }
+fn m_win() {
+    m_state = 2;
+    var i = 0;
+    while (i < m_w * m_h) { if (m_mine[i] != 0) { m_st[i] = 2; } i++; }
+    m_flags = m_n;
+}
+
+fn m_flag(i: int) {
+    if (m_state >= 2) { return; }
+    if (m_st[i] == 0) { m_st[i] = 2; m_flags++; }
+    else if (m_st[i] == 2) { m_st[i] = 0; m_flags--; }
+}
+fn m_open(i: int) {
+    if (m_state >= 2) { return; }
+    if (m_st[i] != 0) { return; }
+    if (m_state == 0) { m_place(i); m_state = 1; m_t0 = ticks; }
+    if (m_mine[i] != 0) { m_lose(i); return; }
+    m_flood(i);
+    if (m_opened >= m_w * m_h - m_n) { m_win(); }
+}
+
+fn m_key(k: int) {
+    if (k == ' ' || k == 10 || k == 'r' || k == 'R') { m_reset(); }
+    else if (k == '1') { m_setmode(0); }
+    else if (k == '2') { m_setmode(1); }
+    else if (k == '3') { m_setmode(2); }
+    else if (k == 'f' || k == 'F') { m_flagmode = !m_flagmode; }
+    else { return; }
+    ui_inval_all(APP_MINES);
+}
+
+fn m_bx() -> int { return (336 - m_w * M_CELL) / 2; }
+
+fn m_mouse(mx: int, my: int, ev: int) {
+    if (ev != 1 && ev != 4) { return; }
+    if (my < M_BY - 4) {
+        if (ev == 1) {
+            if (in_rect(mx, my, 154, 6, 28, 28)) { m_reset(); }
+            else if (in_rect(mx, my, 8, 40, 44, 24)) { m_setmode(0); }
+            else if (in_rect(mx, my, 56, 40, 56, 24)) { m_setmode(1); }
+            else if (in_rect(mx, my, 116, 40, 56, 24)) { m_setmode(2); }
+            else if (in_rect(mx, my, 272, 40, 56, 24)) { m_flagmode = !m_flagmode; }
+        }
+        ui_inval_all(APP_MINES);
+        return;
+    }
+    let cx = (mx - m_bx()) / M_CELL; let cy = (my - M_BY) / M_CELL;
+    if (mx < m_bx() || my < M_BY || cx >= m_w || cy >= m_h) { return; }
+    let i = cy * m_w + cx;
+    if (ev == 4 || m_flagmode) { m_flag(i); } else { m_open(i); }
+    ui_inval_all(APP_MINES);
+}
+
+fn m_tick() -> bool {
+    if (m_state == 1) {
+        var t = (ticks - m_t0) / 100;
+        if (t > 999) { t = 999; }
+        if (t != m_time) { m_time = t; return true; }
+    }
+    return false;
+}
+
+fn m_led(x: int, y: int, v: int) {
+    rfill(x, y, 56, 28, 8, 0x1A1216, false);
+    var b: u8[8];
+    var n = v;
+    if (n < 0) { n = 0; }
+    if (n > 999) { n = 999; }
+    b[0] = ('0' + (n / 100) % 10) as u8; b[1] = ('0' + (n / 10) % 10) as u8; b[2] = ('0' + n % 10) as u8; b[3] = 0;
+    draw_text_sc(x + 4, y + 6, &b[0], 0xFF3030, 2);
+}
+
+fn m_num_color(n: int) -> int {
+    if (n == 1) { return 0x1F4FA8; } if (n == 2) { return 0x1E8449; } if (n == 3) { return 0xC0392B; }
+    if (n == 4) { return 0x1B2A6B; } if (n == 5) { return 0x7B241C; } if (n == 6) { return 0x148F77; }
+    if (n == 7) { return 0x000000; }
+    return 0x707B7C;
+}
+
+fn m_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, 0xE4E8F1);
+    fill(x, y, w, 38, 0xEEF1F7);
+    hline(x, y + 37, w, 0xDCE1EC);
+    m_led(x + 8, y + 5, m_n - m_flags);
+    m_led(x + w - 64, y + 5, m_time);
+    // face
+    let fx = x + 154; let fy = y + 6;
+    rfill(fx, fy, 28, 28, 14, 0xFFFFFF, false);
+    disc(fx + 14, fy + 14, 11, 0xF1C40F);
+    if (m_state == 2) { fill(fx + 6, fy + 9, 16, 4, 0x1B2433); fill(fx + 10, fy + 19, 8, 1, 0x1B2433); fill(fx + 9, fy + 18, 1, 1, 0x1B2433); fill(fx + 18, fy + 18, 1, 1, 0x1B2433); }
+    else if (m_state == 3) { draw_char(fx + 3, fy + 5, 'x', 0x1B2433); draw_char(fx + 13, fy + 5, 'x', 0x1B2433); fill(fx + 9, fy + 20, 10, 1, 0x1B2433); fill(fx + 8, fy + 21, 1, 1, 0x1B2433); fill(fx + 19, fy + 21, 1, 1, 0x1B2433); }
+    else { fill(fx + 9, fy + 9, 2, 3, 0x1B2433); fill(fx + 17, fy + 9, 2, 3, 0x1B2433); fill(fx + 9, fy + 19, 10, 1, 0x1B2433); fill(fx + 8, fy + 18, 1, 1, 0x1B2433); fill(fx + 19, fy + 18, 1, 1, 0x1B2433); }
+    // mode / flag buttons
+    a2_btn(x + 8, y + 40, 44, 24, "9x9", m_mode == 0 ? th_sel() : 0xFFFFFF);
+    a2_btn(x + 56, y + 40, 56, 24, "12x10", m_mode == 1 ? th_sel() : 0xFFFFFF);
+    a2_btn(x + 116, y + 40, 56, 24, "16x12", m_mode == 2 ? th_sel() : 0xFFFFFF);
+    a2_btn(x + 272, y + 40, 56, 24, "Flag", m_flagmode ? 0xFBE3E1 : 0xFFFFFF);
+    // board
+    let bx = x + m_bx(); let by = y + M_BY;
+    var cy = 0;
+    while (cy < m_h) {
+        var cx = 0;
+        while (cx < m_w) {
+            let i = cy * m_w + cx;
+            let px0 = bx + cx * M_CELL; let py0 = by + cy * M_CELL;
+            let st = m_st[i] as int;
+            let lost = (m_state == 3);
+            if (st == 1 || (lost && m_mine[i] != 0 && st != 2)) {
+                var bg = 0xE3E9F4;
+                if (i == m_hit) { bg = 0xE74C3C; }
+                fill(px0, py0, M_CELL, M_CELL, bg);
+                frame(px0, py0, M_CELL, M_CELL, 0xA9B4CC);
+                if (m_mine[i] != 0) {
+                    disc(px0 + 10, py0 + 10, 5, 0x1B2433);
+                    hline(px0 + 3, py0 + 10, 14, 0x1B2433); vline(px0 + 10, py0 + 3, 14, 0x1B2433);
+                    fill(px0 + 8, py0 + 8, 2, 2, 0xFFFFFF);
+                } else if (m_cnt[i] != 0) {
+                    var nb2: u8[2];
+                    nb2[0] = ('0' + (m_cnt[i] as int)) as u8; nb2[1] = 0;
+                    draw_char(px0 + 6, py0 + 2, nb2[0] as int, m_num_color(m_cnt[i] as int));
+                }
+            } else {
+                rfill(px0, py0, M_CELL, M_CELL, 4, 0xC3CBDC, false);
+                rfill(px0, py0, M_CELL, M_CELL - 1, 4, th_sel(), false);
+                rfill(px0 + 1, py0 + 1, M_CELL - 2, M_CELL - 4, 3, mix(0xFFFFFF, th_acc, 40), false);
+                if (st == 2) {
+                    fill(px0 + 9, py0 + 4, 2, 12, 0x1B2433);
+                    fill(px0 + 5, py0 + 4, 5, 5, 0xE74C3C);
+                    fill(px0 + 6, py0 + 15, 8, 2, 0x1B2433);
+                    if (lost && m_mine[i] == 0) { hline(px0 + 3, py0 + 3, 14, 0xE74C3C); }
+                }
+            }
+            cx++;
+        }
+        cy++;
+    }
+    if (m_state == 0) { text_c(x, w, y + h - 18, "left click = open, right click or Flag = flag", 0x5B6784); }
+    else if (m_state == 2) { text_c(x, w, y + h - 18, "You cleared the field!", 0x1E8449); }
+    else if (m_state == 3) { text_c(x, w, y + h - 18, "BOOM - click the face to try again", 0xB03A2E); }
+}
+
+// ================================================================= Monitor
+var mon_hist: int[90];
+var mon_hn = 0;
+var mon_sec = -1; var mon_f0 = 0; var mon_fps = 0;
+var mon_used = 0; var mon_free = 0;
+var mon_sig = -1;
+var mon_tab = 0;                       // 0 overview, 1 threads
+var mon_cpu: int[90]; var mon_cn = 0;
+
+fn mon_nth_win(n: int) -> int {
+    var c = 0; var i = 0;
+    while (i < MAXWIN) { if (wins[i].used != 0) { if (c == n) { return i; } c++; } i++; }
+    return -1;
+}
+fn mon_win_sig() -> int {
+    var s = 0; var i = 0;
+    while (i < MAXWIN) { if (wins[i].used != 0) { s = s * 3 + 1 + wins[i].minimized + wins[i].kind * 7; } i++; }
+    return s;
+}
+fn mon_sample() {
+    var hs: int[4];
+    heap_stats(&hs[0]);
+    mon_used = hs[0]; mon_free = hs[1];
+    let busy = imax(0, imin(100, 100 - thr_idle_pct));
+    if (mon_cn < 90) { mon_cpu[mon_cn] = busy; mon_cn++; } else { var j = 0; while (j < 89) { mon_cpu[j] = mon_cpu[j + 1]; j++; } mon_cpu[89] = busy; }
+    if (mon_hn < 90) { mon_hist[mon_hn] = mon_used; mon_hn++; }
+    else { var i = 0; while (i < 89) { mon_hist[i] = mon_hist[i + 1]; i++; } mon_hist[89] = mon_used; }
+}
+fn mon_init() { mon_hn = 0; mon_sec = -1; mon_f0 = frames; mon_fps = 0; mon_sig = -1; mon_sample(); }
+
+fn mon_tick() -> bool {
+    var r = false;
+    let sec = ticks / 100;
+    if (sec != mon_sec) {
+        mon_sec = sec;
+        mon_fps = frames - mon_f0; mon_f0 = frames;
+        mon_sample();
+        r = true;
+    }
+    let sg = mon_win_sig();
+    if (sg != mon_sig) { mon_sig = sg; r = true; }
+    return r;
+}
+
+fn mon_thr_nth(n: int) -> int { return thr_nth(n); }
+fn mon_mouse(mx: int, my: int, ev: int) {
+    if (ev != 1) { return; }
+    if (my < 26 && mx >= 270) { mon_tab = mx < 352 ? 0 : 1; ui_inval_all(APP_MON); return; }
+    if (mon_tab == 1) {
+        if (my >= 190 && mx >= 394) {
+            let row = (my - 190) / 16;
+            let si = thr_nth(row);
+            if (si >= 0) { thr_kill(thr[si].id); ui_inval_all(APP_MON); }
+        }
+        return;
+    }
+    if (my >= 224 && mx >= 378 && mx < 432) {
+        let row = (my - 224) / 16;
+        let wi = mon_nth_win(row);
+        if (wi >= 0) { win_close(wi); }
+    }
+}
+
+fn mon_bar(x: int, y: int, label: *u8, used: int, total: int, col: int) {
+    draw_text(x + 8, y, label, 0x5B6784);
+    fill(x + 78, y + 1, 240, 14, 0xFFFFFF);
+    frame(x + 78, y + 1, 240, 14, 0xDCE1EC);
+    var f = 0;
+    if (total > 0) { f = used * 238 / total; }
+    if (f > 238) { f = 238; }
+    if (f > 0) { fill(x + 79, y + 2, f, 12, col); }
+}
+
+fn mon_draw_threads(x: int, y: int, w: int, h: int) {
+    var nt = thr_count();
+    var e = draw_text(x + 8, y + 32, "Threads  ", 0x5B6784); e = draw_num(e, y + 32, nt, C_INK);
+    e = draw_text(x + 150, y + 32, "Idle  ", 0x5B6784); e = draw_num(e, y + 32, thr_idle_pct, C_INK); draw_text(e, y + 32, " %", C_INK);
+    e = draw_text(x + 8, y + 48, "Switches  ", 0x5B6784); e = draw_num(e, y + 48, thr_total_sw, C_INK);
+    e = draw_text(x + 150, y + 48, "Slow slices  ", 0x5B6784); draw_num(e, y + 48, thr_total_ov, thr_total_ov > 0 ? 0xB3261E : C_INK);
+    draw_text(x + 8, y + 68, "CPU busy, last 90 s", 0x5B6784);
+    fill(x + 8, y + 86, 424, 36, 0x0F1D40);
+    frame(x + 8, y + 86, 424, 36, 0x3A5090);
+    var i = 0;
+    while (i < mon_cn) {
+        let bh = mon_cpu[i] * 32 / 100;
+        fill(x + 10 + i * 4, y + 86 + 34 - bh, 3, imax(1, bh), 0xE8B923);
+        i++;
+    }
+    draw_text(x + 8, y + 126, "Cooperative threads: each runs until it yields, sleeps or waits.", 0x8A97AD);
+    fill(x + 8, y + 170, w - 16, 18, 0xF1F3F9);
+    draw_text(x + 12, y + 171, "ID", 0x5B6784); draw_text(x + 40, y + 171, "Name", 0x5B6784); draw_text(x + 140, y + 171, "State", 0x5B6784);
+    draw_text(x + 214, y + 171, "Pri", 0x5B6784); draw_text(x + 244, y + 171, "CPU", 0x5B6784); draw_text(x + 316, y + 171, "Stack", 0x5B6784);
+    var r = 0;
+    while (r < 14) {
+        let si = thr_nth(r);
+        if (si >= 0) {
+            let ry = y + 190 + r * 16;
+            draw_num(x + 12, ry, thr[si].id, C_INK);
+            draw_text_n(x + 40, ry, &thr[si].name[0], 12, C_INK);
+            var sc = C_INK;
+            if (thr[si].state == TS_BLOCK) { sc = 0xB36B00; } else if (thr[si].state == TS_RUN) { sc = 0x1E8449; } else if (thr[si].state == TS_SLEEP || thr[si].state == TS_DEAD) { sc = 0x8A97AD; }
+            draw_text(x + 140, ry, thr_state_name(thr[si].state), sc);
+            draw_num(x + 214, ry, thr[si].prio, C_INK);
+            var pc = thr[si].cpu_pct;
+            if (si == 0) { pc = imax(0, pc - thr_idle_pct); }
+            fill(x + 244, ry + 3, 40, 9, 0xE3E9F4);
+            fill(x + 244, ry + 3, imin(40, pc * 40 / 100), 9, 0x3E7BD6);
+            draw_num(x + 288, ry, pc, 0x5B6784);
+            if (thr[si].stack != 0) { var e2 = draw_num(x + 316, ry, thr_stack_used(si) / 1024, C_INK); draw_text(e2, ry, "/32K", 0x5B6784); }
+            else { draw_text(x + 316, ry, "boot", 0x8A97AD); }
+            if ((thr[si].flags & TF_SYSTEM) == 0 && thr[si].state != TS_DEAD) {
+                rfill(x + 394, ry, 32, 15, 7, 0xFBE3E1, false);
+                svg_tint(G_CLOSE, x + 394 + 9, ry, 14, 0xB3261E, 256);
+            }
+        }
+        r++;
+    }
+}
+
+fn mon_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    vgrad(x, y, w, 26, 0x1F4FA8, 0x0E7C86);
+    feather(x + 18, y + 13, 7);
+    draw_text_sh(x + 34, y + 5, "Peacock Monitor", 0xFFFFFF, 0x0A1630);
+    var tb = 0;
+    while (tb < 2) {
+        let tx = x + w - 170 + tb * 84;
+        if (tb == mon_tab) { rfill(tx, y + 3, 80, 20, 9, 0xFFFFFF, false); } else { rfill(tx, y + 3, 80, 20, 9, 0x2A63B5, false); }
+        var lab = "System"; if (tb == 1) { lab = "Threads"; }
+        draw_text(tx + (80 - text_w(lab)) / 2, y + 5, lab, tb == mon_tab ? 0x1B2433 : 0xFFFFFF);
+        tb++;
+    }
+    if (mon_tab == 1) { mon_draw_threads(x, y, w, h); return; }
+    // numbers
+    var e = draw_text(x + 8, y + 32, "Uptime  ", 0x5B6784);
+    e = draw_num(e, y + 32, ticks / 100, C_INK); draw_text(e, y + 32, " s", C_INK);
+    e = draw_text(x + 8, y + 48, "Frames  ", 0x5B6784);
+    e = draw_num(e, y + 48, mon_fps, C_INK); draw_text(e, y + 48, " /s", C_INK);
+    var nw = 0; var q = 0;
+    while (q < MAXWIN) { if (wins[q].used != 0) { nw++; } q++; }
+    e = draw_text(x + 8, y + 64, "Windows ", 0x5B6784);
+    draw_num(e, y + 64, nw, C_INK);
+    var fs: int[4];
+    fs_stats(&fs[0]);
+    e = draw_text(x + 220, y + 32, "Display ", 0x5B6784);
+    e = draw_num(e, y + 32, fb_w, C_INK); e = draw_text(e, y + 32, "x", C_INK); draw_num(e, y + 32, fb_h, C_INK);
+    e = draw_text(x + 220, y + 48, "Files   ", 0x5B6784);
+    e = draw_num(e, y + 48, fs[1], C_INK); e = draw_text(e, y + 48, "  dirs ", 0x5B6784); draw_num(e, y + 48, fs[2], C_INK);
+    e = draw_text(x + 220, y + 64, "Stored  ", 0x5B6784);
+    e = draw_num(e, y + 64, fs[3], C_INK); draw_text(e, y + 64, " B", C_INK);
+    // bars
+    mon_bar(x, y + 86, "Heap", mon_used, mon_used + mon_free, 0x2EB6A8);
+    e = draw_num(x + 326, y + 86, mon_used / 1024, C_INK); draw_text(e, y + 86, " KiB", C_INK);
+    mon_bar(x, y + 106, "RAM", (pm_frames - pm_free) * 4096, ram_usable, 0x3E7BD6);
+    e = draw_num(x + 326, y + 106, ((pm_frames - pm_free) * 4) / 1024, C_INK); draw_text(e, y + 106, " MiB", C_INK);
+    mon_bar(x, y + 126, "FS nodes", fs[0], FS_MAX, 0xE8B923);
+    e = draw_num(x + 326, y + 126, fs[0], C_INK); e = draw_text(e, y + 126, "/", C_INK); draw_num(e, y + 126, FS_MAX, C_INK);
+    // heap history graph
+    draw_text(x + 8, y + 148, "heap used, last 90 s", 0x5B6784);
+    fill(x + 8, y + 166, 424, 30, 0x0F1D40);
+    frame(x + 8, y + 166, 424, 30, 0x3A5090);
+    var mx2 = 1; var i = 0;
+    while (i < mon_hn) { if (mon_hist[i] > mx2) { mx2 = mon_hist[i]; } i++; }
+    i = 0;
+    while (i < mon_hn) {
+        let bh = mon_hist[i] * 26 / mx2;
+        fill(x + 10 + i * 4 + 0, y + 166 + 28 - bh, 3, bh, 0x2EB6A8);
+        i++;
+    }
+    // window table
+    fill(x + 8, y + 204, w - 16, 18, 0xF1F3F9);
+    draw_text(x + 12, y + 205, "Window", 0x5B6784);
+    draw_text(x + 184, y + 205, "Size", 0x5B6784);
+    draw_text(x + 274, y + 205, "State", 0x5B6784);
+    var r = 0;
+    while (r < 12) {
+        let wi = mon_nth_win(r);
+        if (wi >= 0) {
+            let ry = y + 224 + r * 16;
+            if (wi == focus) { fill(x + 8, ry, w - 16, 16, 0xE9EEF8); }
+            draw_text_n(x + 12, ry, &wins[wi].title[0], 20, C_INK);
+            var e2 = draw_num(x + 184, ry, wins[wi].w, C_INK);
+            e2 = draw_text(e2, ry, "x", C_INK);
+            draw_num(e2, ry, wins[wi].h, C_INK);
+            if (wins[wi].minimized != 0) { draw_text(x + 274, ry, "minimized", 0x8A97AD); }
+            else if (wi == focus) { draw_text(x + 274, ry, "focused", 0x1E8449); }
+            else { draw_text(x + 274, ry, "running", C_INK); }
+            rfill(x + 394, ry, 32, 15, 7, 0xFBE3E1, false);
+            svg_tint(G_CLOSE, x + 394 + 9, ry, 14, 0xB3261E, 256);
+        }
+        r++;
+    }
+}

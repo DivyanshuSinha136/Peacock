@@ -1,0 +1,76 @@
+// fonts.kc -- the Fonts app: choose the UI font for the whole OS.  Author: Divyanshu Sinha (MIT License)
+// Click a face (or press Up/Down, 1-6) to apply it everywhere at once; the choice is saved in /etc/font and restored at boot.
+
+const FA_TOP = 50; const FA_RH = 52;
+
+fn fa_size(out: *int) { out[0] = 460; out[1] = FA_TOP + (VF_N + 1) * FA_RH + 34; }
+fn fa_init() {}
+fn fa_close() {}
+
+/// choice shown in row r: the vector faces first, the classic bitmap font last
+fn fa_choice(r: int) -> int {
+    if (r == VF_N) { return 0; }
+    return r + 1;
+}
+fn fa_row_of(c: int) -> int {
+    if (c == 0) { return VF_N; }
+    return c - 1;
+}
+
+fn fa_pick(c: int) {
+    font_apply(c, true);
+    var b: u8[64];
+    kstrncpy(&b[0], "Font: ", 8);
+    kstrncpy(&b[6], font_name(c), 50);
+    toast(&b[0]);
+    ui_inval_all(APP_FONT);
+}
+
+fn fa_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    draw_text(x + 16, y + 16, "Choose the font for the whole system", C_INK);
+    draw_text(x + 16, y + 32, "Applies to every window, menu and the taskbar", 0x8A94AB);
+    var r = 0;
+    while (r <= VF_N) {
+        let c = fa_choice(r);
+        let ry = y + FA_TOP + 6 + r * FA_RH;
+        let sel = (c == vf_cur);
+        if (sel) { rfill(x + 10, ry, w - 20, FA_RH - 6, 10, th_acc, false); rfill(x + 12, ry + 2, w - 24, FA_RH - 10, 8, 0xFFFFFF, false); }
+        else { rfill(x + 10, ry, w - 20, FA_RH - 6, 10, 0xDCE1EC, false); rfill(x + 11, ry + 1, w - 22, FA_RH - 8, 9, 0xFFFFFF, false); }
+        // radio
+        disc(x + 32, ry + (FA_RH - 6) / 2, 8, sel ? th_acc : 0xC9D0DF);
+        disc(x + 32, ry + (FA_RH - 6) / 2, 6, 0xFFFFFF);
+        if (sel) { disc(x + 32, ry + (FA_RH - 6) / 2, 3, th_acc); }
+        // the name and a sample, both set in the face itself
+        if (c == 0) {
+            var i = 0; let nm = font_name(0);
+            while (nm[i] != 0) { draw_char_bm(x + 52 + i * 8, ry + 6, nm[i] as int, C_INK); i++; }
+            let sm = "The quick brown fox jumps over the lazy dog";
+            i = 0;
+            while (sm[i] != 0 && i < 44) { draw_char_bm(x + 52 + i * 8, ry + 24, sm[i] as int, 0x5B6784); i++; }
+        } else {
+            let f = c - 1;
+            vf_text(f, 18, x + 52, ry + 5, font_name(c), -1, C_INK);
+            vf_text(f, vf_px(f), x + 52, ry + 24, "The quick brown fox jumps over the lazy dog", -1, 0x5B6784);
+        }
+        r++;
+    }
+    draw_text(x + 16, y + h - 24, "Up / Down to browse, Enter to keep", 0x8A94AB);
+}
+
+fn fa_mouse(mx: int, my: int, ev: int) {
+    if (ev != 1) { return; }
+    var r = 0;
+    while (r <= VF_N) {
+        let ry = FA_TOP + 6 + r * FA_RH;
+        if (mx >= 10 && my >= ry && my < ry + FA_RH - 6) { fa_pick(fa_choice(r)); return; }
+        r++;
+    }
+}
+
+fn fa_key(k: int) {
+    let r = fa_row_of(vf_cur);
+    if (k == KEY_DOWN) { fa_pick(fa_choice((r + 1) % (VF_N + 1))); }
+    else if (k == KEY_UP) { fa_pick(fa_choice((r + VF_N) % (VF_N + 1))); }
+    else if (k >= '1' && k <= '6') { if (k - '1' <= VF_N) { fa_pick(fa_choice(k - '1')); } }
+}

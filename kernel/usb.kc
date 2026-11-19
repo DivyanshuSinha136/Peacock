@@ -1,0 +1,560 @@
+// usb.kc -- USB 1.1 through a UHCI host controller (QEMU: -usb, i.e. the PIIX3 UHCI at PCI class 0C03/00).  Polled, no interrupts.
+// Author: Divyanshu Sinha (MIT License)
+//
+//   * root-port enumeration (reset, address, descriptors, configuration); hot-plug is noticed by usb_poll()
+//   * HID boot keyboard (-> kb_push), HID boot mouse and absolute tablet (-> mouse_push), re-armed interrupt-IN transfers
+//   * Mass Storage (bulk-only, SCSI): INQUIRY, READ CAPACITY(10), READ(10) -- read-only raw sector access
+// Not supported: USB hubs (the two root ports only), isochronous transfers, EHCI/xHCI-only machines.
+// Hardware access is behind uh_r16/uh_w16/uh_r32/uh_w32/uh_find (usbhw.kc on the real machine, tests/host/usb_host.kc in the
+// host tests, which simulate a controller with devices behind it).  All memory the controller touches comes from one kmalloc'd
+// block; "physical" = virtual - usb_dma_off (0 on the real machine, where memory is identity mapped).
+// Needs: kmalloc, pit_sleep_ms, ticks, kb_push, mouse_push (input.kc / hw.kc / mm.kc), kb_shift/kb_ctrl/kb_alt/kb_caps.
+
+const UH_CMD = 0x00; const UH_STS = 0x02; const UH_INTR = 0x04; const UH_FRNUM = 0x06; const UH_FRBASE = 0x08; const UH_SOF = 0x0C; const UH_PORT = 0x10;
+const UD_MAX = 8;
+const UK_NONE = 0; const UK_KBD = 1; const UK_MOUSE = 2; const UK_TABLET = 3; const UK_STORAGE = 4; const UK_OTHER = 5;
+
+var usb_ok = false;                 // a controller was found and started
+var usb_io = 0;                     // its I/O base
+var usb_dma_off = 0;
+var usb_nports = 0;
+var usb_note: u8[48];               // short status text for the Settings app
+var ub_fl = 0; var ub_qh = 0; var ub_td = 0; var ub_buf = 0;   // frame list, queue heads, transfer descriptors, buffers (virtual addresses)
+var uc_ls = false;                  // the transfer being built goes to a low-speed device
+var ut_tag = 1;
+
+var ud_kind: int[8];                // UK_* (0 = free)
+var ud_addr: int[8]; var ud_ls: int[8]; var ud_mps: int[8]; var ud_port: int[8];
+var ud_vid: int[8]; var ud_pid: int[8];
+var ud_ep: int[8]; var ud_epmps: int[8];       // HID: interrupt-IN endpoint; storage: bulk-IN endpoint
+var ud_ep2: int[8]; var ud_ep2mps: int[8];     // storage: bulk-OUT endpoint
+var ud_tog: int[8]; var ud_tog2: int[8];
+var ud_slot: int[8]; var ud_fail: int[8];
+var ud_blocks: int[8]; var ud_bsize: int[8];
+var ud_name: u8[192];
+var usb_port_dev: int[4];           // port -> device index (-1 none)
+var usb_last_scan = 0;
+var usb_ms = -1;                    // the first storage device
+var uk_prev: u8[8]; var uk_held = 0; var uk_next = 0;
+var utab_x = -1; var utab_y = -1; var utab_b = -1;
+var usb_rx_reports = 0;             // statistics: HID reports handled
+
+fn uw32(p: int, v: int) { *(p as *u32) = v as u32; }
+fn ur32(p: int) -> int { return *(p as *u32) as int; }
+fn upa(p: int) -> int { return p - usb_dma_off; }
+fn ud_tdp(i: int) -> int { return ub_td + i * 32; }
+fn ud_namep(i: int) -> *u8 { return &ud_name[i * 24]; }
+fn usb_say(s: *u8) { kstrncpy(&usb_note[0], s, 48); }
+
+fn usb_kind_name(k: int) -> *u8 {
+    if (k == UK_KBD) { return "Keyboard"; }
+    if (k == UK_MOUSE) { return "Mouse"; }
+    if (k == UK_TABLET) { return "Tablet"; }
+    if (k == UK_STORAGE) { return "Storage"; }
+    return "Device";
+}
+fn usb_count() -> int {
+    var n = 0; var i = 0;
+    while (i < UD_MAX) { if (ud_kind[i] != 0) { n++; } i++; }
+    return n;
+}
+/// the k-th present device (0-based), or -1
+fn usb_nth(k: int) -> int {
+    var n = 0; var i = 0;
+    while (i < UD_MAX) { if (ud_kind[i] != 0) { if (n == k) { return i; } n++; } i++; }
+    return -1;
+}
+
+// ---------------------------------------------------------------- transfers
+fn uh_wait_frame() {
+    let f = uh_r16(UH_FRNUM) & 0x7FF;
+    var s = 0;
+    while (s < 20000 && (uh_r16(UH_FRNUM) & 0x7FF) == f) { s++; }
+}
+
+/// build TD i of the chain being prepared
+fn utd_make(i: int, last: bool, pid: int, dev: int, ep: int, tog: int, len: int, buf: int) {
+    let t = ud_tdp(i);
+    var link = 1;
+    if (!last) { link = upa(ud_tdp(i + 1)) | 4; }                       // depth first: the whole chain runs in one frame
+    uw32(t, link);
+    var st = 0x00800000 | 0x18000000;                                   // active, three error retries
+    if (uc_ls) { st = st | 0x04000000; }
+    uw32(t + 4, st);
+    var ml = 0x7FF;
+    if (len > 0) { ml = len - 1; }
+    uw32(t + 8, (ml << 21) | (tog << 19) | (ep << 15) | (dev << 8) | pid);
+    uw32(t + 12, buf);
+}
+
+/// run TDs 0..n-1 through the control queue head; 0 = all done, -1 = timed out, -2 = error / stall
+fn uh_run(n: int) -> int {
+    let q = ub_qh + 3 * 16;
+    uw32(q + 4, upa(ud_tdp(0)));
+    var frames = 0; var res = -1;
+    while (frames < 800) {
+        uh_r16(UH_STS);
+        var i = 0; var act = false; var err = false;
+        while (i < n && !act && !err) {
+            let s = ur32(ud_tdp(i) + 4);
+            if ((s & 0x760000) != 0) { err = true; }
+            else if ((s & 0x800000) != 0) { act = true; }
+            i++;
+        }
+        if (err) { res = -2; break; }
+        if (!act) { res = 0; break; }
+        uh_wait_frame();
+        frames++;
+    }
+    uw32(q + 4, 1);
+    return res;
+}
+
+/// control transfer on endpoint 0 of device `addr`; data (if any) travels through the bounce buffer ub_buf + 256
+fn usb_ctrl(addr: int, ls: bool, mps: int, rt: int, rq: int, val: int, idx: int, len: int) -> int {
+    uc_ls = ls;
+    let sp = ub_buf;
+    let b = sp as *u8;
+    b[0] = rt as u8; b[1] = rq as u8; b[2] = (val & 255) as u8; b[3] = (val >> 8) as u8;
+    b[4] = (idx & 255) as u8; b[5] = (idx >> 8) as u8; b[6] = (len & 255) as u8; b[7] = (len >> 8) as u8;
+    let din = (rt & 0x80) != 0;
+    let nd = (len + mps - 1) / mps;
+    if (nd > 60) { return -2; }
+    utd_make(0, false, 0x2D, addr, 0, 0, 8, upa(sp));
+    var i = 0; var tog = 1;
+    while (i < nd) {
+        var c = len - i * mps;
+        if (c > mps) { c = mps; }
+        var pid = 0xE1;
+        if (din) { pid = 0x69; }
+        utd_make(1 + i, false, pid, addr, 0, tog, c, upa(ub_buf + 256 + i * mps));
+        tog = tog ^ 1;
+        i++;
+    }
+    var spid = 0x69;
+    if (din) { spid = 0xE1; }
+    utd_make(1 + nd, true, spid, addr, 0, 1, 0, 0);
+    return uh_run(2 + nd);
+}
+
+/// bulk transfer of len bytes at the bounce buffer ub_buf + off on endpoint ep of device d; updates the data toggle
+fn usb_bulk(d: int, din: bool, off: int, len: int) -> int {
+    uc_ls = false;
+    var ep = ud_ep2[d]; var mps = ud_ep2mps[d]; var tog = ud_tog2[d];
+    var pid = 0xE1;
+    if (din) { ep = ud_ep[d]; mps = ud_epmps[d]; tog = ud_tog[d]; pid = 0x69; }
+    if (mps < 8) { return -2; }
+    var n = (len + mps - 1) / mps;
+    if (n < 1) { n = 1; }
+    if (n > 60) { return -2; }
+    var i = 0; var t = tog;
+    while (i < n) {
+        var c = len - i * mps;
+        if (c > mps) { c = mps; }
+        if (c < 0) { c = 0; }
+        utd_make(i, i == n - 1, pid, ud_addr[d], ep, t, c, upa(ub_buf + off + i * mps));
+        t = t ^ 1;
+        i++;
+    }
+    let r = uh_run(n);
+    if (r == 0) { if (din) { ud_tog[d] = t; } else { ud_tog2[d] = t; } }
+    return r;
+}
+
+// ---------------------------------------------------------------- mass storage (bulk-only transport)
+/// one SCSI command: cdb at ub_buf + 600 ... data through ub_buf + 256 (dlen <= 2048).  0 = good, 1 = command failed, <0 = transport error
+fn usb_scsi(d: int, cdb: *u8, cl: int, dlen: int, din: bool) -> int {
+    let w = ub_buf + 16;
+    let b = w as *u8;
+    kmemset(b, 0, 32);
+    uw32(w, 0x43425355); uw32(w + 4, ut_tag); ut_tag++;
+    uw32(w + 8, dlen);
+    if (din) { b[12] = 0x80; }
+    b[14] = cl as u8;
+    var i = 0;
+    while (i < cl) { b[15 + i] = cdb[i]; i++; }
+    // the CBW travels from ub_buf + 16 (offset 16 of the buffer)
+    var r = usb_bulk(d, false, 16, 31);
+    if (r != 0) { return -1; }
+    if (dlen > 0) {
+        r = usb_bulk(d, din, 256, dlen);
+        if (r != 0) { return -2; }
+    }
+    r = usb_bulk(d, true, 64, 13);
+    if (r != 0) { return -3; }
+    let c = (ub_buf + 64) as *u8;
+    if (ur32(ub_buf + 64) != 0x53425355) { return -4; }
+    if (c[12] != 0) { return 1; }
+    return 0;
+}
+
+fn usb_ms_probe(d: int) {
+    var cdb: u8[16];
+    var k = 0;
+    while (k < 3) {                                                      // TEST UNIT READY (units often report "not ready" first)
+        kmemset(&cdb[0], 0, 16);
+        if (usb_scsi(d, &cdb[0], 6, 0, false) == 0) { break; }
+        k++;
+    }
+    kmemset(&cdb[0], 0, 16);
+    cdb[0] = 0x12; cdb[4] = 36;
+    let nm = ud_namep(d);
+    kstrncpy(nm, "USB storage", 24);
+    if (usb_scsi(d, &cdb[0], 6, 36, true) == 0) {
+        let p = (ub_buf + 256) as *u8;
+        var n = 0; var i = 8;
+        while (i < 32 && n < 23) {                                       // vendor + product, runs of blanks squeezed
+            let ch = p[i] as int;
+            if (ch >= 33 && ch < 127) { nm[n] = ch as u8; n++; }
+            else if (n > 0 && nm[n - 1] != ' ') { nm[n] = ' '; n++; }
+            i++;
+        }
+        while (n > 0 && nm[n - 1] == ' ') { n--; }
+        nm[n] = 0;
+        if (n == 0) { kstrncpy(nm, "USB storage", 24); }
+    }
+    kmemset(&cdb[0], 0, 16);
+    cdb[0] = 0x25;
+    ud_blocks[d] = 0; ud_bsize[d] = 0;
+    if (usb_scsi(d, &cdb[0], 10, 8, true) == 0) {
+        let p = (ub_buf + 256) as *u8;
+        let last = ((p[0] as int) << 24) | ((p[1] as int) << 16) | ((p[2] as int) << 8) | (p[3] as int);
+        ud_bsize[d] = ((p[4] as int) << 24) | ((p[5] as int) << 16) | ((p[6] as int) << 8) | (p[7] as int);
+        ud_blocks[d] = last + 1;
+    }
+}
+
+/// read `count` sectors starting at lba from the first USB disk into out; false on any error
+fn usb_ms_read(lba: int, count: int, out: *u8) -> bool {
+    let d = usb_ms;
+    if (d < 0 || ud_kind[d] != UK_STORAGE || ud_bsize[d] != 512 || lba < 0 || lba + count > ud_blocks[d]) { return false; }
+    var done = 0;
+    var cdb: u8[16];
+    while (done < count) {
+        var c = count - done;
+        if (c > 4) { c = 4; }
+        kmemset(&cdb[0], 0, 16);
+        let l = lba + done;
+        cdb[0] = 0x28;
+        cdb[2] = (l >> 24) as u8; cdb[3] = (l >> 16) as u8; cdb[4] = (l >> 8) as u8; cdb[5] = l as u8;
+        cdb[7] = (c >> 8) as u8; cdb[8] = c as u8;
+        if (usb_scsi(d, &cdb[0], 10, c * 512, true) != 0) { return false; }
+        kmemcpy(out + done * 512, (ub_buf + 256) as *u8, c * 512);
+        done = done + c;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- HID
+fn uhid_arm(d: int) {
+    let s = ud_slot[d];
+    let t = ud_tdp(93 + s);
+    uc_ls = ud_ls[d] != 0;
+    var st = 0x00800000 | 0x18000000;
+    if (ud_ls[d] != 0) { st = st | 0x04000000; }
+    var ml = ud_epmps[d];
+    if (ml > 8) { ml = 8; }
+    uw32(t, 1);
+    uw32(t + 4, st);
+    uw32(t + 8, ((ml - 1) << 21) | (ud_tog[d] << 19) | (ud_ep[d] << 15) | (ud_addr[d] << 8) | 0x69);
+    uw32(t + 12, upa(ub_buf + 3072 + s * 16));
+    uw32(ub_qh + s * 16 + 4, upa(t));
+}
+
+fn uhid_disarm(d: int) { uw32(ub_qh + ud_slot[d] * 16 + 4, 1); }
+
+/// HID usage -> the character the PS/2 driver would have produced (0 = none)
+fn uk_char(u: int) -> int {
+    var c = 0;
+    if (u >= 4 && u <= 29) {
+        c = 'a' + (u - 4);
+        if (kb_shift != kb_caps) { c = c - 32; }
+        if (kb_ctrl) { c = c & 0x1F; }
+        return c;
+    }
+    if (u >= 30 && u <= 39) {
+        let dg = "1234567890"; let ds = "!@#$%^&*()";
+        if (kb_shift) { return ds[u - 30] as int; }
+        return dg[u - 30] as int;
+    }
+    if (u >= 45 && u <= 56) {
+        let ps = "-=[]\\#;'`,./"; let pu = "_+{}|~:\"~<>?";
+        if (kb_shift) { return pu[u - 45] as int; }
+        return ps[u - 45] as int;
+    }
+    if (u == 40) { return 10; }
+    if (u == 41) { return 27; }
+    if (u == 42) { return 8; }
+    if (u == 43) { return 9; }
+    if (u == 44) { return ' '; }
+    if (u == 79) { return KEY_RIGHT; }
+    if (u == 80) { return KEY_LEFT; }
+    if (u == 81) { return KEY_DOWN; }
+    if (u == 82) { return KEY_UP; }
+    if (u == 74) { return KEY_HOME; }
+    if (u == 75) { return KEY_PGUP; }
+    if (u == 76) { return KEY_DEL; }
+    if (u == 77) { return KEY_END; }
+    if (u == 78) { return KEY_PGDN; }
+    return 0;
+}
+
+fn uk_press(u: int) {
+    if (u == 57) { kb_caps = !kb_caps; return; }
+    let c = uk_char(u);
+    if (c != 0) { kb_push(c); }
+}
+
+fn uk_report(p: *u8) {
+    let m = p[0] as int;
+    kb_shift = (m & 0x22) != 0; kb_ctrl = (m & 0x11) != 0; kb_alt = (m & 0x44) != 0;
+    var newest = 0;
+    var j = 2;
+    while (j < 8) {
+        let u = p[j] as int;
+        if (u >= 4) {
+            var had = false; var q = 2;
+            while (q < 8) { if ((uk_prev[q] as int) == u) { had = true; } q++; }
+            if (!had) { uk_press(u); newest = u; }
+        }
+        j++;
+    }
+    var still = false;
+    j = 2;
+    while (j < 8) { if (uk_held != 0 && (p[j] as int) == uk_held) { still = true; } j++; }
+    if (newest != 0) { uk_held = newest; uk_next = ticks + 40; }
+    else if (!still) { uk_held = 0; }
+    j = 0;
+    while (j < 8) { uk_prev[j] = p[j]; j++; }
+}
+
+fn usb_sbyte(v: int) -> int { if (v > 127) { return v - 256; } return v; }
+
+fn uhid_report(d: int, p: *u8, n: int) {
+    usb_rx_reports++;
+    let k = ud_kind[d];
+    if (k == UK_KBD) { if (n >= 3) { uk_report(p); } return; }
+    if (k == UK_MOUSE) {
+        if (n < 3) { return; }
+        mouse_push(usb_sbyte(p[1] as int), usb_sbyte(p[2] as int), (p[0] as int) & 7);
+        if (n >= 4) { let wh = usb_sbyte(p[3] as int); if (wh != 0) { mouse_wheel = mouse_wheel - wh; } }
+        return;
+    }
+    if (k == UK_TABLET && n >= 5) {
+        let x = (p[1] as int) | ((p[2] as int) << 8);
+        let y = (p[3] as int) | ((p[4] as int) << 8);
+        let b = (p[0] as int) & 7;
+        if (x != utab_x || y != utab_y || b != utab_b) {
+            utab_x = x; utab_y = y; utab_b = b;
+            mouse_push(x * mouse_w / 32768 - mouse_x, y * mouse_h / 32768 - mouse_y, b);
+        }
+        if (n >= 6) { let wh = usb_sbyte(p[5] as int); if (wh != 0) { mouse_wheel = mouse_wheel - wh; } }
+    }
+}
+
+// ---------------------------------------------------------------- enumeration
+fn usb_free_dev(d: int) {
+    if (ud_kind[d] == UK_KBD || ud_kind[d] == UK_MOUSE || ud_kind[d] == UK_TABLET) { uhid_disarm(d); }
+    if (ud_kind[d] == UK_KBD) { uk_held = 0; kmemset(&uk_prev[0], 0, 8); }
+    ud_kind[d] = 0;
+    if (usb_ms == d) {
+        usb_ms = -1;
+        var i = 0;
+        while (i < UD_MAX) { if (ud_kind[i] == UK_STORAGE) { usb_ms = i; } i++; }
+    }
+}
+
+fn usb_hid_slot_free() -> int {
+    var s = 0;
+    while (s < 3) {
+        var used = false; var i = 0;
+        while (i < UD_MAX) { if (ud_kind[i] != 0 && ud_kind[i] != UK_STORAGE && ud_kind[i] != UK_OTHER && ud_slot[i] == s) { used = true; } i++; }
+        if (!used) { return s; }
+        s++;
+    }
+    return -1;
+}
+
+/// reset the port, address and configure whatever is plugged in; true when a device was added
+fn usb_enum(port: int) -> bool {
+    let reg = UH_PORT + port * 2;
+    if ((uh_r16(reg) & 1) == 0) { return false; }
+    uh_w16(reg, 0x200);                                                  // port reset
+    pit_sleep_ms(50);
+    uh_w16(reg, 0);
+    pit_sleep_ms(10);
+    uh_w16(reg, 0x4);                                                    // enable
+    pit_sleep_ms(10);
+    uh_w16(reg, 0x0E);                                                   // clear the change bits
+    let st = uh_r16(reg);
+    if ((st & 1) == 0 || (st & 4) == 0) { return false; }
+    let ls = (st & 0x100) != 0;
+    var d = 0;
+    while (d < UD_MAX && ud_kind[d] != 0) { d++; }
+    if (d == UD_MAX) { return false; }
+    var mps = 8;
+    if (usb_ctrl(0, ls, 8, 0x80, 6, 0x0100, 0, 8) != 0) { return false; }
+    mps = (*((ub_buf + 256 + 7) as *u8)) as int;
+    if (mps != 8 && mps != 16 && mps != 32 && mps != 64) { mps = 8; }
+    if (ls) { mps = 8; }
+    let addr = port + 1;
+    if (usb_ctrl(0, ls, mps, 0x00, 5, addr, 0, 0) != 0) { return false; }
+    pit_sleep_ms(10);
+    if (usb_ctrl(addr, ls, mps, 0x80, 6, 0x0100, 0, 18) != 0) { return false; }
+    let dv = (ub_buf + 256) as *u8;
+    ud_vid[d] = (dv[8] as int) | ((dv[9] as int) << 8);
+    ud_pid[d] = (dv[10] as int) | ((dv[11] as int) << 8);
+    if (usb_ctrl(addr, ls, mps, 0x80, 6, 0x0200, 0, 9) != 0) { return false; }
+    let cf = (ub_buf + 256) as *u8;
+    var total = (cf[2] as int) | ((cf[3] as int) << 8);
+    let cfgval = cf[5] as int;
+    if (total > 255) { total = 255; }
+    if (total < 9) { return false; }
+    if (usb_ctrl(addr, ls, mps, 0x80, 6, 0x0200, 0, total) != 0) { return false; }
+    // walk the descriptors: first interface of interest + its endpoints
+    var icls = -1; var isub = 0; var ipro = 0; var inum = 0;
+    var epi = 0; var epim = 0; var bi = 0; var bim = 0; var bo = 0; var bom = 0;
+    var o = 0;
+    while (o + 2 <= total) {
+        let l = cf[o] as int;
+        let t = cf[o + 1] as int;
+        if (l < 2) { break; }
+        if (t == 4 && icls < 0) { icls = cf[o + 5] as int; isub = cf[o + 6] as int; ipro = cf[o + 7] as int; inum = cf[o + 2] as int; }
+        else if (t == 5 && icls >= 0 && l >= 7) {
+            let ea = cf[o + 2] as int; let at = (cf[o + 3] as int) & 3;
+            let em = (cf[o + 4] as int) | ((cf[o + 5] as int) << 8);
+            if (at == 3 && (ea & 0x80) != 0 && epi == 0) { epi = ea & 15; epim = em; }
+            if (at == 2 && (ea & 0x80) != 0 && bi == 0) { bi = ea & 15; bim = em; }
+            if (at == 2 && (ea & 0x80) == 0 && bo == 0) { bo = ea & 15; bom = em; }
+        }
+        o = o + l;
+    }
+    ud_addr[d] = addr; ud_ls[d] = 0; if (ls) { ud_ls[d] = 1; }
+    ud_mps[d] = mps; ud_port[d] = port; ud_tog[d] = 0; ud_tog2[d] = 0; ud_fail[d] = 0; ud_slot[d] = 0;
+    ud_blocks[d] = 0; ud_bsize[d] = 0;
+    let nm = ud_namep(d);
+    var kind = UK_OTHER;
+    if (icls == 3 && epi != 0) {
+        if (ipro == 1) { kind = UK_KBD; kstrncpy(nm, "USB keyboard", 24); }
+        else if (ipro == 2) { kind = UK_MOUSE; kstrncpy(nm, "USB mouse", 24); }
+        else { kind = UK_TABLET; kstrncpy(nm, "USB tablet", 24); }
+    } else if (icls == 8 && isub == 6 && ipro == 0x50 && bi != 0 && bo != 0) {
+        kind = UK_STORAGE; kstrncpy(nm, "USB storage", 24);
+    } else { kstrncpy(nm, "USB device", 24); }
+    if (usb_ctrl(addr, ls, mps, 0x00, 9, cfgval, 0, 0) != 0) { return false; }
+    if (kind == UK_KBD || kind == UK_MOUSE || kind == UK_TABLET) {
+        let s = usb_hid_slot_free();
+        if (s < 0) { kind = UK_OTHER; kstrncpy(nm, "USB device", 24); }
+        else {
+            ud_slot[d] = s; ud_ep[d] = epi; ud_epmps[d] = epim;
+            if (isub == 1) { usb_ctrl(addr, ls, mps, 0x21, 0x0B, 0, inum, 0); }     // boot protocol
+            usb_ctrl(addr, ls, mps, 0x21, 0x0A, 0, inum, 0);                       // idle: only report changes (may STALL: ignored)
+        }
+    }
+    if (kind == UK_STORAGE) { ud_ep[d] = bi; ud_epmps[d] = bim; ud_ep2[d] = bo; ud_ep2mps[d] = bom; }
+    ud_kind[d] = kind;
+    usb_port_dev[port] = d;
+    if (kind == UK_STORAGE) { usb_ms_probe(d); if (usb_ms < 0) { usb_ms = d; } }
+    if (kind == UK_KBD || kind == UK_MOUSE || kind == UK_TABLET) { uhid_arm(d); }
+    klog("USB device added");
+    return true;
+}
+
+fn usb_scan_ports() {
+    var p = 0;
+    while (p < usb_nports) {
+        let reg = UH_PORT + p * 2;
+        let st = uh_r16(reg);
+        if ((st & 2) != 0) {                                             // connect status changed
+            uh_w16(reg, 0x0E);
+            let d = usb_port_dev[p];
+            if (d >= 0) { usb_free_dev(d); usb_port_dev[p] = -1; klog("USB device removed"); }
+            if ((st & 1) != 0) { usb_enum(p); }
+        }
+        p++;
+    }
+    var n = usb_count();
+    if (n == 0) { usb_say("No USB devices connected"); }
+    else { usb_say("USB ready"); }
+}
+
+// ---------------------------------------------------------------- start-up and the polling entry point
+fn usb_init() -> bool {
+    usb_ok = false; usb_ms = -1;
+    var i = 0;
+    while (i < UD_MAX) { ud_kind[i] = 0; i++; }
+    i = 0;
+    while (i < 4) { usb_port_dev[i] = -1; i++; }
+    usb_say("No USB controller found");
+    if (!uh_find()) { return false; }
+    let raw = kzalloc(24576) as int;
+    if (raw == 0) { usb_say("Out of memory"); return false; }
+    ub_fl = (raw + 4095) & ~4095;
+    ub_qh = ub_fl + 4096;
+    ub_td = ub_qh + 64;
+    ub_buf = ub_fl + 8192;
+    // controller reset
+    uh_w16(UH_CMD, 4);
+    pit_sleep_ms(20);
+    uh_w16(UH_CMD, 0);
+    pit_sleep_ms(5);
+    uh_w16(UH_CMD, 2);
+    var t = 0;
+    while (t < 100 && (uh_r16(UH_CMD) & 2) != 0) { pit_sleep_ms(1); t++; }
+    if ((uh_r16(UH_CMD) & 2) != 0) { usb_say("Controller reset failed"); return false; }
+    // schedule: frame list -> three HID queue heads -> the control queue head
+    i = 0;
+    while (i < 3) { uw32(ub_qh + i * 16, upa(ub_qh + (i + 1) * 16) | 2); uw32(ub_qh + i * 16 + 4, 1); i++; }
+    uw32(ub_qh + 48, 1); uw32(ub_qh + 52, 1);
+    i = 0;
+    while (i < 1024) { uw32(ub_fl + i * 4, upa(ub_qh) | 2); i++; }
+    uh_w16(UH_INTR, 0);
+    uh_w16(UH_STS, 0x3F);
+    uh_w16(UH_FRNUM, 0);
+    uh_w32(UH_FRBASE, upa(ub_fl));
+    uh_w16(UH_SOF, 0x40);
+    uh_w16(UH_CMD, 0xC1);                                                // run, configured, 64-byte max packets
+    pit_sleep_ms(5);
+    if ((uh_r16(UH_STS) & 0x20) != 0) { usb_say("Controller did not start"); return false; }
+    usb_nports = 0;
+    while (usb_nports < 4) {
+        let v = uh_r16(UH_PORT + usb_nports * 2);
+        if (v == 0xFFFF || (v & 0x80) == 0) { break; }
+        usb_nports++;
+    }
+    usb_ok = true;
+    klog("USB controller ready");
+    var p = 0;
+    while (p < usb_nports) { usb_enum(p); uh_w16(UH_PORT + p * 2, 0x0E); p++; }
+    if (usb_count() == 0) { usb_say("No USB devices connected"); } else { usb_say("USB ready"); }
+    return true;
+}
+
+/// called every pass of the main loop: collect HID reports, repeat held keys, look for plugged / unplugged devices
+fn usb_poll() {
+    if (!usb_ok) { return; }
+    uh_r16(UH_STS);
+    var d = 0;
+    while (d < UD_MAX) {
+        let k = ud_kind[d];
+        if (k == UK_KBD || k == UK_MOUSE || k == UK_TABLET) {
+            let t = ud_tdp(93 + ud_slot[d]);
+            let s = ur32(t + 4);
+            if ((s & 0x800000) == 0) {
+                if ((s & 0x760000) != 0) {
+                    ud_fail[d]++;
+                    if (ud_fail[d] < 20) { uhid_arm(d); }                // retry; a device that keeps failing is left alone
+                } else {
+                    ud_fail[d] = 0;
+                    let n = ((s + 1) & 0x7FF);
+                    uhid_report(d, (ub_buf + 3072 + ud_slot[d] * 16) as *u8, n);
+                    ud_tog[d] = ud_tog[d] ^ 1;
+                    uhid_arm(d);
+                }
+            }
+        }
+        d++;
+    }
+    if (uk_held != 0 && ticks >= uk_next) { uk_press(uk_held); uk_next = ticks + 3; }
+    if (ticks - usb_last_scan >= 100) { usb_last_scan = ticks; usb_scan_ports(); }
+}

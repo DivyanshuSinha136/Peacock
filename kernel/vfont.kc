@@ -1,0 +1,238 @@
+// vfont.kc -- vector fonts for the whole UI.  Author: Divyanshu Sinha (MIT License)
+//
+// The fonts are SVG fonts (SVG 1.1 <font> / <glyph unicode horiz-adv-x d>, one file per face in assets/fonts/*.svg, converted from
+// OFL / Bitstream-Vera-licensed typefaces by tools/mkfonts.py and packed into fontdata.kc).  Glyph outlines are parsed by the SVG
+// path code in svg.kc and rasterised with anti-aliasing at the requested pixel size; every glyph is rendered once per size and
+// cached as an 8-bit coverage mask.  vf_cur selects the UI font (0 = the classic 8x16 bitmap font); the monospace face is always
+// used for grid text (terminal, editor, big calculator digits), which keeps those layouts aligned.
+
+const VF_MONO = 4;                    // index of the monospace face in fontdata.kc
+const VF_NSIZE = 12;                  // different pixel sizes cached per font
+const VF_BASE = 12;                   // baseline offset inside a 16 px text line
+
+var vf_cur = 1;                       // 0 classic bitmap, n = vector font n-1 (Inter by default)
+var vf_ok = false;
+var vf_loaded: int[8];
+var vf_upem: int[8]; var vf_asc: int[8]; var vf_desc: int[8];
+var vf_goff: *int;                    // [font * 96 + ch - 32] offset of the <glyph> tag in the source (-1: none)
+var vf_gadv: *int;                    // advance in font units
+var vf_sizes: int[12]; var vf_nsz = 0;
+var vf_cbm: *int;                     // glyph cache, slot = (font * VF_NSIZE + size index) * 96 + ch - 32
+var vf_cw: *int; var vf_ch: *int; var vf_cbase: *int;     // bitmap width / height / baseline row (w = 0: not rendered yet, -1: empty)
+var vf_tmp: *u32;                     // scratch ARGB bitmap for rendering one glyph
+const VF_TMP_PX = 9000;               // 90 x 100 pixels
+
+fn vf_init() -> bool {
+    if (vf_ok) { return true; }
+    let n = VF_N * 96;
+    let c = VF_N * VF_NSIZE * 96;
+    vf_goff = kmalloc(n * 8) as *int; vf_gadv = kmalloc(n * 8) as *int;
+    vf_cbm = kzalloc(c * 8) as *int; vf_cw = kzalloc(c * 8) as *int; vf_ch = kzalloc(c * 8) as *int; vf_cbase = kzalloc(c * 8) as *int;
+    vf_tmp = kmalloc(VF_TMP_PX * 4) as *u32;
+    if (vf_goff == (0 as *int) || vf_gadv == (0 as *int) || vf_cbm == (0 as *int) || vf_cw == (0 as *int) || vf_ch == (0 as *int)
+        || vf_cbase == (0 as *int) || vf_tmp == (0 as *u32)) { return false; }
+    var i = 0;
+    while (i < n) { vf_goff[i] = -1; vf_gadv[i] = 0; i++; }
+    vf_ok = sv_init();
+    return vf_ok;
+}
+
+/// index the glyphs of font f (once)
+fn vf_load(f: int) {
+    if (vf_loaded[f] != 0) { return; }
+    vf_loaded[f] = 1;
+    let src = vf_src(f);
+    sv_s = src;
+    vf_upem[f] = 1000; vf_asc[f] = 900; vf_desc[f] = 250;
+    var i = 0;
+    while (sv_ch(i) != 0) {
+        if (sv_ch(i) == 60) {
+            sv_ts = i;
+            var j = i;
+            while (sv_ch(j) != 0 && sv_ch(j) != 62) { j++; }
+            sv_te = j;
+            if (sv_tag_is("font-face")) {
+                vf_upem[f] = sv_num_attr("units-per-em", 1000 * 1024) / 1024;
+                vf_asc[f] = sv_num_attr("ascent", 900 * 1024) / 1024;
+                vf_desc[f] = sv_num_attr("descent", 250 * 1024) / 1024;
+            } else if (sv_tag_is("glyph")) {
+                if (sv_attr("unicode")) {
+                    var cp = sv_val[0] as int;
+                    if (cp == 38 && (sv_val[1] as int) == 35) {                // "&#NN;"
+                        cp = 0; var k = 2;
+                        while (sv_dig(sv_val[k] as int)) { cp = cp * 10 + (sv_val[k] as int) - 48; k++; }
+                    }
+                    if (cp >= 32 && cp <= 126) {
+                        vf_goff[f * 96 + cp - 32] = i;
+                        vf_gadv[f * 96 + cp - 32] = sv_num_attr("horiz-adv-x", 600 * 1024) / 1024;
+                    }
+                }
+            }
+            i = j;
+            if (sv_ch(i) == 0) { break; }
+        }
+        i++;
+    }
+}
+
+fn vf_size_idx(size: int) -> int {
+    var i = 0;
+    while (i < vf_nsz) { if (vf_sizes[i] == size) { return i; } i++; }
+    if (vf_nsz >= VF_NSIZE) { return -1; }
+    vf_sizes[vf_nsz] = size; vf_nsz++;
+    return vf_nsz - 1;
+}
+
+/// advance of character ch of font f at `size` px, in 1/256 pixel
+fn vf_adv8(f: int, ch: int, size: int) -> int {
+    var c = ch;
+    if (c < 32 || c > 126) { c = 63; }
+    return vf_gadv[f * 96 + c - 32] * size * 256 / vf_upem[f];
+}
+
+/// rasterise one glyph into the cache; returns the slot (or -1 when it cannot be cached)
+fn vf_glyph(f: int, ch: int, size: int) -> int {
+    var c = ch;
+    if (c < 32 || c > 126) { c = 63; }
+    let si = vf_size_idx(size);
+    if (si < 0) { return -1; }
+    let slot = (f * VF_NSIZE + si) * 96 + c - 32;
+    if (vf_cw[slot] != 0) { return slot; }
+    let off = vf_goff[f * 96 + c - 32];
+    let asc = vf_asc[f]; let upem = vf_upem[f];
+    let w = vf_gadv[f * 96 + c - 32] * size / upem + 5;
+    let h = (asc + vf_desc[f]) * size / upem + 4;
+    if (off < 0 || w * h > VF_TMP_PX) { vf_cw[slot] = -1; return slot; }
+    // render with the SVG path code (glyph mode: font units -> pixels, y flipped)
+    sv_s = vf_src(f);
+    sv_ts = off; var j = off;
+    while (sv_ch(j) != 0 && sv_ch(j) != 62) { j++; }
+    sv_te = j;
+    var i = 0;
+    while (i < w * h) { vf_tmp[i] = 0; i++; }
+    sv_out = vf_tmp; sv_bw = w; sv_bh = h; sv_gsz = size; sv_gupem = upem; sv_gasc = asc; sv_gm = 1;
+    sv_np = 0; sv_sn = 0;
+    if (sv_attr("d")) { sv_path(); }
+    if (sv_np > 0) { sv_fill_edges(); sv_pk = 1; sv_pc = 0xFFFFFF; sv_eop = 256; sv_raster(); }
+    sv_gm = 0;
+    let bm = kmalloc(w * h);
+    if (bm == (0 as *u8)) { vf_cw[slot] = -1; return slot; }
+    i = 0;
+    while (i < w * h) { bm[i] = ((vf_tmp[i] as int) >> 24) as u8; i++; }
+    vf_cbm[slot] = bm as int; vf_cw[slot] = w; vf_ch[slot] = h; vf_cbase[slot] = asc * size / upem + 1;
+    return slot;
+}
+
+/// blit a cached glyph with its pen position at x and its baseline at y
+fn vf_blit(slot: int, x: int, y: int, fg: int) {
+    let w = vf_cw[slot];
+    if (w <= 0) { return; }
+    let h = vf_ch[slot];
+    let bm = vf_cbm[slot] as *u8;
+    let left = x - 1; let top = y - vf_cbase[slot];
+    if (left >= clip_x1 || left + w <= clip_x0 || top >= clip_y1 || top + h <= clip_y0) { return; }
+    var row = 0;
+    while (row < h) {
+        let yy = top + row;
+        if (yy >= clip_y0 && yy < clip_y1) {
+            var col = 0;
+            while (col < w) {
+                let xx = left + col;
+                if (xx >= clip_x0 && xx < clip_x1) {
+                    let a = bm[row * w + col] as int;
+                    if (a > 0) {
+                        let o = yy * fb_w + xx;
+                        if (a >= 250) { bb[o] = p64(fg) as u64; }
+                        else { bb[o] = mixp(bb[o] as int, fg, a) as u64; }
+                    }
+                }
+                col++;
+            }
+        }
+        row++;
+    }
+}
+
+/// draw up to n characters (n < 0: all) of s with font f at `size`; (x, y) is the top of a 16 px line; returns the x after the text
+fn vf_text(f: int, size: int, x: int, y: int, s: *u8, n: int, fg: int) -> int {
+    if (!vf_init()) { vf_cur = 0; return draw_text(x, y, s, fg); }      // out of memory: fall back to the bitmap font
+    vf_load(f);
+    var pen = x * 256;
+    var i = 0;
+    while (s[i] != 0 && (n < 0 || i < n)) {
+        let ch = s[i] as int;
+        if (ch != 32) {
+            let slot = vf_glyph(f, ch, size);
+            if (slot >= 0) { vf_blit(slot, (pen + 128) >> 8, y + VF_BASE, fg); }
+        }
+        pen = pen + vf_adv8(f, ch, size);
+        i++;
+    }
+    return (pen + 128) >> 8;
+}
+
+fn vf_width(f: int, size: int, s: *u8) -> int {
+    if (!vf_init()) { return kstrlen(s) * 8; }
+    vf_load(f);
+    var pen = 0;
+    var i = 0;
+    while (s[i] != 0) { pen = pen + vf_adv8(f, s[i] as int, size); i++; }
+    return (pen + 128) >> 8;
+}
+
+/// one monospace glyph in an 8 px grid cell
+fn vf_cell(x: int, y: int, ch: int, fg: int) {
+    if (ch == 32) { return; }
+    if (!vf_init()) { vf_cur = 0; draw_char_bm(x, y, ch, fg); return; }
+    vf_load(VF_MONO);
+    let size = vf_px(VF_MONO);
+    let slot = vf_glyph(VF_MONO, ch, size);
+    if (slot >= 0) { vf_blit(slot, x, y + VF_BASE, fg); }
+}
+
+/// big text: the monospace face at 13 * sc px (the classic font scaled by sc is 8 * sc wide, the face is ~7.8 * sc)
+fn vf_text_sc(x: int, y: int, s: *u8, fg: int, sc: int) -> int {
+    if (!vf_init()) { vf_cur = 0; return draw_text_sc(x, y, s, fg, sc); }
+    vf_load(VF_MONO);
+    let size = vf_px(VF_MONO) * sc;
+    var cx = x;
+    var i = 0;
+    while (s[i] != 0) {
+        if (s[i] != 32) {
+            let slot = vf_glyph(VF_MONO, s[i] as int, size);
+            if (slot >= 0) { vf_blit(slot, cx, y + 12 * sc, fg); }
+        }
+        cx = cx + 8 * sc;
+        i++;
+    }
+    return cx;
+}
+
+// ---------------------------------------------------------------- the UI font setting
+fn font_count() -> int { return VF_N + 1; }          // + the classic bitmap font
+/// name of choice c (0 = classic bitmap font, 1.. = vector fonts)
+fn font_name(c: int) -> *u8 {
+    if (c == 0) { return "Classic bitmap"; }
+    return vf_name(c - 1);
+}
+fn font_save() {
+    var b: u8[2];
+    b[0] = ('0' + vf_cur) as u8; b[1] = 10;
+    var n = fs_resolve("/etc/font");
+    if (n < 0) { n = fs_create("/etc/font", K_FILE); }
+    if (n >= 0) { fs_write(n, &b[0], 2, false); }
+    fs_save();
+}
+fn font_apply(c: int, save: bool) {
+    if (c < 0 || c > VF_N) { return; }
+    vf_cur = c;
+    if (save) { font_save(); }
+    dmg_add(0, 0, fb_w, fb_h);
+}
+fn font_load_pref() {
+    let n = fs_resolve("/etc/font");
+    if (n >= 0 && fs_nodes[n].size >= 1) {
+        let c = (fs_nodes[n].data[0] as int) - 48;
+        if (c >= 0 && c <= VF_N) { vf_cur = c; }
+    }
+}

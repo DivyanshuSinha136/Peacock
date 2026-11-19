@@ -1,0 +1,98 @@
+// nic.kc -- PCI scan and a polled RealTek RTL8139 Ethernet driver (QEMU: -nic user,model=rtl8139).
+// Author: Divyanshu Sinha (MIT License)
+//
+// The network stack (net.kc) only needs these four functions, so tests can replace this file with a simulated NIC:
+//   nic_init() -> bool          find and start the card
+//   nic_mac(out: *u8)           6 bytes
+//   nic_send(buf: *u8, len)     transmit one Ethernet frame (padded to 60 bytes)
+//   nic_recv(buf: *u8) -> int   copy one received frame (without CRC) into buf (>= 1600 bytes); 0 when none
+// Memory is identity mapped, so heap addresses are the physical addresses the card needs for DMA.
+// Needs: kmalloc/kzalloc, klog, pit_sleep_ms (hw.kc / mm.kc).
+
+const RTL_RXBUF = 8192 + 16 + 1536;
+var nic_ok = false;
+var nic_io = 0;
+var nic_bus = 0; var nic_dev = 0; var nic_func = 0;
+var nic_rx: *u8;
+var nic_rx_off = 0;
+var nic_tx0: *u8; var nic_tx1: *u8; var nic_tx2: *u8; var nic_tx3: *u8;
+var nic_tx_cur = 0;
+var nic_name: u8[24];
+
+fn nic_mac(out: *u8) {
+    var i = 0;
+    while (i < 6) { out[i] = inb(nic_io + i) as u8; i++; }
+}
+
+fn nic_init() -> bool {
+    nic_ok = false;
+    let pi = pci_find(0x10EC, 0x8139, 0);                        // the RTL8139, wherever it sits on the bus tree
+    if (pi < 0) { return false; }
+    nic_bus = pcid_bus(pi); nic_dev = pcid_dev(pi); nic_func = pcid_fn(pi);
+    nic_io = pci_io_bar(pi);
+    if (nic_io <= 0) { return false; }                           // need the I/O-space BAR
+    if (!pci_enable(pi, PCI_CMD_IO | PCI_CMD_MASTER)) { return false; }
+    nic_rx = kzalloc(RTL_RXBUF + 16);
+    nic_tx0 = kzalloc(2048); nic_tx1 = kzalloc(2048); nic_tx2 = kzalloc(2048); nic_tx3 = kzalloc(2048);
+    if (nic_rx == (0 as *u8) || nic_tx3 == (0 as *u8)) { return false; }
+    outb(nic_io + 0x52, 0);                                       // power on
+    outb(nic_io + 0x37, 0x10);                                    // reset
+    var spin = 0;
+    while ((inb(nic_io + 0x37) & 0x10) != 0 && spin < 1000000) { spin++; }
+    if (spin >= 1000000) { return false; }
+    outl(nic_io + 0x30, nic_rx as int);                           // RBSTART
+    outw(nic_io + 0x3C, 0);                                       // no interrupts: the stack polls
+    outl(nic_io + 0x44, 0x8F);                                    // accept broadcast/multicast/physical/all, WRAP
+    outb(nic_io + 0x37, 0x0C);                                    // RX + TX enable
+    nic_rx_off = 0; nic_tx_cur = 0;
+    outw(nic_io + 0x38, 0xFFF0);                                  // CAPR = -16: nothing read yet
+    nic_ok = true;
+    return true;
+}
+
+fn nic_tx_buf(i: int) -> *u8 {
+    if (i == 0) { return nic_tx0; }
+    if (i == 1) { return nic_tx1; }
+    if (i == 2) { return nic_tx2; }
+    return nic_tx3;
+}
+
+fn nic_send(buf: *u8, len: int) {
+    if (!nic_ok || len <= 0 || len > 1514) { return; }
+    let i = nic_tx_cur;
+    // the descriptor must be free: OWN (bit 13) is set by the card when it is done with it
+    let tsd = nic_io + 0x10 + i * 4;
+    var spin = 0;
+    while ((inl(tsd) & 0x2000) == 0 && spin < 200000 && (inl(tsd) & 0x1FFF) != 0) { spin++; }
+    let tb = nic_tx_buf(i);
+    kmemcpy(tb, buf, len);
+    var n = len;
+    while (n < 60) { tb[n] = 0; n++; }
+    outl(nic_io + 0x20 + i * 4, tb as int);                       // TSAD
+    outl(tsd, n);                                                 // TSD: size, OWN cleared -> start
+    nic_tx_cur = (i + 1) & 3;
+}
+
+fn nic_recv(buf: *u8) -> int {
+    if (!nic_ok) { return 0; }
+    if ((inb(nic_io + 0x37) & 1) != 0) { return 0; }              // BUFE: buffer empty
+    let p = nic_rx + nic_rx_off;
+    let status = *(p as *u16) as int;
+    let len = *((p + 2) as *u16) as int;                          // includes the 4-byte CRC
+    var got = 0;
+    if ((status & 1) != 0 && len >= 18 && len <= 1600) {
+        got = len - 4;
+        kmemcpy(buf, p + 4, got);
+    }
+    nic_rx_off = (nic_rx_off + len + 4 + 3) & ~3;
+    nic_rx_off = nic_rx_off % 8192;
+    outw(nic_io + 0x38, (nic_rx_off - 16) & 0xFFFF);              // CAPR
+    outw(nic_io + 0x3E, 0xFFFF);                                  // clear the interrupt status bits
+    if (got == 0 && (status & 1) == 0) {                          // bad packet: reset the receiver
+        outb(nic_io + 0x37, 0x04); outb(nic_io + 0x37, 0x0C);
+        outl(nic_io + 0x44, 0x8F);
+        nic_rx_off = 0;
+        outw(nic_io + 0x38, 0xFFF0);
+    }
+    return got;
+}

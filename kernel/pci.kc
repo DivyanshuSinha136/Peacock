@@ -1,0 +1,263 @@
+// pci.kc -- the PCI bus: full enumeration (bridges, multi-function devices), BAR sizing (I/O, 32- and 64-bit memory),
+// capability lists (power management, MSI, MSI-X, PCI Express), command-register control and a small name database.
+// Author: Divyanshu Sinha (MIT License)
+//
+// Configuration space is reached through pci_cfg_r32 / pci_cfg_w32 (configuration mechanism #1, ports 0xCF8/0xCFC in hw.kc;
+// the host tests supply a simulated bus).  Drivers find their hardware with pci_find / pci_find_class and switch it on with
+// pci_enable instead of poking the config space themselves.
+
+const PCI_MAX = 48;
+const PCI_CMD_IO = 1; const PCI_CMD_MEM = 2; const PCI_CMD_MASTER = 4;
+const PCAP_PM = 1; const PCAP_MSI = 2; const PCAP_MSIX = 4; const PCAP_PCIE = 8; const PCAP_AGP = 16;
+
+var pci_n = 0;
+var pci_scanned = false;
+var pci_buses = 0;                       // number of buses visited (host bridge + bridges behind it)
+var pd_loc: int[48];                     // bus << 8 | dev << 3 | function
+var pd_vid: int[48]; var pd_did: int[48];
+var pd_cls: int[48];                     // class << 16 | subclass << 8 | programming interface
+var pd_rev: int[48]; var pd_hdr: int[48];
+var pd_irq: int[48];                     // interrupt line | pin << 8
+var pd_sub: int[48];                     // subsystem vendor << 16 | subsystem id
+var pd_caps: int[48];                    // PCAP_* bits
+var pd_pm: int[48];                      // offset of the power-management capability (0 = none)
+var pd_msi: int[48];
+var pd_sec: int[48];                     // bridges: secondary bus number
+var pd_bar: int[288];                    // 6 BARs per device: base address with the type bits cleared (0 = unused)
+var pd_bsz: int[288];                    // their sizes in bytes (0 = unused)
+var pd_bty: int[288];                    // 0 unused, 1 I/O, 2 memory, 3 64-bit memory; +4 = prefetchable
+
+// ---------------------------------------------------------------- configuration space
+fn pci_addr(bus: int, dev: int, func: int, off: int) -> int {
+    return 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (off & 0xFC);
+}
+fn pci_read32(bus: int, dev: int, func: int, off: int) -> int { return pci_cfg_r32(bus, dev, func, off & 0xFC) & 0xFFFFFFFF; }
+fn pci_write32(bus: int, dev: int, func: int, off: int, v: int) { pci_cfg_w32(bus, dev, func, off & 0xFC, v & 0xFFFFFFFF); }
+fn pci_read16(bus: int, dev: int, func: int, off: int) -> int { return (pci_read32(bus, dev, func, off) >> ((off & 2) * 8)) & 0xFFFF; }
+fn pci_read8(bus: int, dev: int, func: int, off: int) -> int { return (pci_read32(bus, dev, func, off) >> ((off & 3) * 8)) & 0xFF; }
+/// 16-bit write; the status half of the command/status dword is written as zero (its bits are write-1-to-clear)
+fn pci_write16(bus: int, dev: int, func: int, off: int, v: int) {
+    let sh = (off & 2) * 8;
+    var d = pci_read32(bus, dev, func, off);
+    if ((off & 0xFC) == 4) { d = d & 0xFFFF; }
+    d = (d & ~(0xFFFF << sh)) | ((v & 0xFFFF) << sh);
+    pci_write32(bus, dev, func, off, d);
+}
+fn pci_write8(bus: int, dev: int, func: int, off: int, v: int) {
+    let sh = (off & 3) * 8;
+    var d = pci_read32(bus, dev, func, off);
+    if ((off & 0xFC) == 4) { d = d & 0xFFFF; }
+    d = (d & ~(0xFF << sh)) | ((v & 0xFF) << sh);
+    pci_write32(bus, dev, func, off, d);
+}
+fn pcid_bus(i: int) -> int { return pd_loc[i] >> 8; }
+fn pcid_dev(i: int) -> int { return (pd_loc[i] >> 3) & 31; }
+fn pcid_fn(i: int) -> int { return pd_loc[i] & 7; }
+fn pcid_r32(i: int, off: int) -> int { return pci_read32(pcid_bus(i), pcid_dev(i), pcid_fn(i), off); }
+fn pcid_r16(i: int, off: int) -> int { return pci_read16(pcid_bus(i), pcid_dev(i), pcid_fn(i), off); }
+fn pcid_w32(i: int, off: int, v: int) { pci_write32(pcid_bus(i), pcid_dev(i), pcid_fn(i), off, v); }
+fn pcid_w16(i: int, off: int, v: int) { pci_write16(pcid_bus(i), pcid_dev(i), pcid_fn(i), off, v); }
+
+// ---------------------------------------------------------------- BARs and capabilities
+/// size one BAR of device i (decoding is switched off while the all-ones pattern is written); returns the number of BARs used (1 or 2)
+fn pci_probe_bar(i: int, n: int) -> int {
+    let b = pcid_bus(i); let d = pcid_dev(i); let f = pcid_fn(i);
+    let off = 0x10 + n * 4;
+    let raw = pci_read32(b, d, f, off);
+    let cmd = pci_read16(b, d, f, 4);
+    pci_write16(b, d, f, 4, cmd & ~7);
+    pci_write32(b, d, f, off, 0xFFFFFFFF);
+    let m = pci_read32(b, d, f, off);
+    pci_write32(b, d, f, off, raw);
+    var used = 1;
+    let k = i * 6 + n;
+    if (m == 0 || m == 0xFFFFFFFF) { pci_write16(b, d, f, 4, cmd); return 1; }
+    if ((raw & 1) != 0) {                                                  // I/O space
+        let mask = m & 0xFFFC;
+        pd_bsz[k] = ((~mask) & 0xFFFF) + 1;
+        pd_bar[k] = raw & 0xFFFC;
+        pd_bty[k] = 1;
+    } else {
+        var ty = 2;
+        var mask = m & 0xFFFFFFF0;
+        var base = raw & 0xFFFFFFF0;
+        if (((raw >> 1) & 3) == 2 && n < 5) {                              // 64-bit memory BAR: the next BAR holds the upper half
+            let raw2 = pci_read32(b, d, f, off + 4);
+            pci_write32(b, d, f, off + 4, 0xFFFFFFFF);
+            let m2 = pci_read32(b, d, f, off + 4);
+            pci_write32(b, d, f, off + 4, raw2);
+            mask = mask | (m2 << 32); base = base | (raw2 << 32);
+            ty = 3; used = 2;
+            pd_bsz[k] = (~mask) + 1;
+        } else {
+            pd_bsz[k] = ((~mask) & 0xFFFFFFFF) + 1;
+        }
+        if ((raw & 8) != 0) { ty = ty + 4; }
+        pd_bar[k] = base; pd_bty[k] = ty;
+    }
+    pci_write16(b, d, f, 4, cmd);
+    return used;
+}
+
+fn pci_walk_caps(i: int) {
+    pd_caps[i] = 0; pd_pm[i] = 0; pd_msi[i] = 0;
+    let b = pcid_bus(i); let d = pcid_dev(i); let f = pcid_fn(i);
+    if ((pci_read16(b, d, f, 6) & 0x10) == 0) { return; }                  // no capability list
+    var p = pci_read8(b, d, f, 0x34) & 0xFC;
+    var guard = 0;
+    while (p >= 0x40 && guard < 48) {
+        let id = pci_read8(b, d, f, p);
+        if (id == 1) { pd_caps[i] = pd_caps[i] | PCAP_PM; pd_pm[i] = p; }
+        else if (id == 5) { pd_caps[i] = pd_caps[i] | PCAP_MSI; pd_msi[i] = p; }
+        else if (id == 0x11) { pd_caps[i] = pd_caps[i] | PCAP_MSIX; }
+        else if (id == 0x10) { pd_caps[i] = pd_caps[i] | PCAP_PCIE; }
+        else if (id == 2) { pd_caps[i] = pd_caps[i] | PCAP_AGP; }
+        p = pci_read8(b, d, f, p + 1) & 0xFC;
+        guard++;
+    }
+}
+
+fn pci_add(bus: int, dev: int, func: int) -> int {
+    if (pci_n >= PCI_MAX) { return -1; }
+    let i = pci_n;
+    pd_loc[i] = (bus << 8) | (dev << 3) | func;
+    let id = pci_read32(bus, dev, func, 0);
+    pd_vid[i] = id & 0xFFFF; pd_did[i] = (id >> 16) & 0xFFFF;
+    let cr = pci_read32(bus, dev, func, 8);
+    pd_cls[i] = (cr >> 8) & 0xFFFFFF; pd_rev[i] = cr & 255;
+    pd_hdr[i] = pci_read8(bus, dev, func, 0x0E);
+    pd_irq[i] = pci_read16(bus, dev, func, 0x3C);
+    pd_sub[i] = pci_read32(bus, dev, func, 0x2C);
+    pd_sec[i] = 0;
+    var k = 0;
+    while (k < 6) { pd_bar[i * 6 + k] = 0; pd_bsz[i * 6 + k] = 0; pd_bty[i * 6 + k] = 0; k++; }
+    pci_n++;
+    let ht = pd_hdr[i] & 0x7F;
+    var nb = 0;
+    if (ht == 0) { nb = 6; } else if (ht == 1) { nb = 2; }
+    k = 0;
+    while (k < nb) { k = k + pci_probe_bar(i, k); }
+    if (ht == 1) { pd_sec[i] = pci_read8(bus, dev, func, 0x19); }
+    if (ht == 0) { pd_sub[i] = pci_read32(bus, dev, func, 0x2C); } else { pd_sub[i] = 0; }
+    pci_walk_caps(i);
+    return i;
+}
+
+fn pci_scan_bus(bus: int, depth: int) {
+    if (depth > 6) { return; }
+    pci_buses++;
+    var dev = 0;
+    while (dev < 32) {
+        var func = 0;
+        var nf = 1;
+        while (func < nf) {
+            let id = pci_read32(bus, dev, func, 0);
+            if ((id & 0xFFFF) != 0xFFFF && id != 0) {
+                let i = pci_add(bus, dev, func);
+                if (func == 0 && i >= 0 && (pd_hdr[i] & 0x80) != 0) { nf = 8; }
+                if (i >= 0 && (pd_cls[i] >> 8) == 0x0604 && pd_sec[i] > bus) { pci_scan_bus(pd_sec[i], depth + 1); }
+            } else if (func == 0) { nf = 1; }
+            func++;
+        }
+        dev++;
+    }
+}
+
+/// enumerate the whole bus; returns the number of functions found (also callable again after hot changes)
+fn pci_scan() -> int {
+    pci_n = 0; pci_buses = 0;
+    pci_scan_bus(0, 0);
+    pci_scanned = true;
+    return pci_n;
+}
+
+// ---------------------------------------------------------------- lookup and control
+fn pci_find(vid: int, did: int, st0: int) -> int {
+    if (!pci_scanned) { pci_scan(); }
+    var i = st0;
+    while (i < pci_n) { if (pd_vid[i] == vid && pd_did[i] == did) { return i; } i++; }
+    return -1;
+}
+/// first device at or after `from` whose class dword (class, subclass, interface) matches under `mask`
+fn pci_find_class(cls: int, mask: int, st0: int) -> int {
+    if (!pci_scanned) { pci_scan(); }
+    var i = st0;
+    while (i < pci_n) { if ((pd_cls[i] & mask) == (cls & mask)) { return i; } i++; }
+    return -1;
+}
+/// switch on I/O decoding, memory decoding and/or bus mastering (PCI_CMD_* bits); also wakes a device sleeping in D1-D3
+fn pci_enable(i: int, flags: int) -> bool {
+    if (i < 0 || i >= pci_n) { return false; }
+    if (pd_pm[i] != 0) {
+        let pmcs = pcid_r16(i, pd_pm[i] + 4);
+        if ((pmcs & 3) != 0) { pcid_w16(i, pd_pm[i] + 4, pmcs & ~3); }          // back to D0
+    }
+    let cmd = pcid_r16(i, 4);
+    pcid_w16(i, 4, (cmd | flags) & ~0x400);                                      // and make sure legacy INTx is not masked
+    return (pcid_r16(i, 4) & flags) == flags;
+}
+/// the first I/O BAR (as a port base) or -1
+fn pci_io_bar(i: int) -> int {
+    var k = 0;
+    while (k < 6) { if (pd_bty[i * 6 + k] == 1) { return pd_bar[i * 6 + k]; } k++; }
+    return -1;
+}
+/// first memory BAR index, or -1
+fn pci_mem_bar(i: int) -> int {
+    var k = 0;
+    while (k < 6) { if (pd_bty[i * 6 + k] >= 2) { return k; } k++; }
+    return -1;
+}
+
+// ---------------------------------------------------------------- names
+fn pci_vendor_name(v: int) -> *u8 {
+    if (v == 0x8086) { return "Intel"; } if (v == 0x1234) { return "QEMU/Bochs"; } if (v == 0x10EC) { return "Realtek"; }
+    if (v == 0x1AF4) { return "Red Hat (virtio)"; } if (v == 0x1B36) { return "Red Hat (QEMU)"; } if (v == 0x1022) { return "AMD"; }
+    if (v == 0x1002) { return "AMD/ATI"; } if (v == 0x10DE) { return "NVIDIA"; } if (v == 0x15AD) { return "VMware"; }
+    if (v == 0x80EE) { return "VirtualBox"; } if (v == 0x1106) { return "VIA"; } if (v == 0x14E4) { return "Broadcom"; }
+    if (v == 0x168C) { return "Qualcomm Atheros"; } if (v == 0x1B21) { return "ASMedia"; } if (v == 0x1033) { return "NEC"; }
+    if (v == 0x10EE) { return "Xilinx"; } if (v == 0x1B4B) { return "Marvell"; } if (v == 0x144D) { return "Samsung"; }
+    return "unknown vendor";
+}
+fn pci_dev_name(v: int, d: int) -> *u8 {
+    if (v == 0x8086) {
+        if (d == 0x1237) { return "440FX host bridge"; } if (d == 0x7000) { return "PIIX3 ISA bridge"; } if (d == 0x7010) { return "PIIX3 IDE"; }
+        if (d == 0x7020) { return "PIIX3 USB (UHCI)"; } if (d == 0x7113) { return "PIIX4 power management"; } if (d == 0x100E) { return "82540EM Gigabit (e1000)"; }
+        if (d == 0x29C0) { return "Q35 host bridge"; } if (d == 0x2918) { return "ICH9 LPC bridge"; } if (d == 0x2922) { return "ICH9 SATA (AHCI)"; }
+        if (d == 0x2930) { return "ICH9 SMBus"; } if (d == 0x2934) { return "ICH9 USB (UHCI)"; } if (d == 0x293A) { return "ICH9 USB (EHCI)"; }
+        if (d == 0x10D3) { return "82574L Gigabit"; }
+    }
+    if (v == 0x1234 && d == 0x1111) { return "Bochs VGA (std)"; }
+    if (v == 0x10EC && d == 0x8139) { return "RTL8139 Ethernet"; }
+    if (v == 0x10EC && d == 0x8168) { return "RTL8111 Gigabit"; }
+    if (v == 0x1B36 && d == 0x000D) { return "QEMU xHCI"; }
+    if (v == 0x1B36 && d == 0x0001) { return "QEMU PCI-PCI bridge"; }
+    if (v == 0x1B36 && d == 0x000C) { return "QEMU PCIe root port"; }
+    if (v == 0x1AF4 && d == 0x1000) { return "virtio network"; }
+    if (v == 0x1AF4 && d == 0x1001) { return "virtio block"; }
+    if (v == 0x1AF4 && d == 0x1050) { return "virtio GPU"; }
+    return "";
+}
+fn pci_class_name(c: int) -> *u8 {
+    let cs = c >> 8;
+    if (cs == 0x0600) { return "Host bridge"; } if (cs == 0x0601) { return "ISA bridge"; } if (cs == 0x0604) { return "PCI-PCI bridge"; }
+    if (cs == 0x0680) { return "Other bridge"; } if (cs == 0x0300) { return "VGA display"; } if (cs == 0x0380) { return "Display"; }
+    if (cs == 0x0200) { return "Ethernet"; } if (cs == 0x0280) { return "Network"; } if (cs == 0x0101) { return "IDE storage"; }
+    if (cs == 0x0106) { return "SATA storage"; } if (cs == 0x0108) { return "NVMe storage"; } if (cs == 0x0100) { return "SCSI storage"; }
+    if (cs == 0x0C03) {
+        let pi = c & 255;
+        if (pi == 0x00) { return "USB UHCI"; } if (pi == 0x10) { return "USB OHCI"; } if (pi == 0x20) { return "USB EHCI"; } if (pi == 0x30) { return "USB xHCI"; }
+        return "USB";
+    }
+    if (cs == 0x0C05) { return "SMBus"; } if (cs == 0x0401) { return "Audio"; } if (cs == 0x0403) { return "HD Audio"; }
+    if (cs == 0x0500) { return "RAM controller"; } if (cs == 0x0700) { return "Serial controller"; } if ((cs >> 8) == 0x08) { return "System peripheral"; }
+    return "Device";
+}
+/// which of our drivers is using device i ("" = none)
+fn pci_driver_name(i: int) -> *u8 {
+    if (pd_vid[i] == 0x10EC && pd_did[i] == 0x8139 && nic_ok) { return "rtl8139"; }
+    if ((pd_cls[i] >> 8) == 0x0C03 && (pd_cls[i] & 255) == 0 && usb_ok && pci_io_bar(i) == usb_io) { return "uhci"; }
+    if (pd_vid[i] == 0x1234 && pd_did[i] == 0x1111 && disp_probe()) { return "bochs-dispi"; }
+    if ((pd_cls[i] >> 8) == 0x0101 && disk_present) { return "ata-pio"; }
+    return "";
+}

@@ -1,0 +1,112 @@
+// main.kc -- Peacock kernel entry point.  Author: Divyanshu Sinha (MIT License)
+//
+// Build:   kcc kernel/main.kc -o build/kernel.bin --target kcos
+// kcc supplies the entry stub (calls kmain on a fresh stack); the boot stage (boot/boot.kc) has already set up long mode,
+// the memory map and a VBE linear framebuffer, and describes them at 0x500..0x7FF (see boot/boot.kc).
+import "kstr.kc";
+import "font.kc";
+import "serial.kc";
+import "input.kc";
+import "hw.kc";
+import "mm.kc";
+import "fs.kc";
+import "disk.kc";
+import "kcfs.kc";
+import "threads.kc";
+import "gfx.kc";
+import "gfx3d.kc";
+import "ui.kc";
+import "apps.kc";
+import "apps2.kc";
+import "pkg.kc";
+import "pci.kc";
+import "hwctl.kc";
+import "nic.kc";
+import "net.kc";
+import "html.kc";
+import "browser.kc";
+import "peabin.kc";
+import "builder.kc";
+import "samples.kc";
+import "theme.kc";
+import "modern.kc";
+import "svgdata.kc";
+import "peacockicon.kc";
+import "svg.kc";
+import "fontdata.kc";
+import "vfont.kc";
+import "fonts.kc";
+import "studio3d.kc";
+import "display.kc";
+import "usb.kc";
+import "settings.kc";
+import "usbhw.kc";
+import "notepad.kc";
+import "splash.kc";
+import "shell.kc";
+import "panic.kc";
+
+const VBEMODE_ADDR = 0x6F0;
+const VBEINFO_ADDR = 0x700;
+
+fn halt_forever() { cli(); while (true) { hlt(); } }
+
+fn kmain() {
+    ser_init();
+    klog("Peacock kernel starting");
+    gdt_init(); idt_init();
+    pic_init(); pit_init(); kb_init();
+    klog("CPU tables, PIC, PIT, keyboard ready");
+    pmm_init(); heap_init();
+    if (heap_size == 0) { klog("not enough memory (Peacock needs at least 8 MiB)"); halt_forever(); }
+    ser_puts("[peacock] RAM usable MiB "); ser_putdec(ram_usable / 1048576); ser_puts("\n");
+    let magic = *(0x500 as *u32) as int;
+    let mode = *(VBEMODE_ADDR as *u32) as int;
+    if (magic != 0x43414550 || mode == 0) { klog("no framebuffer from the boot stage"); halt_forever(); }
+    let pitch = *((VBEINFO_ADDR + 0x10) as *u16) as int;
+    let w = *((VBEINFO_ADDR + 0x12) as *u16) as int;
+    let h = *((VBEINFO_ADDR + 0x14) as *u16) as int;
+    let bpp = *((VBEINFO_ADDR + 0x19) as *u8) as int;
+    let fb = *((VBEINFO_ADDR + 0x28) as *u32) as int;
+    ser_puts("[peacock] VBE mode "); ser_puthex(mode); ser_puts(" "); ser_putdec(w); ser_puts("x"); ser_putdec(h); ser_puts("x"); ser_putdec(bpp);
+    ser_puts(" pitch "); ser_putdec(pitch); ser_puts(" fb "); ser_puthex(fb); ser_puts("\n");
+    if (fb == 0 || w < 640 || h < 480 || w > 4096 || h > 2400 || (bpp != 32 && bpp != 24)) { klog("unsupported video mode"); halt_forever(); }
+    if (!gfx_init(w, h, pitch, bpp, fb)) { klog("out of memory for the back buffer"); halt_forever(); }
+    disk_init();                                        // first, so the splash can read the logo from the disk image
+    splash_begin();
+    sti();                                              // the timer drives the splash animation
+    splash(15, "Starting file system");
+    fs_init();
+    if (fs_nodes == (0 as *FsNode)) { klog("out of memory for the filesystem"); halt_forever(); }
+    splash(35, "Checking the disk");
+    splash(55, "Loading your files");
+    if (!fs_load()) { fs_seed(); }
+    theme_load_pref(); font_load_pref(); depth_load_pref(); disp_load_pref();
+    splash(70, "Installing apps");
+    bld_seed_apps();
+    splash(78, "Scanning the PCI bus");
+    pci_scan();
+    cpu_init();
+    acpi_init();
+    splash(82, "Starting network");
+    net_init();
+    splash(88, "Starting USB");
+    usb_init();
+    splash(92, "Preparing the desktop");
+    mouse_set_bounds(w, h);
+    mouse_init();
+    if (mouse_ok) { klog("PS/2 mouse ready"); } else { klog("no PS/2 mouse found (keyboard only)"); }
+    ui_init();
+    app_open(APP_TERM);
+    splash_end();
+    toast("Welcome to Peacock OS");
+    threads_start();
+    klog("desktop ready");
+    while (true) {
+        usb_poll();
+        ui_frame();
+        thr_idle_enter();
+        hlt();
+        thr_idle_leave();
+    }
+}

@@ -1,0 +1,102 @@
+// disk.kc -- ATA PIO driver (primary bus, master drive, LBA28) and the persistent KCFS store.  Author: Divyanshu Sinha (MIT License)
+const ATA_DATA = 0x1F0;
+const ATA_STATUS = 0x1F7;
+const STORE_LBA_MIN = 1024;              // KCFS header sector; the data follows at store_lba() + 1 (up to 3.5 MiB reserved)
+const LOGO_GAP = 7168;                   // boot logo (tools/mklogo.py, 350 sectors) sits right after the store area
+const BUNDLE_GAP = 7680;                 // the install bundle (tools/mkbundle.kc) starts BUNDLE_GAP sectors after the store
+
+/// the disk layout follows the kernel size: store = first 1024-sector boundary after the kernel (same formula as tools/mkimage.kc)
+fn store_lba() -> int { return (5 + boot_ksectors() + 1023) & ~1023; }
+fn bundle_lba() -> int { return store_lba() + BUNDLE_GAP; }
+fn themes_lba() -> int { return bundle_lba() + 8192; }      // desktop theme pictures (tools/mkthemes.py), after the largest bundle (4 MiB)
+fn logo_lba() -> int { return store_lba() + LOGO_GAP; }
+
+var disk_present = false;
+var disk_sectors = 0;
+var disk_model: u8[44];
+
+fn ata_delay() { var i = 0; while (i < 4) { inb(0x3F6); i++; } }
+
+fn ata_wait_idle() -> bool {
+    var spin = 0;
+    while (spin < 2000000) { if ((inb(ATA_STATUS) & 0x80) == 0) { return true; } spin++; }
+    return false;
+}
+
+/// wait for DRQ; false on error, fault or timeout
+fn ata_wait_drq() -> bool {
+    ata_delay();
+    var spin = 0;
+    while (spin < 2000000) {
+        let s = inb(ATA_STATUS);
+        if ((s & 0x80) == 0) {
+            if ((s & 0x21) != 0) { return false; }
+            if ((s & 0x08) != 0) { return true; }
+        }
+        spin++;
+    }
+    return false;
+}
+
+fn disk_init() {
+    var id: u16[256];
+    disk_present = false;
+    if (inb(ATA_STATUS) == 0xFF) { return; }                  // floating bus: no controller
+    outb(0x1F6, 0xA0);
+    outb(0x1F2, 0); outb(0x1F3, 0); outb(0x1F4, 0); outb(0x1F5, 0);
+    outb(ATA_STATUS, 0xEC);                                    // IDENTIFY
+    if (inb(ATA_STATUS) == 0) { return; }
+    if (!ata_wait_idle()) { return; }
+    if (inb(0x1F4) != 0 || inb(0x1F5) != 0) { return; }       // ATAPI / SATA signature: not handled
+    if (!ata_wait_drq()) { return; }
+    insw_rep(ATA_DATA, &id[0], 256);
+    disk_sectors = (id[60] as int) | ((id[61] as int) << 16);
+    var i = 0;
+    while (i < 20) {
+        let w = id[27 + i] as int;
+        disk_model[i * 2] = (w >> 8) as u8;
+        disk_model[i * 2 + 1] = (w & 255) as u8;
+        i++;
+    }
+    disk_model[40] = 0;
+    var e = 39;
+    while (e > 0 && (disk_model[e] == ' ' || disk_model[e] == 0)) { disk_model[e] = 0; e--; }
+    disk_present = disk_sectors > 0;
+}
+
+fn ata_setup(lba: int, cmd: int) {
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, lba & 0xFF);
+    outb(0x1F4, (lba >> 8) & 0xFF);
+    outb(0x1F5, (lba >> 16) & 0xFF);
+    outb(ATA_STATUS, cmd);
+}
+
+fn ata_read(lba: int, count: int, buf: *u8) -> bool {
+    if (!disk_present) { return false; }
+    var i = 0;
+    while (i < count) {
+        if (!ata_wait_idle()) { return false; }
+        ata_setup(lba + i, 0x20);
+        if (!ata_wait_drq()) { return false; }
+        insw_rep(ATA_DATA, buf + i * 512, 256);
+        i++;
+    }
+    return true;
+}
+
+fn ata_write(lba: int, count: int, buf: *u8) -> bool {
+    if (!disk_present) { return false; }
+    var i = 0;
+    while (i < count) {
+        if (!ata_wait_idle()) { return false; }
+        ata_setup(lba + i, 0x30);
+        if (!ata_wait_drq()) { return false; }
+        outsw_rep(ATA_DATA, buf + i * 512, 256);
+        outb(ATA_STATUS, 0xE7);                                // cache flush
+        if (!ata_wait_idle()) { return false; }
+        i++;
+    }
+    return true;
+}

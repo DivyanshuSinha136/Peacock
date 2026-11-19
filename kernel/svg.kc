@@ -1,0 +1,659 @@
+// svg.kc -- a small SVG renderer for icons.  Author: Divyanshu Sinha (MIT License)
+//
+// Icons are real .svg files (assets/icons/*.svg, packed into svgdata.kc by tools/mksvg.py).  This file parses the subset
+// of SVG 1.1 that icons need and rasterises it with anti-aliasing (4 sub-scanlines per pixel, exact horizontal coverage),
+// so one source draws crisply at any size: 48 px desktop / start-menu icons, 18 px taskbar tabs, 16 px title bars.
+//
+//   elements   rect (rx), circle, ellipse, line, polygon, path (M L H V C Q Z, absolute and relative),
+//              linearGradient + stop (user-space x1 y1 x2 y2), svg (viewBox is always 0 0 48 48)
+//   attributes fill, stroke (#rgb, #rrggbb, none, url(#id)), stroke-width, stroke-linecap (always round), opacity
+//   not supported: transforms, arcs, text, CSS, nested groups with inherited style -- keep the artwork simple.
+//
+// Bitmaps are rendered lazily on first use and cached (straight-alpha ARGB), see svg_draw().
+
+const SV_MAXE = 6000;                 // edges per shape
+const SV_MAXP = 1500;                 // points per shape
+const SV_NCACHE = 200;
+
+var sv_e: *int;                       // edges: x0, y0, x1, y1 in 8.8 fixed-point pixels
+var sv_ne = 0;
+var sv_pt: *int;                      // shape points: x, y (8.8 px), corner flag
+var sv_np = 0;
+var sv_sub: int[64];                  // start index of each sub-path
+var sv_subc: int[64];                 // 1 = closed
+var sv_sn = 0;
+var sv_cov: *int;                     // coverage accumulator for one pixel row
+var sv_cx: *int; var sv_cd: *int;     // x crossings (8.8) and winding direction of the current sub-scanline
+var sv_out: *u32;                     // bitmap being rendered
+var sv_sz = 0;
+var sv_bw = 0; var sv_bh = 0;         // bitmap width / height (equal to sv_sz for icons)
+var sv_gm = 0; var sv_gsz = 0; var sv_gupem = 1000; var sv_gasc = 0;   // glyph mode: font units -> pixels (y flipped), see vfont.kc
+var sv_ready = false;
+
+// source being parsed
+var sv_s: *u8;
+var sv_ts = 0; var sv_te = 0;         // current tag: '<' .. '>'
+var sv_val: u8[1500];                  // value of the last attribute asked for
+var sv_vp = 0;
+
+// paint of the element being drawn
+var sv_pk = 0;                        // 0 none, 1 solid, 2 gradient
+var sv_pc = 0; var sv_pg = 0; var sv_eop = 256;
+
+// gradients (at most 6 per icon, 4 stops each)
+var sv_gn = 0;
+var sv_gid: u8[96];
+var sv_gx: int[24];                   // x1 y1 x2 y2 (8.8 px)
+var sv_gsn: int[6];
+var sv_gso: int[24]; var sv_gsc: int[24];
+
+var sv_qx: int[24]; var sv_qy: int[24];
+
+fn sv_init() -> bool {
+    if (sv_ready) { return true; }
+    sv_e = kmalloc(SV_MAXE * 4 * 8) as *int;
+    sv_pt = kmalloc(SV_MAXP * 3 * 8) as *int;
+    sv_cov = kmalloc(256 * 8) as *int;
+    sv_cx = kmalloc(1024 * 8) as *int;
+    sv_cd = kmalloc(1024 * 8) as *int;
+    if (sv_e == (0 as *int) || sv_pt == (0 as *int) || sv_cov == (0 as *int) || sv_cx == (0 as *int) || sv_cd == (0 as *int)) { return false; }
+    sv_ready = true;
+    return true;
+}
+
+fn sv_isqrt(n: int) -> int {
+    if (n <= 0) { return 0; }
+    var x = n; var y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return x;
+}
+
+// ---------------------------------------------------------------- attribute / number parsing
+fn sv_ch(i: int) -> int { return sv_s[i] as int; }
+
+/// copy attribute `name` of the current tag into sv_val; false when the tag has no such attribute
+fn sv_attr(name: *u8) -> bool {
+    let nl = kstrlen(name);
+    var i = sv_ts;
+    while (i < sv_te) {
+        if (sv_ch(i) == 32) {
+            var j = 0;
+            while (j < nl && sv_ch(i + 1 + j) == (name[j] as int)) { j++; }
+            if (j == nl && sv_ch(i + 1 + nl) == 61) {
+                let q = sv_ch(i + 2 + nl);
+                var k = i + 3 + nl; var o = 0;
+                while (k < sv_te && sv_ch(k) != q && o < 1490) { sv_val[o] = sv_s[k]; o++; k++; }
+                sv_val[o] = 0; sv_vp = 0;
+                return true;
+            }
+        }
+        i++;
+    }
+    return false;
+}
+
+fn sv_skip() {
+    while (sv_val[sv_vp] != 0 && ((sv_val[sv_vp] as int) == 32 || (sv_val[sv_vp] as int) == 44)) { sv_vp++; }
+}
+fn sv_dig(c: int) -> bool { return c >= 48 && c <= 57; }
+
+/// next number of sv_val, scaled by 1024
+fn sv_num() -> int {
+    sv_skip();
+    var neg = false;
+    var c = sv_val[sv_vp] as int;
+    if (c == 45) { neg = true; sv_vp++; } else if (c == 43) { sv_vp++; }
+    var ip = 0;
+    while (sv_dig(sv_val[sv_vp] as int)) { ip = ip * 10 + (sv_val[sv_vp] as int) - 48; sv_vp++; }
+    var fr = 0;
+    if ((sv_val[sv_vp] as int) == 46) {
+        sv_vp++;
+        var div = 1;
+        while (sv_dig(sv_val[sv_vp] as int)) {
+            if (div < 10000) { fr = fr * 10 + (sv_val[sv_vp] as int) - 48; div = div * 10; }
+            sv_vp++;
+        }
+        fr = fr * 1024 / div;
+    }
+    let v = ip * 1024 + fr;
+    if (neg) { return 0 - v; }
+    return v;
+}
+
+/// user units (x1024) -> 8.8 fixed-point pixels at the current bitmap size (viewBox is 48 units)
+fn sv_fx(v: int) -> int { return v * sv_sz / 192; }
+
+fn sv_hex(c: int) -> int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return 0;
+}
+/// "#rgb" or "#rrggbb" at sv_val[sv_vp]
+fn sv_color() -> int {
+    var n = 0;
+    var v = 0;
+    var i = sv_vp + 1;
+    while (sv_hex_ok(sv_val[i] as int)) { v = v * 16 + sv_hex(sv_val[i] as int); n++; i++; }
+    if (n == 3) {
+        let r = (v >> 8) & 15; let g = (v >> 4) & 15; let b = v & 15;
+        return (r * 17) * 65536 + (g * 17) * 256 + b * 17;
+    }
+    return v;
+}
+fn sv_hex_ok(c: int) -> bool { return (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+
+fn sv_gfind() -> int {
+    // sv_val is "url(#id)"
+    var id: u8[16];
+    var i = 5; var o = 0;
+    while (sv_val[i] != 0 && (sv_val[i] as int) != 41 && o < 15) { id[o] = sv_val[i]; o++; i++; }
+    id[o] = 0;
+    var g = 0;
+    while (g < sv_gn) {
+        if (kstreq(&sv_gid[g * 16], &id[0])) { return g; }
+        g++;
+    }
+    return -1;
+}
+
+/// paint of attribute `name` (fill / stroke); `dflt` = 1 for "black when absent"
+fn sv_set_paint(name: *u8, dflt: int) {
+    sv_pk = 0; sv_pc = 0; sv_pg = 0;
+    if (!sv_attr(name)) {
+        if (dflt == 1) { sv_pk = 1; sv_pc = 0; }
+        return;
+    }
+    let c0 = sv_val[0] as int;
+    if (c0 == 35) { sv_pk = 1; sv_pc = sv_color(); }
+    else if (c0 == 117) {
+        let g = sv_gfind();
+        if (g >= 0) { sv_pk = 2; sv_pg = g; }
+    }
+}
+
+fn sv_gradient_at(g: int, px: int, py: int) -> int {
+    let x1 = sv_gx[g * 4]; let y1 = sv_gx[g * 4 + 1]; let x2 = sv_gx[g * 4 + 2]; let y2 = sv_gx[g * 4 + 3];
+    let dx = x2 - x1; let dy = y2 - y1;
+    let l2 = dx * dx + dy * dy;
+    var t = 0;
+    if (l2 > 0) { t = ((px - x1) * dx + (py - y1) * dy) * 256 / l2; }
+    if (t < 0) { t = 0; }
+    if (t > 256) { t = 256; }
+    let n = sv_gsn[g];
+    if (n == 0) { return 0; }
+    if (n == 1 || t <= sv_gso[g * 4]) { return sv_gsc[g * 4]; }
+    var i = 1;
+    while (i < n) {
+        if (t <= sv_gso[g * 4 + i]) {
+            let o0 = sv_gso[g * 4 + i - 1]; let o1 = sv_gso[g * 4 + i];
+            var a = 256;
+            if (o1 > o0) { a = (t - o0) * 256 / (o1 - o0); }
+            return mix(sv_gsc[g * 4 + i - 1], sv_gsc[g * 4 + i], a);
+        }
+        i++;
+    }
+    return sv_gsc[g * 4 + n - 1];
+}
+
+// ---------------------------------------------------------------- shapes -> points
+fn sv_move(x: int, y: int) {
+    if (sv_sn >= 63 || sv_np >= SV_MAXP - 1) { return; }
+    sv_sub[sv_sn] = sv_np; sv_subc[sv_sn] = 0; sv_sn++;
+    sv_add(x, y, 1);
+}
+fn sv_add(x: int, y: int, corner: int) {
+    if (sv_np >= SV_MAXP) { return; }
+    if (sv_gm != 0) {
+        sv_pt[sv_np * 3] = x * sv_gsz / (sv_gupem * 4) + 256;                          // 1 px left pad
+        sv_pt[sv_np * 3 + 1] = (sv_gasc * 1024 - y) * sv_gsz / (sv_gupem * 4) + 256;   // y-up font units -> y-down, 1 px top pad
+    } else { sv_pt[sv_np * 3] = sv_fx(x); sv_pt[sv_np * 3 + 1] = sv_fx(y); }
+    sv_pt[sv_np * 3 + 2] = corner;
+    sv_np++;
+}
+fn sv_close() { if (sv_sn > 0) { sv_subc[sv_sn - 1] = 1; } }
+
+fn sv_cubic(x0: int, y0: int, x1: int, y1: int, x2: int, y2: int, x3: int, y3: int) {
+    var i = 1;
+    while (i <= 10) {
+        let t = i * 1024 / 10; let u = 1024 - t;
+        let a = u * u * u; let b = 3 * u * u * t; let c = 3 * u * t * t; let d = t * t * t;
+        let k = 1024 * 1024 * 1024;
+        sv_add((a * x0 + b * x1 + c * x2 + d * x3) / k, (a * y0 + b * y1 + c * y2 + d * y3) / k, i == 10 ? 1 : 0);
+        i++;
+    }
+}
+fn sv_quad(x0: int, y0: int, x1: int, y1: int, x2: int, y2: int) {
+    var i = 1;
+    while (i <= 8) {
+        let t = i * 1024 / 8; let u = 1024 - t;
+        let k = 1024 * 1024;
+        sv_add((u * u * x0 + 2 * u * t * x1 + t * t * x2) / k, (u * u * y0 + 2 * u * t * y1 + t * t * y2) / k, i == 8 ? 1 : 0);
+        i++;
+    }
+}
+
+fn sv_ellipse(cx: int, cy: int, rx: int, ry: int) {
+    var k = 0;
+    while (k < 60) {
+        let px = cx + rx * sin60(k) / 1000; let py = cy - ry * cos60(k) / 1000;
+        if (k == 0) { sv_move(px, py); } else { sv_add(px, py, 0); }
+        k++;
+    }
+    sv_close();
+}
+
+fn sv_rrect(x: int, y: int, w: int, h: int, r0: int) {
+    var r = r0;
+    if (r * 2 > w) { r = w / 2; }
+    if (r * 2 > h) { r = h / 2; }
+    if (r <= 0) {
+        sv_move(x, y); sv_add(x + w, y, 1); sv_add(x + w, y + h, 1); sv_add(x, y + h, 1); sv_close();
+        return;
+    }
+    var c = 0;
+    while (c < 4) {
+        var cx = x + r; var cy = y + r;                    // c: 0 TR, 1 BR, 2 BL, 3 TL (clockwise from 12 o'clock)
+        if (c == 0) { cx = x + w - r; cy = y + r; }
+        else if (c == 1) { cx = x + w - r; cy = y + h - r; }
+        else if (c == 2) { cx = x + r; cy = y + h - r; }
+        var j = 0;
+        while (j <= 15) {
+            let k = c * 15 + j;
+            let px = cx + r * sin60(k) / 1000; let py = cy - r * cos60(k) / 1000;
+            if (c == 0 && j == 0) { sv_move(px, py); } else { sv_add(px, py, 0); }
+            j++;
+        }
+        c++;
+    }
+    sv_close();
+}
+
+fn sv_path() {
+    sv_vp = 0;
+    var cmd = 0;
+    var cx = 0; var cy = 0; var sx = 0; var sy = 0;
+    var guard = 0;
+    while (guard < 400) {
+        guard++;
+        sv_skip();
+        let c = sv_val[sv_vp] as int;
+        if (c == 0) { break; }
+        var isl = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if (isl) { cmd = c; sv_vp++; }
+        else if (cmd == 0 || !(sv_dig(c) || c == 45 || c == 46 || c == 43)) { sv_vp++; continue; }
+        if (cmd == 90 || cmd == 122) { sv_close(); cx = sx; cy = sy; continue; }
+        let rel = cmd >= 97;
+        let up = rel ? cmd - 32 : cmd;
+        if (up == 77 || up == 76) {                                   // M L
+            var x = sv_num(); var y = sv_num();
+            if (rel) { x = x + cx; y = y + cy; }
+            if (up == 77) { sv_move(x, y); sx = x; sy = y; cmd = rel ? 108 : 76; }
+            else { sv_add(x, y, 1); }
+            cx = x; cy = y;
+        } else if (up == 72) {                                        // H
+            var x = sv_num(); if (rel) { x = x + cx; }
+            sv_add(x, cy, 1); cx = x;
+        } else if (up == 86) {                                        // V
+            var y = sv_num(); if (rel) { y = y + cy; }
+            sv_add(cx, y, 1); cy = y;
+        } else if (up == 67) {                                        // C
+            var x1 = sv_num(); var y1 = sv_num(); var x2 = sv_num(); var y2 = sv_num(); var x = sv_num(); var y = sv_num();
+            if (rel) { x1 = x1 + cx; y1 = y1 + cy; x2 = x2 + cx; y2 = y2 + cy; x = x + cx; y = y + cy; }
+            sv_cubic(cx, cy, x1, y1, x2, y2, x, y); cx = x; cy = y;
+        } else if (up == 81) {                                        // Q
+            var x1 = sv_num(); var y1 = sv_num(); var x = sv_num(); var y = sv_num();
+            if (rel) { x1 = x1 + cx; y1 = y1 + cy; x = x + cx; y = y + cy; }
+            sv_quad(cx, cy, x1, y1, x, y); cx = x; cy = y;
+        } else { sv_vp++; }
+    }
+}
+
+// ---------------------------------------------------------------- points -> edges -> pixels
+fn sv_edge(x0: int, y0: int, x1: int, y1: int) {
+    if (y0 == y1 || sv_ne >= SV_MAXE) { return; }
+    let b = sv_ne * 4;
+    sv_e[b] = x0; sv_e[b + 1] = y0; sv_e[b + 2] = x1; sv_e[b + 3] = y1;
+    sv_ne++;
+}
+
+fn sv_fill_edges() {
+    sv_ne = 0;
+    var s = 0;
+    while (s < sv_sn) {
+        let a = sv_sub[s];
+        var b = sv_np;
+        if (s + 1 < sv_sn) { b = sv_sub[s + 1]; }
+        var i = a;
+        while (i < b) {
+            var j = i + 1;
+            if (j >= b) { j = a; }
+            sv_edge(sv_pt[i * 3], sv_pt[i * 3 + 1], sv_pt[j * 3], sv_pt[j * 3 + 1]);
+            i++;
+        }
+        s++;
+    }
+}
+
+/// add a small polygon (sv_qx / sv_qy, n points) with positive orientation, so overlapping parts of a stroke add up
+fn sv_poly(n: int) {
+    var area = 0;
+    var i = 0;
+    while (i < n) {
+        let j = (i + 1) % n;
+        area = area + sv_qx[i] * sv_qy[j] - sv_qx[j] * sv_qy[i];
+        i++;
+    }
+    i = 0;
+    while (i < n) {
+        let j = (i + 1) % n;
+        if (area >= 0) { sv_edge(sv_qx[i], sv_qy[i], sv_qx[j], sv_qy[j]); }
+        else { sv_edge(sv_qx[j], sv_qy[j], sv_qx[i], sv_qy[i]); }
+        i++;
+    }
+}
+fn sv_disc_edges(x: int, y: int, r: int) {
+    var j = 0;
+    while (j < 15) {
+        let k = j * 4;
+        sv_qx[j] = x + r * sin60(k) / 1000; sv_qy[j] = y - r * cos60(k) / 1000;
+        j++;
+    }
+    sv_poly(15);
+}
+
+fn sv_stroke_edges(hw: int) {
+    sv_ne = 0;
+    var s = 0;
+    while (s < sv_sn) {
+        let a = sv_sub[s];
+        var b = sv_np;
+        if (s + 1 < sv_sn) { b = sv_sub[s + 1]; }
+        var i = a;
+        while (i < b) {
+            var j = i + 1;
+            var last = (j >= b);
+            if (last) { j = a; }
+            if (!last || sv_subc[s] == 1) {
+                let x0 = sv_pt[i * 3]; let y0 = sv_pt[i * 3 + 1]; let x1 = sv_pt[j * 3]; let y1 = sv_pt[j * 3 + 1];
+                let dx = x1 - x0; let dy = y1 - y0;
+                let len = sv_isqrt(dx * dx + dy * dy);
+                if (len > 0) {
+                    let nx = 0 - dy * hw / len; let ny = dx * hw / len;
+                    sv_qx[0] = x0 + nx; sv_qy[0] = y0 + ny; sv_qx[1] = x1 + nx; sv_qy[1] = y1 + ny;
+                    sv_qx[2] = x1 - nx; sv_qy[2] = y1 - ny; sv_qx[3] = x0 - nx; sv_qy[3] = y0 - ny;
+                    sv_poly(4);
+                }
+            }
+            sv_disc_edges(sv_pt[i * 3], sv_pt[i * 3 + 1], hw);                // round joins and caps at every vertex
+            i++;
+        }
+        s++;
+    }
+}
+
+fn sv_span(xa0: int, xb0: int) {
+    let lim = sv_bw * 256;
+    var xa = xa0; var xb = xb0;
+    if (xa < 0) { xa = 0; }
+    if (xb > lim) { xb = lim; }
+    if (xb <= xa) { return; }
+    let p0 = xa >> 8; let p1 = xb >> 8;
+    if (p0 == p1) { sv_cov[p0] = sv_cov[p0] + (xb - xa) / 4; return; }
+    sv_cov[p0] = sv_cov[p0] + (256 - (xa & 255)) / 4;
+    var p = p0 + 1;
+    while (p < p1) { sv_cov[p] = sv_cov[p] + 64; p++; }
+    if (p1 < sv_bw) { sv_cov[p1] = sv_cov[p1] + (xb & 255) / 4; }
+}
+
+/// composite colour `c` with alpha `a` (0..255) over pixel (x, y) of the bitmap
+fn sv_blend(x: int, y: int, c: int, a: int) {
+    let idx = y * sv_bw + x;
+    let d = sv_out[idx] as int;
+    let da = (d >> 24) & 255;
+    let oa = a + da * (255 - a) / 255;
+    if (oa <= 0) { return; }
+    let wd = da * (255 - a) / 255;
+    let r = (((c >> 16) & 255) * a + ((d >> 16) & 255) * wd) / oa;
+    let g = (((c >> 8) & 255) * a + ((d >> 8) & 255) * wd) / oa;
+    let b = ((c & 255) * a + (d & 255) * wd) / oa;
+    sv_out[idx] = ((oa << 24) | (r << 16) | (g << 8) | b) as u32;
+}
+
+/// scan-convert sv_e (non-zero winding) and composite with the current paint
+fn sv_raster() {
+    let sz = sv_bw;
+    var py = 0;
+    while (py < sv_bh) {
+        var i = 0;
+        while (i < sz) { sv_cov[i] = 0; i++; }
+        var sub = 0;
+        while (sub < 4) {
+            let yc = (py * 4 + sub) * 64 + 32;
+            var n = 0;
+            var e = 0;
+            while (e < sv_ne) {
+                let b = e * 4;
+                let y0 = sv_e[b + 1]; let y1 = sv_e[b + 3];
+                if ((y0 <= yc && yc < y1) || (y1 <= yc && yc < y0)) {
+                    let x0 = sv_e[b]; let x1 = sv_e[b + 2];
+                    let x = x0 + (yc - y0) * (x1 - x0) / (y1 - y0);
+                    var d = 1;
+                    if (y1 < y0) { d = -1; }
+                    if (n < 1000) {
+                        var k = n;
+                        while (k > 0 && sv_cx[k - 1] > x) { sv_cx[k] = sv_cx[k - 1]; sv_cd[k] = sv_cd[k - 1]; k--; }
+                        sv_cx[k] = x; sv_cd[k] = d;
+                        n++;
+                    }
+                }
+                e++;
+            }
+            var wnd = 0; var xa = 0; var k = 0;
+            while (k < n) {
+                let wp = wnd;
+                wnd = wnd + sv_cd[k];
+                if (wp == 0 && wnd != 0) { xa = sv_cx[k]; }
+                if (wp != 0 && wnd == 0) { sv_span(xa, sv_cx[k]); }
+                k++;
+            }
+            sub++;
+        }
+        var px = 0;
+        while (px < sz) {
+            var a = sv_cov[px];
+            if (a > 0) {
+                if (a > 255) { a = 255; }
+                a = a * sv_eop / 256;
+                var col = sv_pc;
+                if (sv_pk == 2) { col = sv_gradient_at(sv_pg, px * 256 + 128, py * 256 + 128); }
+                if (a > 0) { sv_blend(px, py, col, a); }
+            }
+            px++;
+        }
+        py++;
+    }
+}
+
+// ---------------------------------------------------------------- elements
+fn sv_tag_is(name: *u8) -> bool {
+    let nl = kstrlen(name);
+    var j = 0;
+    while (j < nl) { if (sv_ch(sv_ts + 1 + j) != (name[j] as int)) { return false; } j++; }
+    let c = sv_ch(sv_ts + 1 + nl);
+    return c == 32 || c == 47 || c == 62;
+}
+
+fn sv_num_attr(name: *u8, dflt: int) -> int {
+    if (!sv_attr(name)) { return dflt; }
+    return sv_num();
+}
+
+fn sv_paint_shape() {
+    sv_eop = 256;
+    if (sv_attr("opacity")) { sv_eop = sv_num() / 4; }
+    sv_set_paint("fill", sv_tag_is("line") ? 0 : 1);
+    if (sv_pk != 0) { sv_fill_edges(); sv_raster(); }
+    sv_set_paint("stroke", 0);
+    if (sv_pk != 0) {
+        var sw = sv_num_attr("stroke-width", 1024);
+        sv_stroke_edges(sv_fx(sw) / 2);
+        sv_raster();
+    }
+}
+
+fn sv_element() {
+    sv_np = 0; sv_sn = 0;
+    if (sv_tag_is("rect")) {
+        let x = sv_num_attr("x", 0); let y = sv_num_attr("y", 0);
+        let w = sv_num_attr("width", 0); let h = sv_num_attr("height", 0); let rx = sv_num_attr("rx", 0);
+        sv_rrect(x, y, w, h, rx);
+    } else if (sv_tag_is("circle")) {
+        let r = sv_num_attr("r", 0);
+        sv_ellipse(sv_num_attr("cx", 0), sv_num_attr("cy", 0), r, r);
+    } else if (sv_tag_is("ellipse")) {
+        sv_ellipse(sv_num_attr("cx", 0), sv_num_attr("cy", 0), sv_num_attr("rx", 0), sv_num_attr("ry", 0));
+    } else if (sv_tag_is("line")) {
+        let x1 = sv_num_attr("x1", 0); let y1 = sv_num_attr("y1", 0); let x2 = sv_num_attr("x2", 0); let y2 = sv_num_attr("y2", 0);
+        sv_move(x1, y1); sv_add(x2, y2, 1);
+    } else if (sv_tag_is("polygon")) {
+        if (sv_attr("points")) {
+            var first = true;
+            while (true) {
+                sv_skip();
+                if ((sv_val[sv_vp] as int) == 0) { break; }
+                let x = sv_num(); let y = sv_num();
+                if (first) { sv_move(x, y); first = false; } else { sv_add(x, y, 1); }
+            }
+            sv_close();
+        }
+    } else if (sv_tag_is("path")) {
+        if (sv_attr("d")) { sv_path(); }
+    } else { return; }
+    if (sv_np == 0) { return; }
+    sv_paint_shape();
+}
+
+fn sv_gradient_tag() {
+    if (sv_gn >= 6) { return; }
+    let g = sv_gn;
+    if (sv_attr("id")) { kstrncpy(&sv_gid[g * 16], &sv_val[0], 15); } else { sv_gid[g * 16] = 0; }
+    sv_gx[g * 4] = sv_fx(sv_num_attr("x1", 0)); sv_gx[g * 4 + 1] = sv_fx(sv_num_attr("y1", 0));
+    sv_gx[g * 4 + 2] = sv_fx(sv_num_attr("x2", 0)); sv_gx[g * 4 + 3] = sv_fx(sv_num_attr("y2", 0));
+    sv_gsn[g] = 0;
+    sv_gn++;
+}
+fn sv_stop_tag() {
+    if (sv_gn == 0) { return; }
+    let g = sv_gn - 1;
+    let n = sv_gsn[g];
+    if (n >= 4) { return; }
+    sv_gso[g * 4 + n] = sv_num_attr("offset", 0) / 4;
+    var c = 0;
+    if (sv_attr("stop-color")) { c = sv_color(); }
+    sv_gsc[g * 4 + n] = c;
+    sv_gsn[g] = n + 1;
+}
+
+/// rasterise `src` into a fresh size x size ARGB bitmap (NULL when out of memory)
+fn svg_render(src: *u8, size: int) -> *u32 {
+    if (!sv_init()) { return (0 as *u32); }
+    let bm = kzalloc(size * size * 4) as *u32;
+    if (bm == (0 as *u32) || size > 250) { return bm; }
+    sv_out = bm; sv_sz = size; sv_bw = size; sv_bh = size; sv_gm = 0; sv_s = src; sv_gn = 0;
+    var i = 0;
+    while (sv_ch(i) != 0) {
+        if (sv_ch(i) == 60) {
+            sv_ts = i;
+            var j = i;
+            while (sv_ch(j) != 0 && sv_ch(j) != 62) { j++; }
+            sv_te = j;
+            if (sv_ch(i + 1) != 47) {
+                if (sv_tag_is("linearGradient")) { sv_gradient_tag(); }
+                else if (sv_tag_is("stop")) { sv_stop_tag(); }
+                else { sv_element(); }
+            }
+            i = j;
+            if (sv_ch(i) == 0) { break; }
+        }
+        i++;
+    }
+    return bm;
+}
+
+// ---------------------------------------------------------------- cache + drawing
+var svc_kind: int[200]; var svc_size: int[200]; var svc_bm: int[200];
+var svc_n = 0;
+
+fn svg_has(kind: int) -> bool { return kind >= 0 && kind < 128 && (svg_src(kind)[0] as int) != 0; }
+
+fn svg_get(kind: int, size: int) -> *u32 {
+    var i = 0;
+    while (i < svc_n) { if (svc_kind[i] == kind && svc_size[i] == size) { return svc_bm[i] as *u32; } i++; }
+    if (svc_n >= SV_NCACHE || !svg_has(kind)) { return (0 as *u32); }
+    let bm = svg_render(svg_src(kind), size);
+    svc_kind[svc_n] = kind; svc_size[svc_n] = size; svc_bm[svc_n] = bm as int; svc_n++;
+    return bm;
+}
+
+/// draw icon `kind` at (x, y), size x size pixels, opacity 0..256, clipped to the current clip rectangle.
+/// shadow = true draws it as a flat black silhouette (use with a small offset and a low opacity).
+fn svg_draw(kind: int, x: int, y: int, size: int, opacity: int, shadow: bool) {
+    let bm = svg_get(kind, size);
+    if (bm == (0 as *u32)) { return; }
+    var yy = 0;
+    while (yy < size) {
+        let sy = y + yy;
+        if (sy >= clip_y0 && sy < clip_y1) {
+            var xx = 0;
+            while (xx < size) {
+                let sx = x + xx;
+                if (sx >= clip_x0 && sx < clip_x1) {
+                    let p = bm[yy * size + xx] as int;
+                    var a = ((p >> 24) & 255) * opacity / 256;
+                    if (a > 0) {
+                        var c = p & 0xFFFFFF;
+                        if (shadow) { c = 0x04101C; }
+                        let idx = sy * fb_w + sx;
+                        if (a >= 255) { bb[idx] = p64(c) as u64; }
+                        else {
+                            bb[idx] = mixp(bb[idx] as int, c, a + (a >> 7)) as u64;
+                        }
+                    }
+                }
+                xx++;
+            }
+        }
+        yy++;
+    }
+}
+
+/// draw a monochrome glyph (assets/glyphs) in colour `color`: only its coverage is used
+fn svg_tint(kind: int, x: int, y: int, size: int, color: int, opacity: int) {
+    let bm = svg_get(kind, size);
+    if (bm == (0 as *u32)) { return; }
+    var yy = 0;
+    while (yy < size) {
+        let sy = y + yy;
+        if (sy >= clip_y0 && sy < clip_y1) {
+            var xx = 0;
+            while (xx < size) {
+                let sx = x + xx;
+                if (sx >= clip_x0 && sx < clip_x1) {
+                    let a = (((bm[yy * size + xx] as int) >> 24) & 255) * opacity / 256;
+                    if (a > 0) {
+                        let idx = sy * fb_w + sx;
+                        if (a >= 250) { bb[idx] = p64(color) as u64; }
+                        else { bb[idx] = mixp(bb[idx] as int, color, a) as u64; }
+                    }
+                }
+                xx++;
+            }
+        }
+        yy++;
+    }
+}
+/// glyph centred in the rectangle (x, y, w, h), size px square
+fn ui_glyph(g: int, x: int, y: int, w: int, h: int, size: int, color: int) {
+    svg_tint(g, x + (w - size) / 2, y + (h - size) / 2, size, color, 256);
+}

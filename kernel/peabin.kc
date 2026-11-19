@@ -1,0 +1,195 @@
+// peabin.kc -- the Peacock executable format (*.pea), the Peacock counterpart of PE/.exe and ELF.  Author: Divyanshu Sinha (MIT License)
+//
+// A .pea file is a binary: a 64-byte header, a section table, then the sections.  All numbers are little-endian 32-bit.
+//
+//   header   0  7F 'P' 'E' 'A'            magic (the 7F byte, like ELF, keeps text editors from mistaking it for text)
+//            4  u8 class (1 = GUI application)    5  u8 format version (1)    6  u16 flags (bit0 uses 3D, bit1 uses timers)
+//            8  u32 header size (64)     12 u32 section count      16 u32 file size      20 u32 minimum OS (130 = 1.3)
+//           24  i32 entry widget (-1 none: its action runs once when the program starts)      28 u32 build time (unix seconds)
+//           32  16 bytes producer string                 48 u32 CRC-32 of header[0..47] + section table
+//   section table (16 bytes each): u32 type, u32 offset, u32 size, u32 CRC-32 of the section
+//   sections 1 META    title[32] width height background icon widget-count
+//            2 WIDGETS 144-byte records: kind x y w h colour action target hidden action2 target2 value (12 x i32), text[32] arg[32] arg2[32]
+//            3 INFO    author[32] description[96]
+//
+// The loader checks everything before it runs a byte of the program: magic, version, header and section CRCs, section bounds,
+// widget kinds / action numbers / target indices.  The old text format (APP|... lines) is still readable as *source* (".peas"):
+// `peac` compiles source to a binary, `peadump` turns a binary back into source and shows the header.
+
+const PEA_HDR = 64;
+const PEA_REC = 144;
+const PEA_MAGIC0 = 0x7F;
+const PEA_VER = 1;
+const PEA_MINOS = 130;
+const PS_META = 1; const PS_WIDGETS = 2; const PS_INFO = 3;
+const PF_3D = 1; const PF_TIMERS = 2;
+const PEA_CLASS_GUI = 1;
+
+// error codes (negative) returned by pea_decode
+const PE_SHORT = -1; const PE_MAGIC = -2; const PE_VERSION = -3; const PE_HDRCRC = -4; const PE_SECT = -5; const PE_SECCRC = -6;
+const PE_META = -7; const PE_WIDGET = -8; const PE_MANY = -9; const PE_NEWER = -10;
+var pea_last_err = 0;
+
+fn pea_err_str(e: int) -> *u8 {
+    if (e == PE_SHORT) { return "file too short"; }
+    if (e == PE_MAGIC) { return "not a Peacock executable (bad magic)"; }
+    if (e == PE_VERSION) { return "unsupported format version"; }
+    if (e == PE_HDRCRC) { return "header checksum mismatch (file is damaged)"; }
+    if (e == PE_SECT) { return "bad section table"; }
+    if (e == PE_SECCRC) { return "section checksum mismatch (file is damaged)"; }
+    if (e == PE_META) { return "bad program header"; }
+    if (e == PE_WIDGET) { return "invalid widget record"; }
+    if (e == PE_MANY) { return "too many widgets"; }
+    if (e == PE_NEWER) { return "needs a newer Peacock OS"; }
+    return "unknown error";
+}
+
+fn pw32(b: *u8, p: int, v: int) { b[p] = (v & 255) as u8; b[p + 1] = ((v >> 8) & 255) as u8; b[p + 2] = ((v >> 16) & 255) as u8; b[p + 3] = ((v >> 24) & 255) as u8; }
+fn pr32(b: *u8, p: int) -> int {                      // signed
+    var v = (b[p] as int) | ((b[p + 1] as int) << 8) | ((b[p + 2] as int) << 16) | ((b[p + 3] as int) << 24);
+    if (v >= 0x80000000) { v = v - 0x100000000; }
+    return v;
+}
+fn pru32(b: *u8, p: int) -> int { return (b[p] as int) | ((b[p + 1] as int) << 8) | ((b[p + 2] as int) << 16) | ((b[p + 3] as int) << 24); }
+
+/// true when the data starts with the .pea magic
+fn pea_is_binary(src: *u8, len: int) -> bool { return len >= 4 && src[0] == PEA_MAGIC0 && src[1] == 'P' && src[2] == 'E' && src[3] == 'A'; }
+
+fn pea_size(n: int) -> int { return PEA_HDR + 3 * 16 + 64 + n * PEA_REC + 128; }
+
+/// which feature flags the widgets need
+fn pea_flags(wd: *Wd, n: int) -> int {
+    var f = 0; var i = 0;
+    while (i < n) { if (wd[i].kind == WK_VIEW3D) { f = f | PF_3D; } if (wd[i].kind == WK_TIMER) { f = f | PF_TIMERS; } i++; }
+    return f;
+}
+
+/// build a .pea binary into out (needs pea_size(n) bytes); returns its length
+fn pea_encode(out: *u8, wd: *Wd, n: int, title: *u8, w: int, h: int, bg: int, icon: int, entry: int) -> int {
+    let total = pea_size(n);
+    kmemset(out, 0, total);
+    let tab = PEA_HDR;
+    let meta_off = PEA_HDR + 48; let wid_off = meta_off + 64; let info_off = wid_off + n * PEA_REC;
+    // META
+    kstrncpy(out + meta_off, title, 32);
+    pw32(out, meta_off + 32, w); pw32(out, meta_off + 36, h); pw32(out, meta_off + 40, bg); pw32(out, meta_off + 44, icon); pw32(out, meta_off + 48, n);
+    // WIDGETS
+    var i = 0;
+    while (i < n) {
+        let r = wid_off + i * PEA_REC;
+        pw32(out, r, wd[i].kind); pw32(out, r + 4, wd[i].x); pw32(out, r + 8, wd[i].y); pw32(out, r + 12, wd[i].w); pw32(out, r + 16, wd[i].h);
+        pw32(out, r + 20, wd[i].color); pw32(out, r + 24, wd[i].act); pw32(out, r + 28, wd[i].target); pw32(out, r + 32, wd[i].hid);
+        pw32(out, r + 36, wd[i].act2); pw32(out, r + 40, wd[i].target2); pw32(out, r + 44, wd[i].val);
+        kstrncpy(out + r + 48, &wd[i].text[0], 32); kstrncpy(out + r + 80, &wd[i].arg[0], 32); kstrncpy(out + r + 112, &wd[i].arg2[0], 32);
+        i++;
+    }
+    // INFO
+    kstrncpy(out + info_off, "Peacock App Builder", 32);
+    kstrncpy(out + info_off + 32, "", 96);
+    // section table
+    pw32(out, tab, PS_META);    pw32(out, tab + 4, meta_off); pw32(out, tab + 8, 64);          pw32(out, tab + 12, crc32(out + meta_off, 64));
+    pw32(out, tab + 16, PS_WIDGETS); pw32(out, tab + 20, wid_off); pw32(out, tab + 24, n * PEA_REC); pw32(out, tab + 28, crc32(out + wid_off, n * PEA_REC));
+    pw32(out, tab + 32, PS_INFO); pw32(out, tab + 36, info_off); pw32(out, tab + 40, 128);   pw32(out, tab + 44, crc32(out + info_off, 128));
+    // header
+    out[0] = PEA_MAGIC0; out[1] = 'P'; out[2] = 'E'; out[3] = 'A';
+    out[4] = PEA_CLASS_GUI; out[5] = PEA_VER; out[6] = (pea_flags(wd, n) & 255) as u8; out[7] = 0;
+    pw32(out, 8, PEA_HDR); pw32(out, 12, 3); pw32(out, 16, total); pw32(out, 20, PEA_MINOS); pw32(out, 24, entry); pw32(out, 28, fs_now());
+    kstrncpy(out + 32, "peacock-1.3", 16);
+    // header CRC covers bytes 0..47 and the section table (computed in a scratch copy, so the CRC field itself is zero)
+    var tmp: u8[96];
+    kmemcpy(&tmp[0], out, 48); kmemcpy(&tmp[48], out + tab, 48);
+    pw32(out, 48, crc32(&tmp[0], 96));
+    return total;
+}
+
+/// check a binary and decode it. hdr = {w, h, bg, icon, flags, entry}; returns the widget count, or a negative PE_* code
+fn pea_decode(src: *u8, len: int, wd: *Wd, hdr: *int, title: *u8) -> int {
+    if (len < PEA_HDR + 16) { return PE_SHORT; }
+    if (!pea_is_binary(src, len)) { return PE_MAGIC; }
+    if (src[5] != PEA_VER) { return PE_VERSION; }
+    let hsz = pru32(src, 8); let nsec = pru32(src, 12); let fsz = pru32(src, 16);
+    if (hsz != PEA_HDR || nsec < 1 || nsec > 8 || fsz > len || fsz < PEA_HDR + nsec * 16) { return PE_SECT; }
+    if (pru32(src, 20) > PEA_MINOS) { return PE_NEWER; }
+    var tmp: u8[96];
+    if (nsec != 3) { return PE_SECT; }
+    kmemcpy(&tmp[0], src, 48); kmemcpy(&tmp[48], src + PEA_HDR, 48);
+    if ((crc32(&tmp[0], 96) & 0xFFFFFFFF) != pru32(src, 48)) { return PE_HDRCRC; }
+    var meta = -1; var wid = -1; var widn = 0;
+    var s = 0;
+    while (s < nsec) {
+        let e = PEA_HDR + s * 16;
+        let ty = pru32(src, e); let off = pru32(src, e + 4); let sz = pru32(src, e + 8); let cr = pru32(src, e + 12);
+        if (off < PEA_HDR + nsec * 16 || sz < 0 || off + sz > fsz) { return PE_SECT; }
+        if ((crc32(src + off, sz) & 0xFFFFFFFF) != cr) { return PE_SECCRC; }
+        if (ty == PS_META) { if (sz != 64) { return PE_META; } meta = off; }
+        else if (ty == PS_WIDGETS) { wid = off; widn = sz; }
+        s++;
+    }
+    if (meta < 0 || wid < 0) { return PE_SECT; }
+    let n = pr32(src, meta + 48);
+    if (n < 0 || n * PEA_REC != widn) { return PE_META; }
+    if (n > WD_MAX) { return PE_MANY; }
+    let w = pr32(src, meta + 32); let h = pr32(src, meta + 36);
+    if (w < 40 || w > 4000 || h < 40 || h > 4000) { return PE_META; }
+    kmemcpy(title, src + meta, 32); title[31] = 0;
+    hdr[0] = w; hdr[1] = h; hdr[2] = pr32(src, meta + 40); hdr[3] = pr32(src, meta + 44); hdr[4] = src[6] as int; hdr[5] = pr32(src, 24);
+    var i = 0;
+    while (i < n) {
+        let r = wid + i * PEA_REC;
+        let k = pr32(src, r); let a = pr32(src, r + 24); let t = pr32(src, r + 28); let a2 = pr32(src, r + 36); let t2 = pr32(src, r + 40);
+        if (k < 1 || k > WK_MAXK || a < 0 || a >= NACT || a2 < 0 || a2 >= NACT || t < -1 || t >= n || t2 < -1 || t2 >= n) { return PE_WIDGET; }
+        wd[i].kind = k; wd[i].x = pr32(src, r + 4); wd[i].y = pr32(src, r + 8); wd[i].w = pr32(src, r + 12); wd[i].h = pr32(src, r + 16);
+        wd[i].color = pr32(src, r + 20); wd[i].act = a; wd[i].target = t; wd[i].hid = pr32(src, r + 32);
+        wd[i].act2 = a2; wd[i].target2 = t2; wd[i].val = pr32(src, r + 44); wd[i].chk = 0;
+        kmemcpy(&wd[i].text[0], src + r + 48, 32); wd[i].text[31] = 0;
+        kmemcpy(&wd[i].arg[0], src + r + 80, 32); wd[i].arg[31] = 0;
+        kmemcpy(&wd[i].arg2[0], src + r + 112, 32); wd[i].arg2[31] = 0;
+        i++;
+    }
+    if (hdr[5] >= n) { hdr[5] = -1; }
+    return n;
+}
+
+/// a file node holds a runnable program?
+fn pea_runnable(nd: int) -> bool {
+    return nd >= 0 && fs_nodes[nd].kind == K_FILE && pea_is_binary(fs_nodes[nd].data, fs_nodes[nd].size);
+}
+
+/// turn a text source (".peas" / legacy .pea) into a binary, in place or into another file; returns 0 or a negative error
+fn pea_compile(src: *u8, len: int, outnode: int) -> int {
+    var hdr: int[6]; var tt: u8[32];
+    let wd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd;
+    if (wd == (0 as *Wd)) { return PE_MANY; }
+    let n = wd_parse_text(src, len, wd, &hdr[0], &tt[0]);
+    if (n < 0) { kfree(wd as *u8); return PE_MAGIC; }
+    let buf = kzalloc(pea_size(n) + 16);
+    if (buf == (0 as *u8)) { kfree(wd as *u8); return PE_MANY; }
+    let sz = pea_encode(buf, wd, n, &tt[0], hdr[0], hdr[1], hdr[2], 0, -1);
+    var ok = fs_write(outnode, buf, sz, false);
+    if (ok) { fs_set_attr(outnode, FA_EXEC, true); }
+    kfree(buf); kfree(wd as *u8);
+    if (!ok) { return PE_SECT; }
+    return 0;
+}
+
+/// convert every text-format .pea in /apps to a binary (once, at update time)
+fn pea_migrate() {
+    let d = fs_resolve("/apps");
+    if (d < 0) { return; }
+    var ids: int[64];
+    let c = fs_list(d, &ids[0], 64, true);
+    var i = 0;
+    while (i < c) {
+        let nd = ids[i];
+        if (fs_nodes[nd].kind == K_FILE && ends_with(&fs_nodes[nd].name[0], ".pea") && !pea_is_binary(fs_nodes[nd].data, fs_nodes[nd].size) && fs_nodes[nd].size > 0) {
+            let sz = fs_nodes[nd].size;
+            let copy = kmalloc(sz + 1);
+            if (copy != (0 as *u8)) {
+                kmemcpy(copy, fs_nodes[nd].data, sz); copy[sz] = 0;
+                pea_compile(copy, sz, nd);
+                kfree(copy);
+            }
+        }
+        i++;
+    }
+}

@@ -1,0 +1,200 @@
+// x86.kc -- a machine-code emitter written in KingCobra (16/32/64-bit x86 subset for boot code).
+// Author: Divyanshu Sinha (MIT License)
+//
+// This is NOT an assembler front-end (there is no text syntax to parse): every function below appends the
+// encoding of exactly one instruction to a byte array, and `finish()` resolves label references.  The Peacock
+// boot stage is a KingCobra program that calls these functions, so the bootloader source is KingCobra and
+// neither NASM nor KASM is involved.
+//
+//   x.org(0x7C00); x.bits(16); x.label("start"); x.cli(); x.mov_ri(x.SP, 0x7C00, 16); ...  let bytes = x.finish();
+//
+// Operand sizes are passed as 8, 16 or 32 and the 0x66 prefix is added when it differs from the current mode's default.
+// A string where a number is expected is a label (absolute for immediates/addresses, relative for jumps and calls).
+
+const AX = 0; const CX = 1; const DX = 2; const BX = 3; const SP = 4; const BP = 5; const SI = 6; const DI = 7;
+const ES = 0; const CS = 1; const SS = 2; const DS = 3; const FS = 4; const GS = 5;
+const OP_ADD = 0; const OP_OR = 1; const OP_ADC = 2; const OP_SBB = 3; const OP_AND = 4; const OP_SUB = 5; const OP_XOR = 6; const OP_CMP = 7;
+const CC_B = 2; const CC_AE = 3; const CC_E = 4; const CC_NE = 5; const CC_BE = 6; const CC_A = 7;
+
+var buf = [];
+var org_addr = 0;
+var mode = 16;
+var labels = {};
+var fixups = [];
+
+fn org(a: int) { org_addr = a; }
+fn bits(m: int) { mode = m; }
+fn pos() -> int { return org_addr + len(buf); }
+fn label(name: string) { labels[name] = pos(); }
+fn addr_of(name: string) -> int { return labels[name]; }
+
+fn db(v: int) { buf.push(v & 0xFF); }
+fn dw(v: int) { db(v); db(v >> 8); }
+fn dd(v: int) { db(v); db(v >> 8); db(v >> 16); db(v >> 24); }
+fn dq(v: int) { dd(v); dd(v >> 32); }
+fn bytes(a) { for (v in a) { db(v); } }
+fn cstr(s: string) { var i = 0; while (i < len(s)) { db(ord(s[i])); i = i + 1; } }
+fn zeros(n: int) { var i = 0; while (i < n) { db(0); i = i + 1; } }
+fn pad_to(addr: int) { if (pos() > addr) { throw "x86: image is past " + str(addr) + " (at " + str(pos()) + ")"; } while (pos() < addr) { db(0); } }
+fn align(n: int, fill: int = 0) { while ((pos() % n) != 0) { db(fill); } }
+
+/// emit an n-byte little-endian value, or a label reference that finish() fills in (absolute)
+fn val(v, n: int) {
+    if (typeof(v) == "string") {
+        fixups.push({ at: len(buf), name: v, size: n, rel: false });
+        zeros(n);
+        return;
+    }
+    var i = 0;
+    while (i < n) { db(v >> (8 * i)); i = i + 1; }
+}
+fn rel(name: string, n: int) { fixups.push({ at: len(buf), name: name, size: n, rel: true }); zeros(n); }
+
+fn osz(sz: int) {
+    var def = 32;
+    if (mode == 16) { def = 16; }
+    if (sz != 8 && sz != def) { db(0x66); }
+}
+fn fits8(v: int, sz: int) -> bool {
+    var s = v;
+    if (sz == 16) { s = v & 0xFFFF; if (s >= 0x8000) { s = s - 0x10000; } }
+    if (sz == 32) { s = v & 0xFFFFFFFF; if (s >= 0x80000000) { s = s - 0x100000000; } }
+    return s >= -128 && s <= 127;
+}
+
+// ---- ModRM helpers
+fn mem_abs(reg: int, addr) {
+    if (mode == 16) { db((reg << 3) | 6); val(addr, 2); }
+    else { db((reg << 3) | 5); val(addr, 4); }
+}
+fn mem_ind(reg: int, base: int, disp: int) {
+    var rm = base;
+    if (mode == 16) {
+        if (base == SI) { rm = 4; } else if (base == DI) { rm = 5; } else if (base == BX) { rm = 7; }
+        else { throw "x86: unsupported 16-bit base register"; }
+    }
+    var md = 0;
+    if (disp != 0 || base == BP) { md = 1; }
+    db((md << 6) | (reg << 3) | rm);
+    if (md == 1) { db(disp); }
+}
+
+// ---- data movement
+fn mov_ri(r: int, imm, sz: int) {
+    if (sz == 8) { db(0xB0 + r); val(imm, 1); return; }
+    osz(sz); db(0xB8 + r); val(imm, sz / 8);
+}
+fn mov_rr(dst: int, src: int, sz: int) {
+    osz(sz); if (sz == 8) { db(0x88); } else { db(0x89); }
+    db(0xC0 | (src << 3) | dst);
+}
+fn mov_mi(addr, imm, sz: int) {
+    osz(sz); if (sz == 8) { db(0xC6); } else { db(0xC7); }
+    mem_abs(0, addr); val(imm, sz / 8);
+}
+fn mov_mr(addr, r: int, sz: int) {          // [addr] <- r   (the accumulator uses the short moffs form, like every assembler does)
+    osz(sz);
+    if (r == AX) { if (sz == 8) { db(0xA2); } else { db(0xA3); } val(addr, mode == 16 ? 2 : 4); return; }
+    if (sz == 8) { db(0x88); } else { db(0x89); }
+    mem_abs(r, addr);
+}
+fn mov_rm(r: int, addr, sz: int) {          // r <- [addr]
+    osz(sz);
+    if (r == AX) { if (sz == 8) { db(0xA0); } else { db(0xA1); } val(addr, mode == 16 ? 2 : 4); return; }
+    if (sz == 8) { db(0x8A); } else { db(0x8B); }
+    mem_abs(r, addr);
+}
+fn mov_ind_r(base: int, disp: int, r: int, sz: int) { osz(sz); if (sz == 8) { db(0x88); } else { db(0x89); } mem_ind(r, base, disp); }
+fn mov_ind_i(base: int, disp: int, imm, sz: int) { osz(sz); if (sz == 8) { db(0xC6); } else { db(0xC7); } mem_ind(0, base, disp); val(imm, sz / 8); }
+fn mov_sr(sreg: int, r: int) { db(0x8E); db(0xC0 | (sreg << 3) | r); }
+fn mov_r_cr(r: int, cr: int) { db(0x0F); db(0x20); db(0xC0 | (cr << 3) | r); }
+fn mov_cr_r(cr: int, r: int) { db(0x0F); db(0x22); db(0xC0 | (cr << 3) | r); }
+fn movzx_rr(dst: int, src: int, srcsz: int, dstsz: int) {
+    osz(dstsz); db(0x0F); if (srcsz == 8) { db(0xB6); } else { db(0xB7); } db(0xC0 | (dst << 3) | src);
+}
+fn movzx_rm(dst: int, addr, srcsz: int, dstsz: int) {
+    osz(dstsz); db(0x0F); if (srcsz == 8) { db(0xB6); } else { db(0xB7); } mem_abs(dst, addr);
+}
+fn lodsb() { db(0xAC); }
+fn lodsw() { osz(16); db(0xAD); }
+fn push_r(r: int, sz: int) { osz(sz); db(0x50 + r); }
+fn pop_r(r: int, sz: int) { osz(sz); db(0x58 + r); }
+
+// ---- arithmetic / logic
+fn alu_ri(op: int, r: int, imm: int, sz: int) {
+    if (sz == 8) {
+        if (r == AX) { db((op << 3) | 4); db(imm); } else { db(0x80); db(0xC0 | (op << 3) | r); db(imm); }
+        return;
+    }
+    osz(sz);
+    if (fits8(imm, sz)) { db(0x83); db(0xC0 | (op << 3) | r); db(imm); return; }
+    if (r == AX) { db((op << 3) | 5); val(imm, sz / 8); return; }
+    db(0x81); db(0xC0 | (op << 3) | r); val(imm, sz / 8);
+}
+fn alu_rr(op: int, dst: int, src: int, sz: int) {          // dst op= src   (encoded as  op r/m, r)
+    osz(sz); if (sz == 8) { db((op << 3) | 0); } else { db((op << 3) | 1); }
+    db(0xC0 | (src << 3) | dst);
+}
+fn alu_mr(op: int, addr, r: int, sz: int) {                // [addr] op= r
+    osz(sz); if (sz == 8) { db((op << 3) | 0); } else { db((op << 3) | 1); }
+    mem_abs(r, addr);
+}
+fn alu_mi(op: int, addr, imm: int, sz: int) {              // [addr] op= imm
+    osz(sz);
+    if (sz == 8) { db(0x80); mem_abs(op, addr); db(imm); return; }
+    if (fits8(imm, sz)) { db(0x83); mem_abs(op, addr); db(imm); return; }
+    db(0x81); mem_abs(op, addr); val(imm, sz / 8);
+}
+fn test_rr(a: int, b: int, sz: int) { osz(sz); if (sz == 8) { db(0x84); } else { db(0x85); } db(0xC0 | (b << 3) | a); }
+fn shl_ri(r: int, n: int, sz: int) { osz(sz); if (sz == 8) { db(0xC0); } else { db(0xC1); } db(0xE0 | r); db(n); }
+fn shr_ri(r: int, n: int, sz: int) { osz(sz); if (sz == 8) { db(0xC0); } else { db(0xC1); } db(0xE8 | r); db(n); }
+fn inc_r(r: int, sz: int) { osz(sz); db(0x40 + r); }           // 16/32-bit register forms (not for 64-bit mode)
+
+// ---- control flow
+fn jcc(cc: int, name: string) { db(0x70 | cc); rel(name, 1); }
+fn jmp_s(name: string) { db(0xEB); rel(name, 1); }
+fn jmp_n(name: string) { db(0xE9); rel(name, mode == 16 ? 2 : 4); }
+fn call_n(name: string) { db(0xE8); rel(name, mode == 16 ? 2 : 4); }
+fn jcxz(name: string) { db(0xE3); rel(name, 1); }
+/// far jump to sel:target.  `offsz` is the offset width in bytes (2 or 4); in 16-bit mode a 4-byte offset needs the 0x66 prefix.
+fn jmp_far(sel: int, target, offsz: int) {
+    if (mode == 16 && offsz == 4) { db(0x66); }
+    db(0xEA); val(target, offsz); dw(sel);
+}
+fn jmp_r(r: int) { db(0xFF); db(0xE0 | r); }
+fn int_(n: int) { db(0xCD); db(n); }
+fn ret() { db(0xC3); }
+fn hlt() { db(0xF4); }
+fn cli() { db(0xFA); }
+fn sti() { db(0xFB); }
+fn cld() { db(0xFC); }
+fn in_al(port: int) { db(0xE4); db(port); }
+fn out_al(port: int) { db(0xE6); db(port); }
+fn lgdt_m(addr) { db(0x0F); db(0x01); mem_abs(2, addr); }
+fn rep_stosd() { db(0xF3); db(0xAB); }
+fn rep_insd() { db(0xF3); db(0x6D); }                    // rep insd: port DX -> [ES:EDI]  (32-bit mode)
+fn in_dx() { db(0xEC); }                                 // in al, dx
+fn out_dx() { db(0xEE); }                                // out dx, al
+fn cpuid() { db(0x0F); db(0xA2); }
+fn rdmsr() { db(0x0F); db(0x32); }
+fn wrmsr() { db(0x0F); db(0x30); }
+
+/// resolve label references and return the finished byte array
+fn finish() {
+    for (f in fixups) {
+        if (!(f.name in labels)) { throw "x86: undefined label '" + f.name + "'"; }
+        let target = labels[f.name];
+        var v = target;
+        if (f.rel) {
+            v = target - (org_addr + f.at + f.size);
+            if (f.size == 1 && (v < -128 || v > 127)) { throw "x86: short jump to '" + f.name + "' is out of range (" + str(v) + ")"; }
+            if (f.size == 2 && (v < -32768 || v > 32767)) { throw "x86: jump to '" + f.name + "' is out of range"; }
+        } else {
+            if (f.size == 1 && (v < 0 || v > 255)) { throw "x86: label '" + f.name + "' does not fit a byte"; }
+            if (f.size == 2 && (v < 0 || v > 65535)) { throw "x86: label '" + f.name + "' does not fit 16 bits (0x" + str(v) + ")"; }
+        }
+        var i = 0;
+        while (i < f.size) { buf[f.at + i] = (v >> (8 * i)) & 0xFF; i = i + 1; }
+    }
+    return buf;
+}

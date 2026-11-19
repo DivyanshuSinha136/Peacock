@@ -1,0 +1,223 @@
+// settings.kc -- the Settings app: one window with a sidebar (Appearance, Fonts, Network, USB, System) that hosts the older
+// Appearance / Fonts / System Info apps as pages and adds Network and USB pages.  Author: Divyanshu Sinha (MIT License)
+// The wrapped apps draw into the page area (client x + SET_SB); ui_inval() maps their invalidations onto this window.
+
+const SET_SB = 150;
+const SP_APPEAR = 0; const SP_FONTS = 1; const SP_NET = 2; const SP_USB = 3; const SP_SYS = 4; const SP_DEV = 5;
+const SET_NP = 6;
+var set_page = 0;
+var set_sec = -1;
+var set_hov = -1;
+
+fn set_wraps(kind: int) -> bool { return kind == APP_THEME || kind == APP_FONT || kind == APP_INFO; }
+/// the page that replaces an old app kind, or -1
+fn set_page_for(kind: int) -> int {
+    if (kind == APP_THEME) { return SP_APPEAR; }
+    if (kind == APP_FONT) { return SP_FONTS; }
+    if (kind == APP_INFO) { return SP_SYS; }
+    return -1;
+}
+fn set_label(p: int) -> *u8 {
+    if (p == SP_APPEAR) { return "Appearance"; }
+    if (p == SP_FONTS) { return "Fonts"; }
+    if (p == SP_NET) { return "Network"; }
+    if (p == SP_USB) { return "USB"; }
+    if (p == SP_DEV) { return "Devices"; }
+    return "System";
+}
+fn set_goto(p: int) {
+    if (p < 0 || p >= SET_NP) { return; }
+    set_page = p;
+    ui_inval_all(APP_SETTINGS);
+}
+fn set_open(p: int) { set_goto(p); app_open(APP_SETTINGS); set_goto(p); }
+
+fn set_size(out: *int) {
+    var a: int[2]; var b: int[2];
+    th_size(&a[0]); fa_size(&b[0]);
+    var w = a[0]; var h = a[1];
+    if (b[0] > w) { w = b[0]; }
+    if (b[1] > h) { h = b[1]; }
+    if (w < 460) { w = 460; }
+    if (h < 330) { h = 330; }
+    out[0] = SET_SB + w; out[1] = h;
+}
+fn set_init() { th_init(); fa_init(); info_init(); set_sec = -1; set_hov = -1; }
+fn set_close() { th_close(); fa_close(); }
+
+fn set_tick() -> bool {
+    let s = ticks / 100;
+    if (s == set_sec) { return false; }
+    set_sec = s;
+    return set_page == SP_SYS || set_page == SP_NET || set_page == SP_USB;
+}
+
+fn set_hex(v: int, out: *u8) {
+    var i = 0;
+    while (i < 4) { let n = (v >> ((3 - i) * 4)) & 15; if (n < 10) { out[i] = ('0' + n) as u8; } else { out[i] = ('a' + n - 10) as u8; } i++; }
+    out[4] = 0;
+}
+fn set_mac_str(out: *u8) {
+    var i = 0; var o = 0;
+    while (i < 6) {
+        let n = my_mac[i] as int;
+        let hi = n >> 4; let lo = n & 15;
+        if (hi < 10) { out[o] = ('0' + hi) as u8; } else { out[o] = ('a' + hi - 10) as u8; }
+        if (lo < 10) { out[o + 1] = ('0' + lo) as u8; } else { out[o + 1] = ('a' + lo - 10) as u8; }
+        o = o + 2;
+        if (i < 5) { out[o] = ':'; o++; }
+        i++;
+    }
+    out[o] = 0;
+}
+
+fn set_row(x: int, y: int, k: *u8, v: *u8) { draw_text(x, y, k, 0x5B6784); draw_text(x + 130, y, v, C_INK); }
+
+fn set_page_head(x: int, y: int, w: int, t: *u8, sub: *u8) {
+    fill(x, y, w, 62, 0xFFFFFF);
+    draw_text_sc(x + 18, y + 10, t, C_INK, 2);
+    draw_text(x + 20, y + 40, sub, 0x6A7690);
+    hline(x, y + 61, w, 0xD3D9E6);
+}
+
+fn set_net_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    set_page_head(x, y, w, "Network", "Ethernet adapter and address");
+    var ry = y + 82;
+    var b: u8[24];
+    var adapter = "none found";
+    if (net_ready) { adapter = "RealTek RTL8139"; }
+    set_row(x + 20, ry, "Adapter", adapter); ry = ry + 24;
+    var st = "not connected";
+    if (net_up) { st = "connected"; }
+    set_row(x + 20, ry, "Status", st); ry = ry + 24;
+    if (net_ready) { set_mac_str(&b[0]); set_row(x + 20, ry, "MAC address", &b[0]); ry = ry + 24; }
+    ip_str(my_ip, &b[0]); set_row(x + 20, ry, "IP address", &b[0]); ry = ry + 24;
+    ip_str(net_mask, &b[0]); set_row(x + 20, ry, "Subnet mask", &b[0]); ry = ry + 24;
+    ip_str(gw_ip, &b[0]); set_row(x + 20, ry, "Gateway", &b[0]); ry = ry + 24;
+    ip_str(dns_ip, &b[0]); set_row(x + 20, ry, "DNS server", &b[0]); ry = ry + 24;
+    draw_text(x + 20, ry, "Packets", 0x5B6784);
+    var e = draw_num(x + 150, ry, net_rx_count, C_INK); e = draw_text(e, ry, " in / ", C_INK); e = draw_num(e, ry, net_tx_count, C_INK); draw_text(e, ry, " out", C_INK);
+    ry = ry + 30;
+    draw_text(x + 20, ry, &net_note[0], 0x6A7690);
+}
+
+fn set_usb_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    set_page_head(x, y, w, "USB", "UHCI host controller and attached devices");
+    var ry = y + 78;
+    var st = "no controller";
+    if (usb_ok) { st = "UHCI (USB 1.1) running"; }
+    set_row(x + 20, ry, "Controller", st); ry = ry + 22;
+    draw_text(x + 20, ry, "Root ports", 0x5B6784);
+    draw_num(x + 150, ry, usb_nports, C_INK); ry = ry + 22;
+    set_row(x + 20, ry, "Status", &usb_note[0]); ry = ry + 30;
+    var k = 0;
+    let n = usb_count();
+    if (n == 0) {
+        draw_text(x + 20, ry, "No devices. Attach one with QEMU: -device usb-kbd, usb-tablet, usb-storage", 0x6A7690);
+        return;
+    }
+    while (k < n) {
+        let d = usb_nth(k);
+        rfill(x + 16, ry, w - 32, 54, 8, 0xFFFFFF, false);
+        var bc = 0x2E86DE;
+        if (ud_kind[d] == UK_STORAGE) { bc = 0xE8B923; } else if (ud_kind[d] == UK_MOUSE || ud_kind[d] == UK_TABLET) { bc = 0x27AE60; }
+        rfill(x + 24, ry + 9, 36, 36, 8, bc, false);
+        let kn = usb_kind_name(ud_kind[d]);
+        draw_char(x + 38, ry + 19, kn[0] as int, 0xFFFFFF);
+        draw_text(x + 72, ry + 8, ud_namep(d), C_INK);
+        var hx: u8[8]; var hy: u8[8];
+        set_hex(ud_vid[d], &hx[0]); set_hex(ud_pid[d], &hy[0]);
+        var e = draw_text(x + 72, ry + 30, usb_kind_name(ud_kind[d]), 0x6A7690);
+        e = draw_text(e, ry + 30, "  port ", 0x6A7690); e = draw_num(e, ry + 30, ud_port[d] + 1, 0x6A7690);
+        e = draw_text(e, ry + 30, "  id ", 0x6A7690); e = draw_text(e, ry + 30, &hx[0], 0x6A7690); e = draw_text(e, ry + 30, ":", 0x6A7690); e = draw_text(e, ry + 30, &hy[0], 0x6A7690);
+        if (ud_kind[d] == UK_STORAGE && ud_bsize[d] == 512) {
+            e = draw_text(e, ry + 30, "  ", 0x6A7690);
+            if (ud_blocks[d] >= 2048) { e = draw_num(e, ry + 30, ud_blocks[d] / 2048, 0x6A7690); draw_text(e, ry + 30, " MiB", 0x6A7690); }
+            else { e = draw_num(e, ry + 30, ud_blocks[d] / 2, 0x6A7690); draw_text(e, ry + 30, " KiB", 0x6A7690); }
+        }
+        ry = ry + 62;
+        k++;
+    }
+}
+
+fn set_dev_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    set_page_head(x, y, w, "Devices", "PCI bus, processor and firmware");
+    var ry = y + 74;
+    set_row(x + 20, ry, "Processor", &cpu_brand[0]); ry = ry + 20;
+    var e = draw_text(x + 20, ry, "Package", 0x5B6784);
+    e = draw_text(x + 150, ry, &cpu_vendor[0], C_INK); e = draw_text(e, ry, "  family ", C_INK); e = draw_num(e, ry, cpu_fam, C_INK);
+    e = draw_text(e, ry, " model ", C_INK); draw_num(e, ry, cpu_mod, C_INK); ry = ry + 20;
+    var fw = "no ACPI tables";
+    if (acpi_ok) { fw = "ACPI, soft-off known"; if (acpi_slp_a < 0) { fw = "ACPI, no S5 found"; } }
+    set_row(x + 20, ry, "Firmware", fw); ry = ry + 26;
+    draw_text(x + 20, ry, "PCI", 0x5B6784);
+    e = draw_num(x + 54, ry, pci_n, C_INK); e = draw_text(e, ry, " function(s) on ", C_INK); e = draw_num(e, ry, pci_buses, C_INK); draw_text(e, ry, " bus(es)", C_INK);
+    ry = ry + 22;
+    hline(x + 16, ry - 3, w - 32, 0xD3D9E6);
+    var i = 0;
+    while (i < pci_n && ry + 18 <= y + h) {
+        var id: u8[12];
+        set_hex(pd_vid[i], &id[0]);
+        draw_text(x + 20, ry, &id[0], 0x6A7690);
+        set_hex(pd_did[i], &id[0]);
+        draw_text(x + 62, ry, &id[0], 0x6A7690);
+        let dn = pci_dev_name(pd_vid[i], pd_did[i]);
+        if (dn[0] != 0) { draw_text(x + 112, ry, dn, C_INK); } else { draw_text(x + 112, ry, pci_class_name(pd_cls[i]), C_INK); }
+        let dr = pci_driver_name(i);
+        if (dr[0] != 0) { draw_text(x + w - 120, ry, dr, 0x1E8E6A); }
+        ry = ry + 18;
+        i++;
+    }
+}
+
+fn set_draw(x: int, y: int, w: int, h: int, foc: bool) {
+    fill(x, y, SET_SB, h, 0xE6EAF3);
+    vline(x + SET_SB - 1, y, h, 0xD0D6E4);
+    draw_text(x + 16, y + 12, "Settings", C_INK);
+    var p = 0;
+    while (p < SET_NP) {
+        let ry = y + 40 + p * 38;
+        if (p == set_page) { rfill(x + 8, ry, SET_SB - 16, 32, 8, 0xFFFFFF, false); rfill(x + 8, ry + 8, 3, 16, 1, th_edge, false); }
+        else if (p == set_hov) { rfill(x + 8, ry, SET_SB - 16, 32, 8, 0xD8DEEC, false); }
+        var kind = 0;
+        if (p == SP_APPEAR) { kind = APP_THEME; } else if (p == SP_FONTS) { kind = APP_FONT; } else if (p == SP_SYS) { kind = APP_INFO; }
+        if (kind != 0 && svg_has(kind)) { svg_draw(kind, x + 18, ry + 6, 20, 256, false); }
+        else {
+            var bc = 0x2E86DE;
+            if (p == SP_USB) { bc = 0x8E44AD; }
+            rfill(x + 18, ry + 6, 20, 20, 5, bc, false);
+            let sl = set_label(p);
+            draw_char(x + 24, ry + 8, sl[0] as int, 0xFFFFFF);
+        }
+        draw_text(x + 46, ry + 8, set_label(p), C_INK);
+        p++;
+    }
+    let px = x + SET_SB; let pw = w - SET_SB;
+    if (set_page == SP_APPEAR) { th_draw(px, y, pw, h); }
+    else if (set_page == SP_FONTS) { fill(px, y, pw, h, C_PANEL); fa_draw(px, y, pw, h); }
+    else if (set_page == SP_NET) { set_net_draw(px, y, pw, h); }
+    else if (set_page == SP_USB) { set_usb_draw(px, y, pw, h); }
+    else if (set_page == SP_DEV) { set_dev_draw(px, y, pw, h); }
+    else { info_draw(px, y, pw, h); }
+}
+
+fn set_key(k: int) {
+    if (set_page == SP_APPEAR) { th_key(k); }
+    else if (set_page == SP_FONTS) { fa_key(k); }
+}
+
+fn set_mouse(mx: int, my: int, ev: int) {
+    if (mx < SET_SB) {
+        let p = (my - 40) / 38;
+        var h = -1;
+        if (my >= 40 && p >= 0 && p < SET_NP) { h = p; }
+        if (ev == 1 && h >= 0 && h != set_page) { set_goto(h); return; }
+        if (h != set_hov) { set_hov = h; ui_inval(APP_SETTINGS, 0, 0, SET_SB, 40 + SET_NP * 38); }
+        return;
+    }
+    if (set_page == SP_APPEAR) { th_mouse(mx - SET_SB, my, ev); }
+    else if (set_page == SP_FONTS) { fa_mouse(mx - SET_SB, my, ev); }
+}

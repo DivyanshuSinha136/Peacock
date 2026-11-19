@@ -1,0 +1,113 @@
+// studio3d.kc -- the 3D Studio app: look at the built-in 3D models, spin them, change style and colour.
+// Author: Divyanshu Sinha (MIT License)
+// Drag in the view to rotate, arrows rotate, Space spins, + / - zoom, 1..7 pick a model, S cycles the style.
+const S3_W = 640; const S3_H = 440; const S3_VW = 436; const S3_PX = 448;
+var s3_model = 4; var s3_yaw = 24; var s3_pitch = 14; var s3_style = 0; var s3_col = 0;
+var s3_spin = 1; var s3_zoom = 256; var s3_shadow = true;
+var s3_drag = false; var s3_dx = 0; var s3_dy = 0; var s3_last = 0;
+var s3_pal: int[8] = [0x4F7CFF, 0xE6502D, 0x30A060, 0xF1B72E, 0xB04FE0, 0x20B8C8, 0xE8607A, 0xDADFE8];
+
+fn s3_size(out: *int) { out[0] = S3_W; out[1] = S3_H; }
+fn s3_init() { s3_last = ticks; }
+fn s3_close() { s3_drag = false; }
+
+fn s3_chip(x: int, y: int, w: int, h: int, label: *u8, on: bool) {
+    if (on) { rfill(x, y, w, h, 7, th_acc, false); rfill(x + 1, y + 1, w - 2, h - 2, 6, th_sel(), false); }
+    else { rfill(x, y, w, h, 7, 0xD9DEEA, false); rfill(x + 1, y + 1, w - 2, h - 2, 6, 0xFFFFFF, false); }
+    draw_text(x + (w - text_w(label)) / 2, y + (h - 16) / 2, label, C_INK);
+}
+
+fn s3_draw(x: int, y: int, w: int, h: int) {
+    // viewport: soft studio backdrop with a floor line
+    vgrad(x, y, S3_VW, h, 0xF4F6FB, 0xC9D1E3);
+    g3_shadow = s3_shadow; g3_zoom = s3_zoom;
+    g3_render(x + 8, y + 8, S3_VW - 16, h - 16, s3_model, s3_yaw, s3_pitch, s3_style, s3_pal[s3_col]);
+    draw_text(x + 12, y + 10, g3_name(s3_model), 0x4A5470);
+    // side panel
+    let px0 = x + S3_PX;
+    fill(x + S3_VW, y, w - S3_VW, h, 0xE9EDF5);
+    fill(x + S3_VW, y, 1, h, 0xD0D6E4);
+    draw_text(px0, y + 10, "Model", 0x4A5470);
+    var i = 0;
+    while (i < G3_MODELS) { s3_chip(px0 + (i % 2) * 96, y + 30 + (i / 2) * 30, 92, 26, g3_name(i), i == s3_model); i++; }
+    draw_text(px0, y + 160, "Style", 0x4A5470);
+    s3_chip(px0, y + 180, 60, 26, "Solid", s3_style == 0);
+    s3_chip(px0 + 64, y + 180, 60, 26, "Wire", s3_style == 1);
+    s3_chip(px0 + 128, y + 180, 60, 26, "Both", s3_style == 2);
+    draw_text(px0, y + 216, "Colour", 0x4A5470);
+    i = 0;
+    while (i < 8) {
+        let sx = px0 + i * 24;
+        if (i == s3_col) { rfill(sx - 2, y + 234, 24, 24, 6, th_acc, false); }
+        rfill(sx, y + 236, 20, 20, 5, s3_pal[i], false);
+        i++;
+    }
+    draw_text(px0, y + 268, "Spin", 0x4A5470);
+    a2_ibtn(px0, y + 288, 32, 26, G_CHEVRON_LEFT, 0xFFFFFF, C_INK);
+    var sp: u8[8];
+    var sn = 0;
+    if (s3_spin < 0) { sp[0] = '-'; sn = 1; }
+    itoa(iabs(s3_spin), &sp[sn]);
+    text_c(px0 + 36, 32, y + 293, &sp[0], C_INK);
+    a2_ibtn(px0 + 72, y + 288, 32, 26, G_CHEVRON_RIGHT, 0xFFFFFF, C_INK);
+    draw_text(px0 + 116, y + 268, "Zoom", 0x4A5470);
+    a2_btn(px0 + 116, y + 288, 34, 26, "-", 0xFFFFFF);
+    a2_btn(px0 + 154, y + 288, 34, 26, "+", 0xFFFFFF);
+    s3_chip(px0, y + 328, 188, 26, s3_shadow ? "Shadow: on" : "Shadow: off", s3_shadow);
+    draw_text(px0, y + h - 40, "Drag the view to rotate.", 0x6B7490);
+    var st: u8[40];
+    var n = itoa(g3_tris, &st[0]);
+    kstrncpy(&st[n], " triangles drawn", 24);
+    draw_text(px0, y + h - 22, &st[0], 0x6B7490);
+}
+
+fn s3_pitch_clamp() { if (s3_pitch > 60) { s3_pitch = 60; } if (s3_pitch < -60) { s3_pitch = -60; } }
+
+fn s3_mouse(mx: int, my: int, ev: int) {
+    if (ev == 3) { s3_drag = false; return; }
+    if (ev == 2 && s3_drag) {
+        s3_yaw = (s3_yaw + (mx - s3_dx) / 2) & 255;
+        s3_pitch = s3_pitch + (my - s3_dy) / 3; s3_pitch_clamp();
+        s3_dx = mx; s3_dy = my;
+        ui_inval_all(APP_3D);
+        return;
+    }
+    if (ev != 1) { return; }
+    if (mx < S3_VW) { s3_drag = true; s3_dx = mx; s3_dy = my; return; }
+    let px0 = S3_PX;
+    var i = 0;
+    while (i < G3_MODELS) {
+        if (in_rect(mx, my, px0 + (i % 2) * 96, 30 + (i / 2) * 30, 92, 26)) { s3_model = i; ui_inval_all(APP_3D); return; }
+        i++;
+    }
+    i = 0;
+    while (i < 3) { if (in_rect(mx, my, px0 + i * 64, 180, 60, 26)) { s3_style = i; ui_inval_all(APP_3D); return; } i++; }
+    i = 0;
+    while (i < 8) { if (in_rect(mx, my, px0 + i * 24, 236, 20, 20)) { s3_col = i; ui_inval_all(APP_3D); return; } i++; }
+    if (in_rect(mx, my, px0, 288, 32, 26)) { s3_spin = imax(s3_spin - 1, -4); }
+    else if (in_rect(mx, my, px0 + 72, 288, 32, 26)) { s3_spin = imin(s3_spin + 1, 4); }
+    else if (in_rect(mx, my, px0 + 116, 288, 34, 26)) { s3_zoom = imax(s3_zoom - 32, 96); }
+    else if (in_rect(mx, my, px0 + 154, 288, 34, 26)) { s3_zoom = imin(s3_zoom + 32, 480); }
+    else if (in_rect(mx, my, px0, 328, 188, 26)) { s3_shadow = !s3_shadow; }
+    else { return; }
+    ui_inval_all(APP_3D);
+}
+
+fn s3_key(k: int) {
+    if (k == KEY_LEFT) { s3_yaw = (s3_yaw - 8) & 255; }
+    else if (k == KEY_RIGHT) { s3_yaw = (s3_yaw + 8) & 255; }
+    else if (k == KEY_UP) { s3_pitch = s3_pitch + 8; s3_pitch_clamp(); }
+    else if (k == KEY_DOWN) { s3_pitch = s3_pitch - 8; s3_pitch_clamp(); }
+    else if (k == ' ') { if (s3_spin == 0) { s3_spin = 1; } else { s3_spin = 0; } }
+    else if (k == '+' || k == '=') { s3_zoom = imin(s3_zoom + 32, 480); }
+    else if (k == '-') { s3_zoom = imax(s3_zoom - 32, 96); }
+    else if (k >= '1' && k <= '7') { s3_model = k - '1'; }
+    else if (k == 's' || k == 'S') { s3_style = (s3_style + 1) % 3; }
+    else { return; }
+    ui_inval_all(APP_3D);
+}
+
+fn s3_tick() -> bool {
+    if (s3_spin != 0 && !s3_drag && ticks - s3_last >= 4) { s3_last = ticks; s3_yaw = (s3_yaw + s3_spin) & 255; return true; }
+    return false;
+}

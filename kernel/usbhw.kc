@@ -1,0 +1,23 @@
+// usbhw.kc -- the real-hardware side of usb.kc: PCI lookup of a UHCI controller and its I/O-port registers.
+// Author: Divyanshu Sinha (MIT License)  (tests/host/usb_host.kc replaces this file with a simulated controller)
+
+fn uh_r16(o: int) -> int { return inw(usb_io + o) & 0xFFFF; }
+fn uh_w16(o: int, v: int) { outw(usb_io + o, v); }
+fn uh_r32(o: int) -> int { return inl(usb_io + o) & 0xFFFFFFFF; }
+fn uh_w32(o: int, v: int) { outl(usb_io + o, v); }
+
+/// find the first UHCI controller (class 0C03, interface 00) with an I/O BAR 4; enable I/O + bus mastering
+fn uh_find() -> bool {
+    var i = pci_find_class(0x0C0300, 0xFFFFFF, 0);
+    while (i >= 0) {
+        let io = pd_bar[i * 6 + 4];
+        if (pd_bty[i * 6 + 4] == 1 && io > 0) {
+            usb_io = io & 0xFFE0;
+            pci_enable(i, PCI_CMD_IO | PCI_CMD_MASTER);
+            pcid_w32(i, 0xC0, 0x8F00);                                   // legacy support: hand the controller to us
+            return true;
+        }
+        i = pci_find_class(0x0C0300, 0xFFFFFF, i + 1);
+    }
+    return false;
+}

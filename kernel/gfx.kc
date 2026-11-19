@@ -1,0 +1,398 @@
+// gfx.kc -- 2D drawing on a 64-bit-per-pixel back buffer (4 x 16 bits: A R G B) + flush to the VBE linear framebuffer (24 or 32 bpp,
+// the most any display hardware scans out).  Blending happens at 16 bits per channel; the flush dithers down to 8 bits.
+// Everything is clipped to the current clip rectangle, so the desktop can repaint just a damaged region.
+// Author: Divyanshu Sinha (MIT License)
+import "cursor.kc";
+import "glass.kc";
+// Colours are 0xRRGGBB integers.  Needs font.kc (font_aa), kstr.kc and mm.kc (kmalloc) or any kmalloc.
+
+var fb_addr = 0;
+var fb_pitch = 0;
+var fb_w = 0;
+var fb_h = 0;
+var fb_bpp = 32;
+var bb: *u64;                // back buffer, fb_w * fb_h pixels, 64 bits each: A<<48 | R<<32 | G<<16 | B (16 bits per channel)
+var wall: *u32;              // pre-rendered wallpaper, same size
+var clip_x0 = 0; var clip_y0 = 0; var clip_x1 = 0; var clip_y1 = 0;
+var dmg_on = false;
+var dmg_noncur = false;      // damage other than the mouse cursor was added since the last flush (frosted panels cache their backdrop otherwise)
+var dmg_x0 = 0; var dmg_y0 = 0; var dmg_x1 = 0; var dmg_y1 = 0;
+
+fn imin(a: int, b: int) -> int { if (a < b) { return a; } return b; }
+fn imax(a: int, b: int) -> int { if (a > b) { return a; } return b; }
+fn iabs(a: int) -> int { if (a < 0) { return -a; } return a; }
+
+fn rgb(r: int, g: int, b: int) -> int { return ((r & 255) << 16) | ((g & 255) << 8) | (b & 255); }
+
+/// linear blend of two colours, a = 0..256 (0 = c0, 256 = c1)
+fn mix(c0: int, c1: int, a: int) -> int {
+    let r = (((c0 >> 16) & 255) * (256 - a) + ((c1 >> 16) & 255) * a) >> 8;
+    let g = (((c0 >> 8) & 255) * (256 - a) + ((c1 >> 8) & 255) * a) >> 8;
+    let b = ((c0 & 255) * (256 - a) + (c1 & 255) * a) >> 8;
+    return (r << 16) | (g << 8) | b;
+}
+
+// ---------------------------------------------------------------- 64-bit pixels
+/// 0xRRGGBB -> a 64-bit pixel (each 8-bit channel c becomes c * 257 = 0xcc, so 0xFF maps to 0xFFFF exactly)
+fn p64(c: int) -> int {
+    return (0xFFFF << 48) | ((((c >> 16) & 255) * 257) << 32) | ((((c >> 8) & 255) * 257) << 16) | ((c & 255) * 257);
+}
+/// 64-bit pixel -> 0xRRGGBB (top byte of each channel; exact for pixels made by p64)
+fn px32(p: int) -> int { return (((p >> 40) & 255) << 16) | (((p >> 24) & 255) << 8) | ((p >> 8) & 255); }
+/// blend the 0xRRGGBB colour c over the 64-bit pixel d, a = 0..256, with 16-bit precision
+fn mixp(d: int, c: int, a: int) -> int {
+    let dr = (d >> 32) & 0xFFFF; let dg = (d >> 16) & 0xFFFF; let db = d & 0xFFFF;
+    let r = dr + ((((c >> 16) & 255) * 257 - dr) * a >> 8);
+    let g = dg + ((((c >> 8) & 255) * 257 - dg) * a >> 8);
+    let b = db + (((c & 255) * 257 - db) * a >> 8);
+    return (0xFFFF << 48) | (r << 32) | (g << 16) | b;
+}
+/// blend two 64-bit pixels (o over n by a = 0..256): used by window fades
+fn mixpp(o: int, n: int, a: int) -> int {
+    let r = ((o >> 32) & 0xFFFF) + (((((n >> 32) & 0xFFFF) - ((o >> 32) & 0xFFFF)) * a) >> 8);
+    let g = ((o >> 16) & 0xFFFF) + (((((n >> 16) & 0xFFFF) - ((o >> 16) & 0xFFFF)) * a) >> 8);
+    let b = (o & 0xFFFF) + ((((n & 0xFFFF) - (o & 0xFFFF)) * a) >> 8);
+    return (0xFFFF << 48) | (r << 32) | (g << 16) | b;
+}
+var bay4: int[16] = [8, 136, 40, 168, 200, 72, 232, 104, 56, 184, 24, 152, 248, 120, 216, 88];     // ordered-dither thresholds 0..254
+/// 64-bit pixel -> 0xRRGGBB for the screen: exact colours pass straight through, the rest is dithered (t = 0..254)
+fn flush_px(p: int, t: int) -> int {
+    let hi = (p >> 8) & 0x00FF00FF00FF;
+    if (hi == (p & 0x00FF00FF00FF)) { return (((hi >> 32) & 255) << 16) | (((hi >> 16) & 255) << 8) | (hi & 255); }
+    let tt = t * 257;
+    let xr = ((p >> 32) & 0xFFFF) * 255 + tt; let xg = ((p >> 16) & 0xFFFF) * 255 + tt; let xb = (p & 0xFFFF) * 255 + tt;
+    let r = (xr + (xr >> 16) + 1) >> 16; let g = (xg + (xg >> 16) + 1) >> 16; let b = (xb + (xb >> 16) + 1) >> 16;
+    return (r << 16) | (g << 8) | b;
+}
+
+fn gfx_init(w: int, h: int, pitch: int, bpp: int, addr: int) -> bool {
+    fb_w = w; fb_h = h; fb_pitch = pitch; fb_bpp = bpp; fb_addr = addr;
+    bb = kmalloc(w * h * 8) as *u64;
+    wall = kmalloc(w * h * 4) as *u32;
+    if (bb == (0 as *u64) || wall == (0 as *u32)) { return false; }
+    clip_reset();
+    return true;
+}
+
+fn clip_reset() { clip_x0 = 0; clip_y0 = 0; clip_x1 = fb_w; clip_y1 = fb_h; }
+fn clip_set(x0: int, y0: int, x1: int, y1: int) {
+    clip_x0 = imax(x0, 0); clip_y0 = imax(y0, 0); clip_x1 = imin(x1, fb_w); clip_y1 = imin(y1, fb_h);
+}
+/// narrow the clip to the intersection with a rectangle; returns the previous clip through `save` (4 ints)
+fn clip_push(save: *int, x0: int, y0: int, x1: int, y1: int) {
+    save[0] = clip_x0; save[1] = clip_y0; save[2] = clip_x1; save[3] = clip_y1;
+    clip_x0 = imax(clip_x0, x0); clip_y0 = imax(clip_y0, y0); clip_x1 = imin(clip_x1, x1); clip_y1 = imin(clip_y1, y1);
+}
+fn clip_pop(save: *int) { clip_x0 = save[0]; clip_y0 = save[1]; clip_x1 = save[2]; clip_y1 = save[3]; }
+
+// ---------------------------------------------------------------- damage (the region to flush to the screen)
+fn dmg_add(x: int, y: int, w: int, h: int) {
+    dmg_noncur = true;
+    var x0 = imax(x, 0); var y0 = imax(y, 0);
+    var x1 = imin(x + w, fb_w); var y1 = imin(y + h, fb_h);
+    if (x0 >= x1 || y0 >= y1) { return; }
+    if (!dmg_on) { dmg_x0 = x0; dmg_y0 = y0; dmg_x1 = x1; dmg_y1 = y1; dmg_on = true; return; }
+    dmg_x0 = imin(dmg_x0, x0); dmg_y0 = imin(dmg_y0, y0); dmg_x1 = imax(dmg_x1, x1); dmg_y1 = imax(dmg_y1, y1);
+}
+
+/// damage caused only by the cursor moving: does not force frosted panels to re-grab their backdrop
+fn dmg_add_cur(x: int, y: int, w: int, h: int) { let f = dmg_noncur; dmg_add(x, y, w, h); dmg_noncur = f; }
+
+// ---------------------------------------------------------------- primitives
+fn px(x: int, y: int, c: int) {
+    if (x < clip_x0 || x >= clip_x1 || y < clip_y0 || y >= clip_y1) { return; }
+    bb[y * fb_w + x] = p64(c) as u64;
+}
+
+fn fill(x: int, y: int, w: int, h: int, c: int) {
+    let x0 = imax(x, clip_x0); let y0 = imax(y, clip_y0);
+    let x1 = imin(x + w, clip_x1); let y1 = imin(y + h, clip_y1);
+    if (x0 >= x1 || y0 >= y1) { return; }
+    let pv = p64(c) as u64;
+    var yy = y0;
+    while (yy < y1) {
+        let row = yy * fb_w;
+        var xx = x0;
+        while (xx < x1) { bb[row + xx] = pv; xx++; }
+        yy++;
+    }
+}
+
+fn hline(x: int, y: int, w: int, c: int) { fill(x, y, w, 1, c); }
+fn vline(x: int, y: int, h: int, c: int) { fill(x, y, 1, h, c); }
+
+fn frame(x: int, y: int, w: int, h: int, c: int) {
+    fill(x, y, w, 1, c); fill(x, y + h - 1, w, 1, c); fill(x, y, 1, h, c); fill(x + w - 1, y, 1, h, c);
+}
+
+/// vertical gradient from c0 (top) to c1 (bottom)
+fn vgrad(x: int, y: int, w: int, h: int, c0: int, c1: int) {
+    var i = 0;
+    while (i < h) {
+        let yy = y + i;
+        if (yy >= clip_y0 && yy < clip_y1) { fill(x, yy, w, 1, mix(c0, c1, (i * 256) / (h > 1 ? h - 1 : 1))); }
+        i++;
+    }
+}
+
+/// darken (or tint) a rectangle already in the back buffer: a = 0..256 amount of `c`
+fn shade(x: int, y: int, w: int, h: int, c: int, a: int) {
+    let x0 = imax(x, clip_x0); let y0 = imax(y, clip_y0);
+    let x1 = imin(x + w, clip_x1); let y1 = imin(y + h, clip_y1);
+    if (x0 >= x1 || y0 >= y1) { return; }
+    var yy = y0;
+    while (yy < y1) {
+        let row = yy * fb_w;
+        var xx = x0;
+        while (xx < x1) { bb[row + xx] = mixp(bb[row + xx] as int, c, a) as u64; xx++; }
+        yy++;
+    }
+}
+
+/// filled disc (integer circle test); used for the peacock-feather artwork and a few icons
+fn disc(cx: int, cy: int, r: int, c: int) {
+    var yy = -r;
+    while (yy <= r) {
+        let py = cy + yy;
+        if (py >= clip_y0 && py < clip_y1) {
+            var xx = -r;
+            while (xx <= r) {
+                if (xx * xx + yy * yy <= r * r) { px(cx + xx, py, c); }
+                xx++;
+            }
+        }
+        yy++;
+    }
+}
+
+/// filled ellipse with radii rx, ry
+fn ellipse(cx: int, cy: int, rx: int, ry: int, c: int) {
+    var yy = -ry;
+    while (yy <= ry) {
+        let py = cy + yy;
+        if (py >= clip_y0 && py < clip_y1) {
+            var xx = -rx;
+            while (xx <= rx) {
+                if (xx * xx * ry * ry + yy * yy * rx * rx <= rx * rx * ry * ry) { px(cx + xx, py, c); }
+                xx++;
+            }
+        }
+        yy++;
+    }
+}
+
+// ---------------------------------------------------------------- text (8x16 font)
+/// coverage (0..15) of pixel (col, row) of glyph ch
+fn glyph_a(ch: int, row: int, col: int) -> int {
+    var c = ch;
+    if (c < 32 || c > 126) { c = '?'; }
+    let v = font_aa[(c - 32) * 64 + row * 4 + (col >> 1)] as int;
+    if ((col & 1) == 0) { return v >> 4; }
+    return v & 15;
+}
+
+fn draw_char(x: int, y: int, ch: int, fg: int) {
+    if (vf_cur != 0) { vf_cell(x, y, ch, fg); return; }          // vector UI font: monospace face in the 8 px grid cell
+    draw_char_bm(x, y, ch, fg);
+}
+/// the classic 8x16 bitmap font
+fn draw_char_bm(x: int, y: int, ch: int, fg: int) {
+    if (x + 8 <= clip_x0 || x >= clip_x1 || y + 16 <= clip_y0 || y >= clip_y1) { return; }
+    var c = ch;
+    if (c < 32 || c > 126) { c = '?'; }
+    let base = (c - 32) * 64;
+    var row = 0;
+    while (row < 16) {
+        let yy = y + row;
+        if (yy >= clip_y0 && yy < clip_y1) {
+            var col = 0;
+            while (col < 8) {
+                let xx = x + col;
+                if (xx >= clip_x0 && xx < clip_x1) {
+                    let v = font_aa[base + row * 4 + (col >> 1)] as int;
+                    var a = v & 15;
+                    if ((col & 1) == 0) { a = v >> 4; }
+                    if (a != 0) {
+                        if (a >= 14) { px(xx, yy, fg); }
+                        else { let o = yy * fb_w + xx; bb[o] = mixp(bb[o] as int, fg, (a * 256) / 15) as u64; }
+                    }
+                }
+                col++;
+            }
+        }
+        row++;
+    }
+}
+
+/// draw a NUL-terminated string; returns the x just after it
+fn draw_text(x: int, y: int, s: *u8, fg: int) -> int {
+    if (vf_cur != 0) { return vf_text(vf_cur - 1, vf_px(vf_cur - 1), x, y, s, -1, fg); }
+    var i = 0;
+    var cx = x;
+    while (s[i] != 0) { draw_char(cx, y, s[i] as int, fg); cx = cx + 8; i++; }
+    return cx;
+}
+
+fn draw_text_n(x: int, y: int, s: *u8, n: int, fg: int) {
+    if (vf_cur != 0) { vf_text(vf_cur - 1, vf_px(vf_cur - 1), x, y, s, n, fg); return; }
+    var i = 0;
+    while (i < n && s[i] != 0) { draw_char(x + i * 8, y, s[i] as int, fg); i++; }
+}
+
+fn text_w(s: *u8) -> int {
+    if (vf_cur != 0) { return vf_width(vf_cur - 1, vf_px(vf_cur - 1), s); }
+    return kstrlen(s) * 8;
+}
+
+/// text with a 1-pixel drop shadow
+fn draw_text_sh(x: int, y: int, s: *u8, fg: int, sh: int) { draw_text(x + 1, y + 1, s, sh); draw_text(x, y, s, fg); }
+
+fn draw_num(x: int, y: int, v: int, fg: int) -> int {
+    var buf: u8[24];
+    itoa(v, &buf[0]);
+    return draw_text(x, y, &buf[0], fg);
+}
+
+/// decimal text of v into out (>= 24 bytes); returns the length
+fn itoa(v: int, out: *u8) -> int {
+    var tmp: u8[24];
+    var n = 0;
+    var neg = false;
+    var u = v;
+    if (u < 0) { neg = true; u = -u; }
+    if (u == 0) { tmp[0] = '0'; n = 1; }
+    while (u > 0) { tmp[n] = ('0' + u % 10) as u8; n++; u = u / 10; }
+    var o = 0;
+    if (neg) { out[o] = '-'; o++; }
+    while (n > 0) { n--; out[o] = tmp[n]; o++; }
+    out[o] = 0;
+    return o;
+}
+
+// ---------------------------------------------------------------- bevels (used by buttons and panels)
+fn bevel(x: int, y: int, w: int, h: int, hi: int, lo: int) {
+    hline(x, y, w, hi); vline(x, y, h, hi);
+    hline(x, y + h - 1, w, lo); vline(x + w - 1, y, h, lo);
+}
+
+// ---------------------------------------------------------------- flush to the screen
+fn flush_rect(x: int, y: int, w: int, h: int) {
+    let x0 = imax(x, 0); let y0 = imax(y, 0);
+    let x1 = imin(x + w, fb_w); let y1 = imin(y + h, fb_h);
+    if (x0 >= x1 || y0 >= y1) { return; }
+    var yy = y0;
+    while (yy < y1) {
+        let src = yy * fb_w;
+        let dst = fb_addr + yy * fb_pitch;
+        if (fb_bpp == 32) {
+            let d = (dst + x0 * 4) as *u32;
+            var i = 0;
+            let n = x1 - x0;
+            let by = (yy & 3) * 4;
+            while (i < n) {
+                let p = bb[src + x0 + i] as int;
+                let hi = (p >> 8) & 0x00FF00FF00FF;
+                if (hi == (p & 0x00FF00FF00FF)) { d[i] = ((((hi >> 32) & 255) << 16) | (((hi >> 16) & 255) << 8) | (hi & 255)) as u32; }   // exact colour: no dither needed
+                else { d[i] = flush_px(p, bay4[by + ((x0 + i) & 3)]) as u32; }
+                i++;
+            }
+        } else {
+            let d = (dst + x0 * 3) as *u8;
+            var i = 0;
+            let n = x1 - x0;
+            while (i < n) {
+                let c = flush_px(bb[src + x0 + i] as int, bay4[(yy & 3) * 4 + ((x0 + i) & 3)]);
+                d[i * 3] = (c & 255) as u8; d[i * 3 + 1] = ((c >> 8) & 255) as u8; d[i * 3 + 2] = ((c >> 16) & 255) as u8;
+                i++;
+            }
+        }
+        yy++;
+    }
+}
+
+/// flush the accumulated damage and clear it
+fn present() {
+    if (!dmg_on) { return; }
+    flush_rect(dmg_x0, dmg_y0, dmg_x1 - dmg_x0, dmg_y1 - dmg_y0);
+    dmg_on = false;
+    dmg_noncur = false;
+}
+
+// ---------------------------------------------------------------- wallpaper copy
+fn draw_wall() {
+    let x0 = clip_x0; let x1 = clip_x1;
+    var yy = clip_y0;
+    while (yy < clip_y1) {
+        let row = yy * fb_w;
+        var xx = x0;
+        while (xx < x1) {
+            let c = wall[row + xx] as int;
+            bb[row + xx] = ((0xFFFF << 48) | ((((c >> 16) & 255) * 257) << 32) | ((((c >> 8) & 255) * 257) << 16) | ((c & 255) * 257)) as u64;
+            xx++;
+        }
+        yy++;
+    }
+}
+
+// ---------------------------------------------------------------- scaled text (each font pixel becomes sc x sc)
+fn draw_char_sc(x: int, y: int, ch: int, fg: int, sc: int) {
+    var row = 0;
+    while (row < 16) {
+        var col = 0;
+        while (col < 8) {
+            let a = glyph_a(ch, row, col);
+            if (a >= 14) { fill(x + col * sc, y + row * sc, sc, sc, fg); }
+            else if (a != 0) { shade(x + col * sc, y + row * sc, sc, sc, fg, (a * 256) / 15); }
+            col++;
+        }
+        row++;
+    }
+}
+
+fn draw_text_sc(x: int, y: int, s: *u8, fg: int, sc: int) -> int {
+    if (vf_cur != 0) { return vf_text_sc(x, y, s, fg, sc); }
+    var i = 0;
+    var cx = x;
+    while (s[i] != 0) { draw_char_sc(cx, y, s[i] as int, fg, sc); cx = cx + 8 * sc; i++; }
+    return cx;
+}
+
+// ---------------------------------------------------------------- rounded shapes and soft shadows (the "modern" look)
+/// how many pixels row i (0 = top) of a rounded rectangle with radius r is indented
+fn r_inset(i: int, r: int) -> int {
+    if (i >= r) { return 0; }
+    var k = 0;
+    while (k < r) {
+        let a = 2 * r - 2 * k - 1; let b = 2 * r - 2 * i - 1;
+        if (a * a + b * b <= 4 * r * r) { return k; }
+        k++;
+    }
+    return r;
+}
+/// filled rounded rectangle; top_only keeps the bottom corners square
+fn rfill(x: int, y: int, w: int, h: int, r: int, c: int, top_only: bool) {
+    var i = 0;
+    while (i < h) {
+        var ins = 0;
+        if (i < r) { ins = r_inset(i, r); }
+        else if (!top_only && i >= h - r) { ins = r_inset(h - 1 - i, r); }
+        fill(x + ins, y + i, w - 2 * ins, 1, c);
+        i++;
+    }
+}
+/// 1-pixel rounded outline: an outer rounded fill in `edge`, then the inside in `inner` is the caller's job
+fn rrect(x: int, y: int, w: int, h: int, r: int, edge: int, c: int, top_only: bool) {
+    rfill(x, y, w, h, r, edge, top_only);
+    rfill(x + 1, y + 1, w - 2, h - 2 + (top_only ? 1 : 0), imax(r - 1, 0), c, top_only);
+}
+/// soft drop shadow around a window: concentric 1-pixel rings, darker near the window
+fn soft_shadow(x: int, y: int, w: int, h: int) {
+    var k = 5;
+    while (k >= 1) {
+        let a = 64 - k * 10;
+        let rx = x - k; let ry = y - k + 3; let rw = w + 2 * k; let rh = h + 2 * k;
+        shade(rx, ry, rw, 1, 0x0A1224, a); shade(rx, ry + rh - 1, rw, 1, 0x0A1224, a);
+        shade(rx, ry + 1, 1, rh - 2, 0x0A1224, a); shade(rx + rw - 1, ry + 1, 1, rh - 2, 0x0A1224, a);
+        k--;
+    }
+}

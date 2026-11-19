@@ -1,0 +1,736 @@
+// html.kc -- URLs and the page renderer: an HTML tokenizer + layout engine that turns a document into a list of positioned
+// words (the "display list"), plus plain-text / Markdown layout.  Author: Divyanshu Sinha (MIT License)
+//
+// Supported HTML: headings, paragraphs, line breaks, lists (ul/ol/li, nested), links, bold/italic/underline/code, pre,
+// blockquote, hr, tables (flattened: cells separated by " | "), images (shown as [alt text]), buttons/inputs (shown as
+// boxes), entities and UTF-8 punctuation.  <script> and <style> are skipped.  No CSS, no images, no forms, no JavaScript.
+// Needs: gfx.kc (drawing), kstr.kc, fs.kc (url_parse looks for local files).
+
+// ================================================================= URLs
+var pu_scheme = 0;                   // 0 none, 1 http, 2 https, 3 file, 4 about, 5 other (mailto:, javascript: ...)
+var pu_host: u8[72]; var pu_port = 80; var pu_path: u8[300];
+
+fn url_is_letter(c: int) -> bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+/// split an absolute or typed address into pu_*.  Returns the scheme code.
+fn url_parse(s: *u8) -> int {
+    pu_scheme = 0; pu_host[0] = 0; pu_port = 80; pu_path[0] = '/'; pu_path[1] = 0;
+    var i = 0;
+    while (s[i] == ' ') { i++; }
+    var rest = i;
+    if (kmatch_ci(s + i, "http://")) { pu_scheme = 1; rest = i + 7; }
+    else if (kmatch_ci(s + i, "https://")) { pu_scheme = 2; rest = i + 8; pu_port = 443; }
+    else if (kmatch_ci(s + i, "file://")) { pu_scheme = 3; rest = i + 7; }
+    else if (kmatch_ci(s + i, "file:")) { pu_scheme = 3; rest = i + 5; }
+    else if (kmatch_ci(s + i, "about:")) { pu_scheme = 4; rest = i + 6; }
+    else {
+        var j = i;
+        while (url_is_letter(s[j] as int)) { j++; }
+        if (s[j] == ':' && j - i >= 2 && !kisdigit(s[j + 1] as int)) { pu_scheme = 5; }
+        else if (s[i] == '/') { pu_scheme = 3; rest = i; }
+        else {
+            if (s[i] != 0 && fs_resolve(s + i) >= 0) {                  // a local file typed without file://
+                pu_scheme = 3;
+                var ab: u8[128];
+                fs_path(fs_resolve(s + i), &ab[0]);
+                kstrncpy(&pu_path[0], &ab[0], 300);
+                return 3;
+            }
+            pu_scheme = 1; rest = i;
+        }
+    }
+    if (pu_scheme == 5) { kstrncpy(&pu_path[0], s + i, 300); return 5; }
+    if (pu_scheme == 4) { kstrncpy(&pu_path[0], s + rest, 300); return 4; }
+    if (pu_scheme == 3) {
+        var o = 0; var k = rest;
+        while (s[k] != 0 && s[k] != '#' && o < 298) { pu_path[o] = s[k]; o++; k++; }
+        pu_path[o] = 0;
+        if (o == 0) { pu_path[0] = '/'; pu_path[1] = 0; }
+        return 3;
+    }
+    var h = 0; var k2 = rest;
+    while (s[k2] != 0 && s[k2] != '/' && s[k2] != ':' && s[k2] != '?' && s[k2] != '#' && h < 70) { pu_host[h] = s[k2]; h++; k2++; }
+    pu_host[h] = 0;
+    if (s[k2] == ':') {
+        k2++;
+        var port = 0;
+        while (kisdigit(s[k2] as int)) { port = port * 10 + ((s[k2] as int) - '0'); k2++; }
+        if (port > 0 && port < 65536) { pu_port = port; }
+    }
+    var o2 = 0;
+    if (s[k2] == '?') { pu_path[0] = '/'; o2 = 1; }
+    while (s[k2] != 0 && s[k2] != '#' && o2 < 298) { pu_path[o2] = s[k2]; o2++; k2++; }
+    if (o2 == 0) { pu_path[0] = '/'; o2 = 1; }
+    pu_path[o2] = 0;
+    return pu_scheme;
+}
+
+fn url_put(out: *u8, o: int, s: *u8) -> int { var i = 0; while (s[i] != 0 && o + i < 299) { out[o + i] = s[i]; i++; } out[o + i] = 0; return o + i; }
+
+/// "http://host[:port]" / "file://" / "about:" for the pu_* address
+fn url_origin(out: *u8) -> int {
+    var o = 0;
+    if (pu_scheme == 1 || pu_scheme == 2) {
+        if (pu_scheme == 1) { o = url_put(out, 0, "http://"); } else { o = url_put(out, 0, "https://"); }
+        o = url_put(out, o, &pu_host[0]);
+        if ((pu_scheme == 1 && pu_port != 80) || (pu_scheme == 2 && pu_port != 443)) {
+            var pb: u8[8]; itoa(pu_port, &pb[0]);
+            o = url_put(out, o, ":"); o = url_put(out, o, &pb[0]);
+        }
+    } else if (pu_scheme == 3) { o = url_put(out, 0, "file://"); }
+    else { o = url_put(out, 0, "about:"); }
+    return o;
+}
+
+fn path_normalize(inp: *u8, out: *u8) {
+    var o = 0; var i = 0; var lastdot = false;
+    while (inp[i] != 0) {
+        var j = i + 1;
+        while (inp[j] != 0 && inp[j] != '/') { j++; }
+        let sl = j - (i + 1);
+        if (sl == 1 && inp[i + 1] == '.') { lastdot = true; }
+        else if (sl == 2 && inp[i + 1] == '.' && inp[i + 2] == '.') { while (o > 0 && out[o - 1] != '/') { o--; } if (o > 0) { o--; } lastdot = true; }
+        else { var k = i; while (k < j && o < 296) { out[o] = inp[k]; o++; k++; } lastdot = false; }
+        i = j;
+    }
+    if (lastdot || o == 0) { out[o] = '/'; o++; }
+    out[o] = 0;
+}
+
+/// resolve a link against the page it was found on
+fn url_resolve(base: *u8, rel: *u8, out: *u8) {
+    if (rel[0] == '#') { kstrncpy(out, base, 300); var q = 0; while (out[q] != 0 && out[q] != '#') { q++; } out[q] = 0; return; }
+    if (kmatch_ci(rel, "http://") || kmatch_ci(rel, "https://") || kmatch_ci(rel, "file:") || kmatch_ci(rel, "about:") || kmatch_ci(rel, "mailto:") || kmatch_ci(rel, "javascript:")) {
+        kstrncpy(out, rel, 300); var q2 = 0; while (out[q2] != 0 && out[q2] != '#') { q2++; } out[q2] = 0; return;
+    }
+    url_parse(base);
+    var origin: u8[100];
+    var o = url_origin(&origin[0]);
+    var tmp: u8[300];
+    var t = 0;
+    if (rel[0] == '/' && rel[1] == '/') { if (pu_scheme == 2) { o = url_put(out, 0, "https:"); } else { o = url_put(out, 0, "http:"); } url_put(out, o, rel); return; }
+    if (rel[0] == '/') { tmp[0] = 0; t = url_put(&tmp[0], 0, rel); }
+    else {
+        // directory of the base path
+        var last = 0; var i = 0;
+        while (pu_path[i] != 0 && pu_path[i] != '?') { if (pu_path[i] == '/') { last = i; } i++; }
+        if (rel[0] == '?') { var k = 0; while (k < i) { tmp[k] = pu_path[k]; k++; } tmp[k] = 0; t = url_put(&tmp[0], k, rel); }
+        else { var k2 = 0; while (k2 <= last) { tmp[k2] = pu_path[k2]; k2++; } tmp[k2] = 0; t = url_put(&tmp[0], k2, rel); }
+    }
+    // split off ?query, drop #fragment, normalise the path part
+    var query: u8[200]; var ql = 0;
+    var c = 0;
+    while (tmp[c] != 0 && tmp[c] != '?' && tmp[c] != '#') { c++; }
+    if (tmp[c] == '?') { var q3 = c; while (tmp[q3] != 0 && tmp[q3] != '#' && ql < 198) { query[ql] = tmp[q3]; ql++; q3++; } }
+    query[ql] = 0;
+    tmp[c] = 0;
+    var pn: u8[300];
+    path_normalize(&tmp[0], &pn[0]);
+    var oo = url_put(out, 0, &origin[0]);
+    oo = url_put(out, oo, &pn[0]);
+    url_put(out, oo, &query[0]);
+}
+
+// ================================================================= display list
+struct WItem { x: int, y: int, w: int, h: int, off: int, color: int, flags: int, link: int }
+const WMAX = 7000; const WPOOLMAX = 400000;
+const WF_BOLD = 1; const WF_UL = 2; const WF_RULE = 4; const WF_BOX = 8;
+const WF_HL = 16; const WF_HLCUR = 32; const WF_STRIKE = 64; const WF_MARK = 128;      // find-in-page highlight, <s>, <mark>
+var wit: *WItem; var wn = 0;
+var wpool: *u8; var wpl = 0;
+var wl_off: int[600]; var wl_n = 0;
+var w_title: u8[64];
+var w_height = 0;
+var w_base: u8[300];                  // address of the page being laid out (links are resolved against it)
+
+var lx = 0; var ly = 0; var lmaxw = 600; var lindent = 0; var l_first = 0; var l_h = 16;
+var l_gap = true; var l_space = false;
+var st_bold = 0; var st_ital = 0; var st_code = 0; var st_link = -1; var st_scale = 1; var st_pre = false;
+var st_center = 0; var st_color = 0x202733; var st_head = 0;
+var list_n: int[8]; var list_k: int[8]; var list_d = 0;
+var wbuf: u8[160]; var wbl = 0;
+var in_title = false;
+var st_strike = 0; var st_mark = 0;
+var w_bg = 0xFFFFFF;                          // page background (<body bgcolor> / style)
+var wa_off: int[64]; var wa_y: int[64]; var wa_n = 0;      // in-page anchors (id= / name=)
+var ts_hash: int[12]; var ts_col: int[12]; var ts_ctr: int[12]; var ts_n = 0;      // open tags that changed colour / alignment
+
+fn w_alloc() -> bool {
+    if (wit == (0 as *WItem)) { wit = kzalloc(WMAX * sizeof(WItem)) as *WItem; }
+    if (wpool == (0 as *u8)) { wpool = kmalloc(WPOOLMAX + 8); }
+    return wit != (0 as *WItem) && wpool != (0 as *u8);
+}
+fn w_free() {
+    if (wit != (0 as *WItem)) { kfree(wit as *u8); }
+    if (wpool != (0 as *u8)) { kfree(wpool); }
+    wit = 0 as *WItem; wpool = 0 as *u8; wn = 0; wpl = 0;
+}
+
+fn w_reset(width: int, base: *u8) {
+    wn = 0; wpl = 0; wl_n = 0; w_title[0] = 0; wbl = 0; in_title = false;
+    lx = 0; ly = 8; lmaxw = width; lindent = 0; l_first = 0; l_h = 16; l_gap = true; l_space = false;
+    st_bold = 0; st_ital = 0; st_code = 0; st_link = -1; st_scale = 1; st_pre = false; st_center = 0; st_color = 0x202733; st_head = 0;
+    list_d = 0; st_strike = 0; st_mark = 0; w_bg = 0xFFFFFF; wa_n = 0; ts_n = 0;
+    kstrncpy(&w_base[0], base, 300);
+}
+
+fn w_pool_str(p: *u8, n: int) -> int {
+    if (wpl + n + 1 > WPOOLMAX) { return -1; }
+    let o = wpl;
+    kmemcpy(wpool + o, p, n); wpool[o + n] = 0;
+    wpl = wpl + n + 1;
+    return o;
+}
+
+fn w_color() -> int {
+    if (st_link >= 0) { return 0x1F4FA8; }
+    if (st_color != 0x202733) { return st_color; }                 // an explicit CSS / font colour wins over the default styles
+    if (st_code != 0) { return 0x8A3A00; }
+    if (st_head != 0) { return 0x0E5A66; }
+    if (st_ital != 0) { return 0x5A3E8F; }
+    return st_color;
+}
+fn w_flags() -> int {
+    var f = 0;
+    if (st_bold != 0 || st_head != 0) { f = f | WF_BOLD; }
+    if (st_link >= 0) { f = f | WF_UL; }
+    if (st_strike > 0) { f = f | WF_STRIKE; }
+    if (st_mark > 0) { f = f | WF_MARK; }
+    return f;
+}
+
+fn w_push(off: int, n: int, color: int, flags: int, link: int, sc: int) {
+    if (wn >= WMAX) { return; }
+    wit[wn].x = lx; wit[wn].y = ly; wit[wn].w = n * 8 * sc; wit[wn].h = 16 * sc;
+    wit[wn].off = off; wit[wn].color = color; wit[wn].flags = flags | (sc << 8); wit[wn].link = link;
+    wn++;
+    lx = lx + n * 8 * sc;
+    if (16 * sc > l_h) { l_h = 16 * sc; }
+}
+
+fn w_newline() {
+    if (lx == lindent && wn == l_first) { return; }
+    if (st_center != 0 && wn > l_first) {
+        let avail = lmaxw - lindent; let used = lx - lindent;
+        if (avail > used) {
+            let sh = (avail - used) / 2;
+            var i = l_first;
+            while (i < wn) { wit[i].x = wit[i].x + sh; i++; }
+        }
+    }
+    ly = ly + l_h; lx = lindent; l_first = wn; l_h = 16; l_space = false;
+}
+fn w_para() { w_newline(); if (!l_gap) { ly = ly + 10; l_gap = true; } }
+
+/// one word (no spaces); wraps and splits very long words
+fn w_emit(p: *u8, len: int) {
+    let sc = st_scale; let cw = 8 * sc;
+    var done = 0;
+    while (done < len) {
+        var n = len - done;
+        var sp = 0;
+        if (done == 0 && l_space && lx > lindent) { sp = cw; }
+        if (lx + sp + n * cw > lmaxw && lx > lindent) { w_newline(); sp = 0; }
+        var avail = (lmaxw - lx - sp) / cw;
+        if (avail < 1) { avail = 1; }
+        if (n > avail) { n = avail; }
+        lx = lx + sp;
+        let off = w_pool_str(p + done, n);
+        if (off < 0) { return; }
+        w_push(off, n, w_color(), w_flags(), st_link, sc);
+        done = done + n; l_space = false; l_gap = false;
+    }
+}
+fn w_flush() { if (wbl > 0) { w_emit(&wbuf[0], wbl); wbl = 0; } }
+
+fn w_text_char(c: int) {
+    if (in_title) { var tl = kstrlen(&w_title[0]); if (tl < 62 && c >= 32) { w_title[tl] = c as u8; w_title[tl + 1] = 0; } return; }
+    if (st_pre) {
+        if (c == 10) { w_flush(); if (lx == lindent && wn == l_first) { ly = ly + 16; } else { w_newline(); } l_gap = false; }
+        else if (c == 13) { }
+        else if (c == 9) { w_flush(); lx = lx + 32; }
+        else if (c == ' ') { w_flush(); lx = lx + 8; }
+        else { if (wbl >= 150) { w_flush(); } wbuf[wbl] = c as u8; wbl++; }
+        return;
+    }
+    if (c == ' ' || c == 10 || c == 13 || c == 9 || c == 12) { w_flush(); l_space = true; }
+    else { if (wbl >= 150) { w_flush(); } wbuf[wbl] = c as u8; wbl++; }
+}
+
+fn w_put_cp(cp: int) {
+    if (cp == 160) { w_text_char(' '); return; }
+    if (cp < 128) { if (cp >= 32 || cp == 10 || cp == 9 || cp == 13) { w_text_char(cp); } return; }
+    if (cp == 8211 || cp == 8212 || cp == 8722) { w_text_char('-'); }
+    else if (cp == 8216 || cp == 8217) { w_text_char('\''); }
+    else if (cp == 8220 || cp == 8221) { w_text_char('"'); }
+    else if (cp == 8226 || cp == 183) { w_text_char('*'); }
+    else if (cp == 8230) { w_text_char('.'); w_text_char('.'); w_text_char('.'); }
+    else if (cp == 169) { w_text_char('('); w_text_char('c'); w_text_char(')'); }
+    else if (cp == 187) { w_text_char('>'); w_text_char('>'); }
+    else if (cp == 177) { w_text_char('+'); w_text_char('/'); w_text_char('-'); }
+    else if (cp == 8592) { w_text_char('<'); w_text_char('-'); } else if (cp == 8594) { w_text_char('-'); w_text_char('>'); }
+    else if (cp == 8364) { w_text_char('E'); w_text_char('U'); w_text_char('R'); } else if (cp == 163) { w_text_char('G'); w_text_char('B'); w_text_char('P'); }
+    else if (cp == 176) { w_text_char('o'); } else if (cp == 167) { w_text_char('S'); }
+    else if (cp == 171) { w_text_char('<'); w_text_char('<'); }
+    else { w_text_char('?'); }
+}
+
+/// at body[i] == '&': decode an entity, advance *ip past it; false when it is not one
+fn w_entity(b: *u8, ip: *int, len: int) -> bool {
+    var i = ip[0] + 1;
+    var cp = -1;
+    if (i < len && b[i] == '#') {
+        i++;
+        var v = 0; var digits = 0;
+        if (i < len && (b[i] == 'x' || b[i] == 'X')) { i++; while (i < len && khexval(b[i] as int) >= 0 && digits < 6) { v = v * 16 + khexval(b[i] as int); i++; digits++; } }
+        else { while (i < len && kisdigit(b[i] as int) && digits < 8) { v = v * 10 + ((b[i] as int) - '0'); i++; digits++; } }
+        if (digits == 0) { return false; }
+        cp = v;
+    } else {
+        var nm: u8[10]; var n = 0;
+        while (i < len && n < 9 && url_is_letter(b[i] as int)) { nm[n] = b[i]; n++; i++; }
+        nm[n] = 0;
+        if (n == 0) { return false; }
+        if (kstreq(&nm[0], "amp")) { cp = '&'; } else if (kstreq(&nm[0], "lt")) { cp = '<'; } else if (kstreq(&nm[0], "gt")) { cp = '>'; }
+        else if (kstreq(&nm[0], "quot")) { cp = '"'; } else if (kstreq(&nm[0], "apos")) { cp = '\''; } else if (kstreq(&nm[0], "nbsp")) { cp = 160; }
+        else if (kstreq(&nm[0], "copy")) { cp = 169; } else if (kstreq(&nm[0], "mdash") || kstreq(&nm[0], "ndash")) { cp = 8212; }
+        else if (kstreq(&nm[0], "hellip")) { cp = 8230; } else if (kstreq(&nm[0], "bull") || kstreq(&nm[0], "middot")) { cp = 8226; }
+        else if (kstreq(&nm[0], "lsquo") || kstreq(&nm[0], "rsquo")) { cp = 8217; } else if (kstreq(&nm[0], "ldquo") || kstreq(&nm[0], "rdquo")) { cp = 8221; }
+        else if (kstreq(&nm[0], "raquo")) { cp = 187; } else if (kstreq(&nm[0], "laquo")) { cp = 171; } else if (kstreq(&nm[0], "reg") || kstreq(&nm[0], "trade")) { cp = '?'; }
+        else if (kstreq(&nm[0], "times")) { cp = 'x'; } else if (kstreq(&nm[0], "divide")) { cp = '/'; } else if (kstreq(&nm[0], "plusmn")) { cp = 177; }
+        else if (kstreq(&nm[0], "larr")) { cp = 8592; } else if (kstreq(&nm[0], "rarr")) { cp = 8594; } else if (kstreq(&nm[0], "euro")) { cp = 8364; }
+        else if (kstreq(&nm[0], "pound")) { cp = 163; } else if (kstreq(&nm[0], "deg")) { cp = 176; } else if (kstreq(&nm[0], "para") || kstreq(&nm[0], "sect")) { cp = 167; }
+        else { return false; }
+    }
+    if (i < len && b[i] == ';') { i++; }
+    ip[0] = i;
+    w_put_cp(cp);
+    return true;
+}
+
+/// attribute `name` of the tag text b[fr..to) into out; false when absent
+fn tag_attr(b: *u8, fr: int, to: int, name: *u8, out: *u8, cap: int) -> bool {
+    var i = fr;
+    while (i < to) {
+        while (i < to && (kisspace(b[i] as int) || b[i] == '/')) { i++; }
+        let ns = i;
+        while (i < to && !kisspace(b[i] as int) && b[i] != '=' && b[i] != '/' ) { i++; }
+        let ne = i;
+        var matched = (ne - ns) == kstrlen(name);
+        if (matched) { var k = 0; while (k < ne - ns) { if (http_lower(b[ns + k] as int) != (name[k] as int)) { matched = false; } k++; } }
+        while (i < to && kisspace(b[i] as int)) { i++; }
+        var hasv = false;
+        if (i < to && b[i] == '=') {
+            hasv = true; i++;
+            while (i < to && kisspace(b[i] as int)) { i++; }
+            var vs = i; var ve = i;
+            if (i < to && (b[i] == '"' || b[i] == '\'')) {
+                let q = b[i]; i++; vs = i;
+                while (i < to && b[i] != q) { i++; }
+                ve = i; if (i < to) { i++; }
+            } else { while (i < to && !kisspace(b[i] as int)) { i++; } ve = i; }
+            if (matched) {
+                var o = 0; var k2 = vs;
+                while (k2 < ve && o < cap - 1) {
+                    if (b[k2] == '&' && k2 + 4 < ve && b[k2 + 1] == 'a' && b[k2 + 2] == 'm' && b[k2 + 3] == 'p' && b[k2 + 4] == ';') { out[o] = '&'; o++; k2 = k2 + 5; }
+                    else { out[o] = b[k2]; o++; k2++; }
+                }
+                out[o] = 0;
+                return true;
+            }
+        }
+        if (matched && !hasv) { out[0] = 0; return true; }
+    }
+    return false;
+}
+
+
+// ---------------------------------------------------------------- colours and inline styles
+/// "#rgb", "#rrggbb", rgb(r,g,b) or a colour name -> 0xRRGGBB, or -1
+fn col_parse(s: *u8) -> int {
+    var i = 0;
+    while (s[i] == ' ') { i++; }
+    if (s[i] == '#') {
+        var n = 0; var v = 0;
+        var k = i + 1;
+        while (khexval(s[k] as int) >= 0 && n < 6) { v = v * 16 + khexval(s[k] as int); n++; k++; }
+        if (n == 6) { return v; }
+        if (n == 3) { let r = (v >> 8) & 15; let g = (v >> 4) & 15; let b = v & 15; return ((r * 17) << 16) | ((g * 17) << 8) | (b * 17); }
+        return -1;
+    }
+    if (kmatch_ci(s + i, "rgb(")) {
+        var k2 = i + 4; var c = 0; var v2 = 0;
+        while (c < 3) {
+            while (s[k2] == ' ') { k2++; }
+            var n2 = 0;
+            while (kisdigit(s[k2] as int)) { n2 = n2 * 10 + ((s[k2] as int) - '0'); k2++; }
+            v2 = (v2 << 8) | imin(n2, 255);
+            while (s[k2] == ' ') { k2++; }
+            if (s[k2] == ',') { k2++; }
+            c++;
+        }
+        return v2;
+    }
+    if (kmatch_ci(s + i, "black")) { return 0x000000; } if (kmatch_ci(s + i, "white")) { return 0xFFFFFF; }
+    if (kmatch_ci(s + i, "red")) { return 0xD32F2F; } if (kmatch_ci(s + i, "green")) { return 0x2E7D32; }
+    if (kmatch_ci(s + i, "blue")) { return 0x1565C0; } if (kmatch_ci(s + i, "yellow")) { return 0xF9A825; }
+    if (kmatch_ci(s + i, "orange")) { return 0xEF6C00; } if (kmatch_ci(s + i, "purple")) { return 0x7B1FA2; }
+    if (kmatch_ci(s + i, "gray") || kmatch_ci(s + i, "grey")) { return 0x757575; }
+    if (kmatch_ci(s + i, "silver")) { return 0xB0B6C0; } if (kmatch_ci(s + i, "navy")) { return 0x0D2A6B; }
+    if (kmatch_ci(s + i, "teal")) { return 0x00796B; } if (kmatch_ci(s + i, "maroon")) { return 0x7F1D1D; }
+    if (kmatch_ci(s + i, "olive")) { return 0x6B7A1B; } if (kmatch_ci(s + i, "lime")) { return 0x43A047; }
+    if (kmatch_ci(s + i, "aqua") || kmatch_ci(s + i, "cyan")) { return 0x00ACC1; } if (kmatch_ci(s + i, "pink")) { return 0xD81B60; }
+    if (kmatch_ci(s + i, "brown")) { return 0x6D4C41; } if (kmatch_ci(s + i, "gold")) { return 0xC59A00; }
+    return -1;
+}
+
+/// value of CSS property `name` inside a style="..." string, into out
+fn css_prop(style: *u8, name: *u8, out: *u8, cap: int) -> bool {
+    let nl = kstrlen(name);
+    var i = 0;
+    while (style[i] != 0) {
+        while (style[i] == ' ' || style[i] == ';') { i++; }
+        if (kmatch_ci(style + i, name) && (style[i + nl] == ':' || style[i + nl] == ' ')) {
+            var k = i + nl;
+            while (style[k] == ' ') { k++; }
+            if (style[k] == ':') {
+                k++;
+                while (style[k] == ' ') { k++; }
+                var o = 0;
+                while (style[k] != 0 && style[k] != ';' && o < cap - 1) { out[o] = style[k]; o++; k++; }
+                out[o] = 0;
+                return true;
+            }
+        }
+        while (style[i] != 0 && style[i] != ';') { i++; }
+    }
+    return false;
+}
+
+fn tag_hash(nm: *u8) -> int { var h = 7; var i = 0; while (nm[i] != 0) { h = h * 31 + (nm[i] as int); i++; } return h; }
+fn tag_styled(nm: *u8) -> bool {
+    return kstreq(nm, "span") || kstreq(nm, "font") || kstreq(nm, "p") || kstreq(nm, "div") || kstreq(nm, "td") || kstreq(nm, "th") || kstreq(nm, "li") ||
+        kstreq(nm, "b") || kstreq(nm, "strong") || kstreq(nm, "em") || kstreq(nm, "i") || kstreq(nm, "center") || kstreq(nm, "section") ||
+        (nm[0] == 'h' && nm[1] >= '1' && nm[1] <= '6' && nm[2] == 0) || kstreq(nm, "blockquote") || kstreq(nm, "article") || kstreq(nm, "header");
+}
+/// an opening tag may carry colour / alignment: remember what to restore at its end
+fn w_style_open(nm: *u8, b: *u8, fr: int, to: int) {
+    if (!tag_styled(nm) || ts_n >= 12) { return; }
+    var nc = st_color; var nctr = st_center; var changed = false;
+    var v: u8[80]; var sty: u8[200];
+    if (kstreq(nm, "font") && tag_attr(b, fr, to, "color", &v[0], 80)) { let c = col_parse(&v[0]); if (c >= 0) { nc = c; changed = true; } }
+    if (kstreq(nm, "center")) { nctr = 1; changed = true; }
+    if (tag_attr(b, fr, to, "align", &v[0], 80) && kmatch_ci(&v[0], "center")) { nctr = 1; changed = true; }
+    if (tag_attr(b, fr, to, "style", &sty[0], 200)) {
+        if (css_prop(&sty[0], "color", &v[0], 80)) { let c2 = col_parse(&v[0]); if (c2 >= 0) { nc = c2; changed = true; } }
+        if (css_prop(&sty[0], "text-align", &v[0], 80)) { if (kmatch_ci(&v[0], "center")) { nctr = 1; changed = true; } else if (kmatch_ci(&v[0], "left")) { nctr = 0; changed = true; } }
+    }
+    if (!changed) { return; }
+    w_flush();
+    if (nctr != st_center) { w_newline(); }
+    ts_hash[ts_n] = tag_hash(nm); ts_col[ts_n] = st_color; ts_ctr[ts_n] = st_center; ts_n++;
+    st_color = nc; st_center = nctr;
+}
+fn w_style_close(nm: *u8) {
+    if (ts_n > 0 && ts_hash[ts_n - 1] == tag_hash(nm)) {
+        w_flush();
+        ts_n--;
+        if (ts_ctr[ts_n] != st_center) { w_newline(); }
+        st_color = ts_col[ts_n]; st_center = ts_ctr[ts_n];
+    }
+}
+
+fn w_anchor(name: *u8) {
+    if (wa_n >= 64 || name[0] == 0) { return; }
+    w_flush();
+    let off = w_pool_str(name, kstrlen(name));
+    if (off < 0) { return; }
+    wa_off[wa_n] = off; wa_y[wa_n] = ly; wa_n++;
+}
+/// y of the anchor `#name`, or -1
+fn w_anchor_y(name: *u8) -> int {
+    var i = 0;
+    while (i < wa_n) { if (kstreq(wpool + wa_off[i], name)) { return wa_y[i]; } i++; }
+    return -1;
+}
+
+fn w_open_link(b: *u8, fr: int, to: int) {
+    var href: u8[300];
+    if (!tag_attr(b, fr, to, "href", &href[0], 300)) { return; }
+    if (href[0] == 0 || wl_n >= 600) { return; }
+    var full: u8[300];
+    if (href[0] == '#') { kstrncpy(&full[0], &href[0], 300); } else { url_resolve(&w_base[0], &href[0], &full[0]); }
+    let off = w_pool_str(&full[0], kstrlen(&full[0]));
+    if (off < 0) { return; }
+    wl_off[wl_n] = off;
+    st_link = wl_n; wl_n++;
+}
+
+fn w_rule() {
+    w_newline();
+    if (wn < WMAX) {
+        wit[wn].x = lindent; wit[wn].y = ly + 6; wit[wn].w = lmaxw - lindent; wit[wn].h = 2;
+        wit[wn].off = 0; wit[wn].color = 0xB8C4DA; wit[wn].flags = WF_RULE; wit[wn].link = -1; wn++;
+    }
+    ly = ly + 14; l_first = wn; l_gap = false;
+}
+
+fn w_box(label: *u8) {
+    w_flush();
+    let n = kstrlen(label);
+    if (lx + (n + 2) * 8 > lmaxw && lx > lindent) { w_newline(); }
+    if (l_space && lx > lindent) { lx = lx + 8; }
+    let off = w_pool_str(label, n);
+    if (off < 0 || wn >= WMAX) { return; }
+    wit[wn].x = lx; wit[wn].y = ly; wit[wn].w = (n + 2) * 8; wit[wn].h = 16; wit[wn].off = off;
+    wit[wn].color = 0x3A4660; wit[wn].flags = WF_BOX | (1 << 8); wit[wn].link = st_link; wn++;
+    lx = lx + (n + 2) * 8; l_space = true; l_gap = false;
+}
+
+fn w_tag(nm: *u8, closing: bool, b: *u8, fr: int, to: int) {
+    if (kstreq(nm, "title")) { in_title = !closing; return; }
+    if (kstreq(nm, "br")) { w_flush(); if (lx == lindent && wn == l_first) { ly = ly + 16; } else { w_newline(); } l_gap = false; return; }
+    if (kstreq(nm, "p") || kstreq(nm, "div") || kstreq(nm, "section") || kstreq(nm, "article") || kstreq(nm, "header") || kstreq(nm, "footer") ||
+        kstreq(nm, "nav") || kstreq(nm, "main") || kstreq(nm, "aside") || kstreq(nm, "form") || kstreq(nm, "table") || kstreq(nm, "figure") ||
+        kstreq(nm, "address") || kstreq(nm, "fieldset") || kstreq(nm, "dl") || kstreq(nm, "details") || kstreq(nm, "summary")) { w_flush(); w_para(); return; }
+    if (nm[0] == 'h' && nm[1] >= '1' && nm[1] <= '6' && nm[2] == 0) {
+        w_flush(); w_para();
+        if (closing) { st_head = 0; st_scale = 1; } else { st_head = 1; st_scale = nm[1] == '1' ? 2 : 1; }
+        return;
+    }
+    if (kstreq(nm, "ul") || kstreq(nm, "ol")) {
+        w_flush();
+        if (closing) { if (list_d > 0) { list_d--; lindent = lindent - 24; } if (list_d == 0) { w_para(); } else { w_newline(); } lx = lindent; }
+        else {
+            if (list_d == 0) { w_para(); } else { w_newline(); }
+            if (list_d < 7) { list_k[list_d] = nm[0] == 'o' ? 1 : 0; list_n[list_d] = 0; list_d++; }
+            lindent = lindent + 24; lx = lindent;
+        }
+        return;
+    }
+    if (kstreq(nm, "li")) {
+        if (closing) { return; }
+        w_flush(); w_newline();
+        let savex = lx;
+        lx = lindent - 18;
+        if (list_d > 0 && list_k[list_d - 1] == 1) {
+            list_n[list_d - 1]++;
+            var nb: u8[12]; let nl = itoa(list_n[list_d - 1], &nb[0]); nb[nl] = '.'; nb[nl + 1] = 0;
+            lx = lindent - (nl + 1) * 8 - 4;
+            let off = w_pool_str(&nb[0], nl + 1);
+            if (off >= 0) { w_push(off, nl + 1, 0x6A7A9A, 0, -1, 1); }
+        } else {
+            let off = w_pool_str("*", 1);
+            if (off >= 0) { w_push(off, 1, 0x6A7A9A, 0, -1, 1); }
+        }
+        lx = lindent; l_first = wn; l_gap = false; l_space = false;
+        return;
+    }
+    if (kstreq(nm, "blockquote")) { w_flush(); w_para(); if (closing) { lindent = imax(lindent - 24, 0); } else { lindent = lindent + 24; } lx = lindent; return; }
+    if (kstreq(nm, "dd")) { if (!closing) { w_flush(); w_newline(); } return; }
+    if (kstreq(nm, "dt")) { if (!closing) { w_flush(); w_newline(); } return; }
+    if (kstreq(nm, "tr")) { w_flush(); w_newline(); return; }
+    if (kstreq(nm, "td") || kstreq(nm, "th")) {
+        if (closing) { if (kstreq(nm, "th")) { st_bold--; if (st_bold < 0) { st_bold = 0; } } return; }
+        w_flush();
+        if (lx > lindent) {
+            let off = w_pool_str("|", 1);
+            lx = lx + 8;
+            if (off >= 0) { w_push(off, 1, 0xA0AABF, 0, -1, 1); }
+            l_space = true;
+        }
+        if (kstreq(nm, "th")) { st_bold++; }
+        return;
+    }
+    if (kstreq(nm, "a")) { w_flush(); if (closing) { st_link = -1; } else { w_open_link(b, fr, to); } return; }
+    if (kstreq(nm, "b") || kstreq(nm, "strong")) { w_flush(); if (closing) { if (st_bold > 0) { st_bold--; } } else { st_bold++; } return; }
+    if (kstreq(nm, "i") || kstreq(nm, "em") || kstreq(nm, "cite") || kstreq(nm, "dfn") || kstreq(nm, "var") || kstreq(nm, "u")) { w_flush(); if (closing) { if (st_ital > 0) { st_ital--; } } else { st_ital++; } return; }
+    if (kstreq(nm, "code") || kstreq(nm, "tt") || kstreq(nm, "kbd") || kstreq(nm, "samp")) { w_flush(); if (closing) { if (st_code > 0) { st_code--; } } else { st_code++; } return; }
+    if (kstreq(nm, "s") || kstreq(nm, "del") || kstreq(nm, "strike")) { w_flush(); if (closing) { if (st_strike > 0) { st_strike--; } } else { st_strike++; } return; }
+    if (kstreq(nm, "mark")) { w_flush(); if (closing) { if (st_mark > 0) { st_mark--; } } else { st_mark++; } return; }
+    if (kstreq(nm, "q")) { w_text_char('"'); return; }
+    if (kstreq(nm, "pre")) { w_flush(); w_para(); st_pre = !closing; return; }
+    if (kstreq(nm, "center")) { w_flush(); w_newline(); st_center = closing ? 0 : 1; return; }
+    if (kstreq(nm, "hr")) { w_flush(); w_rule(); return; }
+    if (kstreq(nm, "img")) {
+        var alt: u8[80];
+        if (!tag_attr(b, fr, to, "alt", &alt[0], 80) || alt[0] == 0) { kstrncpy(&alt[0], "image", 80); }
+        var lab: u8[100];
+        lab[0] = '['; var o = 1; var k = 0;
+        while (alt[k] != 0 && o < 90) { lab[o] = alt[k]; o++; k++; }
+        lab[o] = ']'; lab[o + 1] = 0;
+        let saved = st_color;
+        st_color = 0x7A8599;
+        w_flush();
+        w_emit(&lab[0], o + 1);
+        st_color = saved;
+        return;
+    }
+    if (kstreq(nm, "input")) {
+        var ty: u8[16]; var val: u8[40];
+        if (!tag_attr(b, fr, to, "type", &ty[0], 16)) { ty[0] = 0; }
+        if (kmatch_ci(&ty[0], "hidden")) { return; }
+        if (kmatch_ci(&ty[0], "submit") || kmatch_ci(&ty[0], "button")) { if (!tag_attr(b, fr, to, "value", &val[0], 40) || val[0] == 0) { kstrncpy(&val[0], "Submit", 40); } w_box(&val[0]); }
+        else { w_box("__________"); }
+        return;
+    }
+    if (kstreq(nm, "button")) { if (!closing) { w_box("button"); } return; }
+    if (kstreq(nm, "select")) { if (!closing) { w_box("choose"); } return; }
+}
+
+fn w_ci_find(b: *u8, fr: int, len: int, lit: *u8) -> int {
+    let n = kstrlen(lit);
+    var i = fr;
+    while (i + n <= len) { if (kmatch_ci(b + i, lit)) { return i; } i++; }
+    return len;
+}
+
+/// lay out an HTML document
+fn w_html(b: *u8, len: int) {
+    var i = 0;
+    var in_head = false;
+    while (i < len && wn < WMAX - 4) {
+        let c = b[i] as int;
+        if (c == '<') {
+            if (i + 3 < len && b[i + 1] == '!' && b[i + 2] == '-' && b[i + 3] == '-') {
+                var e = i + 4;
+                while (e + 2 < len && !(b[e] == '-' && b[e + 1] == '-' && b[e + 2] == '>')) { e++; }
+                i = e + 3; continue;
+            }
+            var j = i + 1;
+            var closing = false;
+            if (j < len && b[j] == '/') { closing = true; j++; }
+            if (j < len && b[j] == '!') { var e2 = j; while (e2 < len && b[e2] != '>') { e2++; } i = e2 + 1; continue; }
+            var nm: u8[16]; var k = 0;
+            while (j < len && k < 15 && (url_is_letter(b[j] as int) || kisdigit(b[j] as int))) { nm[k] = http_lower(b[j] as int) as u8; k++; j++; }
+            nm[k] = 0;
+            if (k == 0) { w_text_char('<'); i++; continue; }
+            var te = j; var q: u8 = 0;
+            while (te < len && (b[te] != '>' || q != 0)) {
+                if (q != 0) { if (b[te] == q) { q = 0; } } else if (b[te] == '"' || b[te] == '\'') { q = b[te]; }
+                te++;
+            }
+            if (!closing && (kstreq(&nm[0], "script") || kstreq(&nm[0], "style") || kstreq(&nm[0], "noscript") || kstreq(&nm[0], "textarea") || kstreq(&nm[0], "svg"))) {
+                var end = "</script";
+                if (kstreq(&nm[0], "style")) { end = "</style"; } else if (kstreq(&nm[0], "noscript")) { end = "</noscript"; } else if (kstreq(&nm[0], "textarea")) { end = "</textarea"; } else if (kstreq(&nm[0], "svg")) { end = "</svg"; }
+                if (kstreq(&nm[0], "textarea")) { w_box("text area"); }
+                var f = w_ci_find(b, te, len, end);
+                while (f < len && b[f] != '>') { f++; }
+                i = f + 1; continue;
+            }
+            if (!closing && !in_head) {
+                var idb: u8[48];
+                if (tag_attr(b, j, te, "id", &idb[0], 48)) { w_anchor(&idb[0]); }
+                else if (kstreq(&nm[0], "a") && tag_attr(b, j, te, "name", &idb[0], 48)) { w_anchor(&idb[0]); }
+            }
+            if (kstreq(&nm[0], "head")) { in_head = !closing; }
+            else if (kstreq(&nm[0], "body")) {
+                in_head = false;
+                if (!closing) {
+                    var bv: u8[80]; var bs: u8[200];
+                    if (tag_attr(b, j, te, "bgcolor", &bv[0], 80)) { let bc = col_parse(&bv[0]); if (bc >= 0) { w_bg = bc; } }
+                    if (tag_attr(b, j, te, "style", &bs[0], 200)) {
+                        if (css_prop(&bs[0], "background-color", &bv[0], 80) || css_prop(&bs[0], "background", &bv[0], 80)) { let bc2 = col_parse(&bv[0]); if (bc2 >= 0) { w_bg = bc2; } }
+                        if (css_prop(&bs[0], "color", &bv[0], 80)) { let tc = col_parse(&bv[0]); if (tc >= 0) { st_color = tc; } }
+                    }
+                    if (tag_attr(b, j, te, "text", &bv[0], 80)) { let tc2 = col_parse(&bv[0]); if (tc2 >= 0) { st_color = tc2; } }
+                }
+            }
+            else if (!in_head || kstreq(&nm[0], "title")) {
+                if (!closing) { w_tag(&nm[0], closing, b, j, te); w_style_open(&nm[0], b, j, te); }
+                else { w_style_close(&nm[0]); w_tag(&nm[0], closing, b, j, te); }
+            }
+            i = te + 1;
+            continue;
+        }
+        if (in_head && !in_title) { i++; continue; }
+        if (c == '&') { var ip: int[1]; ip[0] = i; if (w_entity(b, &ip[0], len)) { i = ip[0]; continue; } w_text_char('&'); i++; continue; }
+        if (c >= 0xC0) {
+            var n = 1; var cp = c & 0x1F;
+            if (c >= 0xF0) { n = 3; cp = c & 0x07; } else if (c >= 0xE0) { n = 2; cp = c & 0x0F; }
+            var m = 1;
+            while (m <= n && i + m < len && ((b[i + m] as int) & 0xC0) == 0x80) { cp = (cp << 6) | ((b[i + m] as int) & 0x3F); m++; }
+            w_put_cp(cp);
+            i = i + m; continue;
+        }
+        if (c >= 0x80) { i++; continue; }
+        w_text_char(c);
+        i++;
+    }
+    w_flush(); w_newline();
+    w_height = ly + 16;
+}
+
+/// lay out plain text; md = true also styles Markdown headings and ``` code blocks
+fn w_plain(b: *u8, len: int, md: bool) {
+    var i = 0;
+    var fence = false;
+    st_pre = true;
+    while (i < len && wn < WMAX - 4) {
+        var e = i;
+        while (e < len && b[e] != 10) { e++; }
+        var s = i;
+        if (md && e - i >= 3 && b[i] == '`' && b[i + 1] == '`' && b[i + 2] == '`') { fence = !fence; i = e + 1; st_code = fence ? 1 : 0; continue; }
+        if (md && !fence && b[i] == '#') {
+            var h = 0;
+            while (s < e && b[s] == '#') { h++; s++; }
+            while (s < e && b[s] == ' ') { s++; }
+            w_flush(); w_para();
+            st_pre = false; st_head = 1; st_scale = h == 1 ? 2 : 1;
+            var q = s;
+            while (q < e) { w_text_char(b[q] as int); q++; }
+            w_flush(); w_newline();
+            st_head = 0; st_scale = 1; st_pre = true; l_gap = false;
+        } else {
+            var q2 = s;
+            while (q2 < e) {
+                let ch = b[q2] as int;
+                if (ch >= 0xC0) { var n = 1; var cp = ch & 0x1F; if (ch >= 0xF0) { n = 3; cp = ch & 7; } else if (ch >= 0xE0) { n = 2; cp = ch & 15; } var m = 1; while (m <= n && q2 + m < e && ((b[q2 + m] as int) & 0xC0) == 0x80) { cp = (cp << 6) | ((b[q2 + m] as int) & 0x3F); m++; } w_put_cp(cp); q2 = q2 + m; }
+                else if (ch >= 0x80) { q2++; }
+                else { w_text_char(ch); q2++; }
+            }
+            w_text_char(10);
+        }
+        i = e + 1;
+    }
+    st_pre = false; st_code = 0;
+    w_flush(); w_newline();
+    w_height = ly + 16;
+}
+
+/// index of the link under content coordinates (x, y), or -1
+fn w_link_at(x: int, y: int) -> int {
+    var i = 0;
+    while (i < wn) {
+        if (wit[i].link >= 0 && x >= wit[i].x && x < wit[i].x + wit[i].w && y >= wit[i].y && y < wit[i].y + wit[i].h) { return wit[i].link; }
+        i++;
+    }
+    return -1;
+}
+
+/// draw the visible part of the display list; (ox, oy) is where content coordinate (0,0) is on screen
+fn w_draw(ox: int, oy: int, scroll: int, vh: int) {
+    var i = 0;
+    while (i < wn) {
+        let y = wit[i].y - scroll;
+        if (y + wit[i].h >= 0 && y < vh) {
+            let fl = wit[i].flags;
+            let sc = (fl >> 8) & 15;
+            if ((fl & WF_RULE) != 0) { fill(ox + wit[i].x, oy + y, wit[i].w, 2, wit[i].color); }
+            else if ((fl & WF_BOX) != 0) {
+                fill(ox + wit[i].x, oy + y, wit[i].w, 16, 0xE6ECF7);
+                frame(ox + wit[i].x, oy + y, wit[i].w, 16, 0x7C8DA8);
+                draw_text(ox + wit[i].x + 8, oy + y, wpool + wit[i].off, wit[i].color);
+            } else {
+                if ((fl & WF_MARK) != 0) { fill(ox + wit[i].x, oy + y, wit[i].w, wit[i].h, 0xFFF3A8); }
+                if ((fl & WF_HLCUR) != 0) { fill(ox + wit[i].x - 1, oy + y, wit[i].w + 2, wit[i].h, 0xFF9E3D); }
+                else if ((fl & WF_HL) != 0) { fill(ox + wit[i].x - 1, oy + y, wit[i].w + 2, wit[i].h, 0xFFE259); }
+                draw_text_sc(ox + wit[i].x, oy + y, wpool + wit[i].off, wit[i].color, sc);
+                if ((fl & WF_STRIKE) != 0) { fill(ox + wit[i].x, oy + y + 8 * sc, wit[i].w, 1, wit[i].color); }
+                if ((fl & WF_BOLD) != 0) { draw_text_sc(ox + wit[i].x + 1, oy + y, wpool + wit[i].off, wit[i].color, sc); }
+                if ((fl & WF_UL) != 0) { fill(ox + wit[i].x, oy + y + 15 * sc, wit[i].w, 1, wit[i].color); }
+            }
+        }
+        i++;
+    }
+}

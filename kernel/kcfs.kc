@@ -1,0 +1,266 @@
+// kcfs.kc -- crash-safe persistence of the KCFS tree.  Author: Divyanshu Sinha (MIT License)
+//
+// On-disk layout inside the 3.5 MiB store area that starts at store_lba():
+//     +0              header of slot A          +1              header of slot B
+//     +2              data of slot A  (SLOT_SECT sectors)       +2+SLOT_SECT    data of slot B
+// A save writes the complete tree to the slot that does NOT hold the newest generation, flushes it, and only then writes that
+// slot's header (the commit).  A power cut before the header lands leaves the previous generation untouched; a torn or corrupt
+// slot fails its CRC32 and the loader falls back to the other one.  The loader also still reads the old "KCFS0001" format.
+//
+//   header (512 B): "KCFS0002" | u64 generation | u64 stream bytes | u64 node count | u64 CRC32 of the stream | u64 saved-at |
+//                   ... zeros ...  | u32 CRC32 of bytes 0..507 at offset 508
+//   stream: per node a 64-byte record { u32 index, kind, parent, size, mtime, ctime, attr, 0, name[28] } followed by the file bytes.
+// fs_save() runs automatically 3 s after the last change (fs_autosave) and before reboot / power off (fs_flush).
+
+const SLOT_SECT = 3583;
+const STORE_MAX = 1834496;               // SLOT_SECT * 512: the largest tree that can be saved
+const KC_REC = 64;
+
+var fs_persisted = false;
+var fs_gen = 0;                          // generation of the newest committed save (0: none yet)
+var fs_slot = 1;                         // slot that holds it (the next save goes to the other one)
+var fs_saved_at = 0;                     // wall-clock time of that save
+var fs_saved_bytes = 0;
+var fs_save_err = 0;                     // result of the last failed save (0 = none)
+var fs_retry_t = 0;
+var fs_recovered = 0;                    // load: 0 clean, 1 fell back to an older generation, 2 migrated from KCFS 1
+var fs_crc_tab: int[256];
+var fs_crc_ready = false;
+
+fn crc32(buf: *u8, n: int) -> int {
+    if (!fs_crc_ready) {
+        var i = 0;
+        while (i < 256) {
+            var c = i;
+            var k = 0;
+            while (k < 8) { if ((c & 1) != 0) { c = (c >> 1) ^ 0xEDB88320; } else { c = c >> 1; } k++; }
+            fs_crc_tab[i] = c;
+            i++;
+        }
+        fs_crc_ready = true;
+    }
+    var crc = 0xFFFFFFFF;
+    var j = 0;
+    while (j < n) { crc = fs_crc_tab[(crc ^ (buf[j] as int)) & 255] ^ (crc >> 8); j++; }
+    return crc ^ 0xFFFFFFFF;
+}
+
+fn store_total() -> int {
+    var total = 0;
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE) { total = total + KC_REC; if (fs_nodes[i].kind == K_FILE) { total = total + fs_nodes[i].size; } }
+        i++;
+    }
+    return total;
+}
+
+fn kc_data_lba(slot: int) -> int { return store_lba() + 2 + slot * SLOT_SECT; }
+
+/// 0 ok, 1 no disk, 2 too big, 3 I/O error, 4 out of memory
+fn fs_save() -> int {
+    if (!disk_present) { return 1; }
+    if (fs_lock >= 0) { mtx_lock(fs_lock); }            // one save at a time (the saver thread yields while writing)
+    let r = fs_save_locked();
+    if (fs_lock >= 0) { mtx_unlock(fs_lock); }
+    return r;
+}
+
+/// writes the snapshot in chunks of 64 sectors and lets other threads run in between
+fn kc_write_chunks(lba: int, nsec: int, buf: *u8) -> bool {
+    var done = 0;
+    while (done < nsec) {
+        var c = nsec - done;
+        if (c > 64) { c = 64; }
+        if (!ata_write(lba + done, c, buf + done * 512)) { return false; }
+        done = done + c;
+        if (done < nsec) { thr_yield(); }
+    }
+    return true;
+}
+
+fn fs_save_locked() -> int {
+    let total = store_total();
+    if (total > STORE_MAX) { return 2; }
+    let nsec = (total + 511) >> 9;
+    let buf = kzalloc(nsec * 512 + 512);
+    if (buf == (0 as *u8)) { return 4; }
+    let rev0 = fs_rev;                                     // the snapshot below is consistent: nothing yields until it is built
+    var p = 0;
+    var count = 0;
+    var i = 1;
+    while (i < FS_MAX) {
+        if (fs_nodes[i].kind != K_FREE) {
+            let rec = buf + p;
+            let sz = fs_nodes[i].kind == K_FILE ? fs_nodes[i].size : 0;
+            *(rec as *u32) = i as u32;
+            *((rec + 4) as *u32) = fs_nodes[i].kind as u32;
+            *((rec + 8) as *u32) = fs_nodes[i].parent as u32;
+            *((rec + 12) as *u32) = sz as u32;
+            *((rec + 16) as *u32) = fs_nodes[i].mtime as u32;
+            *((rec + 20) as *u32) = fs_nodes[i].ctime as u32;
+            *((rec + 24) as *u32) = fs_nodes[i].attr as u32;
+            kmemcpy(rec + 32, &fs_nodes[i].name[0], FS_NAME);
+            p = p + KC_REC;
+            if (sz > 0) { kmemcpy(buf + p, fs_nodes[i].data, sz); p = p + sz; }
+            count++;
+        }
+        i++;
+    }
+    let target = 1 - fs_slot;
+    let gen = fs_gen + 1;
+    var hdr: u8[512];
+    kmemset(&hdr[0], 0, 512);
+    kmemcpy(&hdr[0], "KCFS0002", 8);
+    wr64((&hdr[0] as int) + 8, gen);
+    wr64((&hdr[0] as int) + 16, total);
+    wr64((&hdr[0] as int) + 24, count);
+    wr64((&hdr[0] as int) + 32, crc32(buf, total));
+    let now = fs_now();
+    wr64((&hdr[0] as int) + 40, now);
+    *((&hdr[0] + 508) as *u32) = crc32(&hdr[0], 508) as u32;
+    var ok = true;
+    if (nsec > 0) { ok = kc_write_chunks(kc_data_lba(target), nsec, buf); }
+    if (ok) { ok = ata_write(store_lba() + target, 1, &hdr[0]); }          // the commit
+    kfree(buf);
+    if (!ok) { fs_save_err = 3; return 3; }
+    fs_gen = gen; fs_slot = target; fs_saved_at = now; fs_saved_bytes = total;
+    fs_persisted = true; fs_save_err = 0;
+    if (fs_rev == rev0) { fs_dirty = false; } else { fs_dirty_t = ticks; }     // edited while the data was being written: still dirty
+    return 0;
+}
+
+/// validate a header sector; returns its generation (>0) or 0 when it is not a good KCFS 2 header
+fn kc_hdr_gen(h: *u8) -> int {
+    if (!kstarts(h, "KCFS0002")) { return 0; }
+    if ((*((h + 508) as *u32) as int) != crc32(h, 508)) { return 0; }
+    let total = rd64((h as int) + 16); let count = rd64((h as int) + 24);
+    if (total < 0 || total > STORE_MAX || count < 0 || count >= FS_MAX) { return 0; }
+    return rd64((h as int) + 8);
+}
+
+/// replace the tree with a stream of `count` records (record size rs: 64 for KCFS 2, 48 for KCFS 1). false = malformed.
+fn kc_apply(buf: *u8, total: int, count: int, rs: int) -> bool {
+    fs_init();
+    var p = 0;
+    var n = 0;
+    while (n < count) {
+        if (p + rs > total) { return false; }
+        let rec = buf + p;
+        let idx = *(rec as *u32) as int;
+        let kind = *((rec + 4) as *u32) as int;
+        let parent = *((rec + 8) as *u32) as int;
+        let sz = *((rec + 12) as *u32) as int;
+        p = p + rs;
+        if (sz < 0 || p + sz > total) { return false; }
+        if (idx > 0 && idx < FS_MAX && (kind == K_FILE || kind == K_DIR)) {
+            if (rs == KC_REC) { kstrncpy(&fs_nodes[idx].name[0], rec + 32, FS_NAME); }
+            else { kstrncpy(&fs_nodes[idx].name[0], rec + 16, FS_NAME); }
+            fs_nodes[idx].name[FS_NAME - 1] = 0;
+            fs_nodes[idx].kind = kind;
+            fs_nodes[idx].parent = parent;
+            fs_nodes[idx].size = 0; fs_nodes[idx].cap = 0; fs_nodes[idx].data = 0 as *u8;
+            fs_nodes[idx].mtime = 0; fs_nodes[idx].ctime = 0; fs_nodes[idx].attr = 0;
+            if (kind == K_FILE && sz > 0) {
+                if (!fs_write(idx, buf + p, sz, false)) { return false; }
+            }
+            if (rs == KC_REC) {                          // metadata last: fs_write stamps the time and refuses read-only files
+                fs_nodes[idx].mtime = *((rec + 16) as *u32) as int;
+                fs_nodes[idx].ctime = *((rec + 20) as *u32) as int;
+                fs_nodes[idx].attr = *((rec + 24) as *u32) as int;
+            }
+        }
+        p = p + sz;
+        n++;
+    }
+    return true;
+}
+
+/// read slot s if its header is good and its stream matches the CRC; returns the buffer (caller frees) or null
+fn kc_read_slot(s: int, hdr: *u8, total_out: *int, count_out: *int) -> *u8 {
+    let total = rd64((hdr as int) + 16);
+    let nsec = (total + 511) >> 9;
+    let buf = kzalloc(nsec * 512 + 512);
+    if (buf == (0 as *u8)) { return buf; }
+    if (nsec > 0 && !ata_read(kc_data_lba(s), nsec, buf)) { kfree(buf); return 0 as *u8; }
+    if (crc32(buf, total) != rd64((hdr as int) + 32)) { kfree(buf); return 0 as *u8; }
+    total_out[0] = total; count_out[0] = rd64((hdr as int) + 24);
+    return buf;
+}
+
+/// restore the filesystem from disk; false (and an empty filesystem) when there is no valid store.
+/// The newest intact generation wins; fs_recovered tells whether the newest one had to be skipped.
+fn fs_load() -> bool {
+    if (!disk_present) { return false; }
+    var ha: u8[512]; var hb: u8[512];
+    var ga = 0; var gb = 0;
+    if (ata_read(store_lba(), 1, &ha[0])) { ga = kc_hdr_gen(&ha[0]); }
+    if (ata_read(store_lba() + 1, 1, &hb[0])) { gb = kc_hdr_gen(&hb[0]); }
+    var tries = 0;
+    while (tries < 2) {
+        var s = 0;                                   // slot to try: newest first
+        if (ga == 0 && gb == 0) { break; }
+        if (ga >= gb) { s = 0; } else { s = 1; }
+        var tot = 0; var cnt = 0;
+        var buf = 0 as *u8;
+        if (s == 0) { buf = kc_read_slot(0, &ha[0], &tot, &cnt); } else { buf = kc_read_slot(1, &hb[0], &tot, &cnt); }
+        if (buf != (0 as *u8)) {
+            let ok = kc_apply(buf, tot, cnt, KC_REC);
+            kfree(buf);
+            if (ok) {
+                if (s == 0) { fs_gen = ga; fs_saved_at = rd64((&ha[0] as int) + 40); } else { fs_gen = gb; fs_saved_at = rd64((&hb[0] as int) + 40); }
+                fs_slot = s; fs_persisted = true; fs_saved_bytes = tot;
+                fs_recovered = 0;
+                if (tries > 0) { fs_recovered = 1; }
+                fs_dirty = false;
+                var rep: int[5];
+                fs_fsck(true, &rep[0]);                       // repairs mark the tree dirty again
+                return true;
+            }
+        }
+        if (s == 0) { ga = 0; } else { gb = 0; }
+        tries++;
+    }
+    // legacy KCFS 1 (header at the store start, data from the next sector, byte-sum checksum)
+    var h1: u8[512];
+    if (ata_read(store_lba(), 1, &h1[0]) && kstarts(&h1[0], "KCFS0001")) {
+        let total = rd64((&h1[0] as int) + 8);
+        let count = rd64((&h1[0] as int) + 16);
+        let sum = rd64((&h1[0] as int) + 24);
+        if (total >= 0 && total <= 0x37F000 && count >= 0 && count < FS_MAX) {
+            let nsec = (total + 511) >> 9;
+            let buf = kzalloc(nsec * 512 + 512);
+            if (buf != (0 as *u8)) {
+                var good = true;
+                if (nsec > 0 && !ata_read(store_lba() + 1, nsec, buf)) { good = false; }
+                if (good) { var s1 = 0; var q = 0; while (q < total) { s1 = s1 + (buf[q] as int); q++; } if (s1 != sum) { good = false; } }
+                if (good && kc_apply(buf, total, count, 48)) {
+                    kfree(buf);
+                    fs_gen = 0; fs_slot = 0; fs_persisted = true; fs_recovered = 2;
+                    fs_mark();                                        // migrate to KCFS 2 at the next autosave
+                    return true;
+                }
+                kfree(buf);
+            }
+        }
+    }
+    fs_init();
+    return false;
+}
+
+fn fs_forget() -> bool {
+    if (!disk_present) { return false; }
+    var z: u8[512];
+    kmemset(&z[0], 0, 512);
+    fs_persisted = false; fs_gen = 0; fs_slot = 1;
+    return ata_write(store_lba(), 1, &z[0]) && ata_write(store_lba() + 1, 1, &z[0]);
+}
+
+/// called about once a second: saves 3 s after the last change (retries after 10 s when a save fails)
+fn fs_autosave() {
+    if (!fs_dirty || !disk_present) { return; }
+    if (ticks - fs_dirty_t < 300 || ticks < fs_retry_t) { return; }
+    if (fs_save() != 0) { fs_retry_t = ticks + 1000; }
+}
+/// save now if anything changed (before reboot / power off)
+fn fs_flush() { if (fs_dirty && disk_present) { fs_save(); } }

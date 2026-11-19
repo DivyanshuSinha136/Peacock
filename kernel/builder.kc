@@ -1,0 +1,1117 @@
+// builder.kc -- the Peacock App Builder (a visual designer) and the App Runner that runs what it builds.
+// An app is a text file /apps/NAME.pea:   APP|title|width|height|background     then one line per widget:
+//   W|kind|x|y|w|h|colour|action|target|hidden|text|arg|action2|target2|value|arg2        (numbers in decimal; the last four are optional)
+// Widgets: label, button, text box, checkbox, panel, progress bar, slider, icon, timer.  Every interactive widget runs an action
+// (and an optional second "then" action) when used; a timer widget runs its actions every N seconds.  Conditions ("if text equals",
+// "if number is greater") stop the chain, so two actions can express "if ... then ...".
+// Author of Peacock: Divyanshu Sinha (MIT License)
+
+const WD_MAX = 40;
+const WK_LABEL = 1; const WK_BUTTON = 2; const WK_TEXT = 3; const WK_CHECK = 4; const WK_PANEL = 5; const WK_BAR = 6;
+const WK_SLIDER = 7; const WK_ICON = 8; const WK_TIMER = 9; const WK_VIEW3D = 10; const WK_MAXK = 10;
+const NACT = 18;
+const BLD_W = 860; const BLD_H = 540;
+const CX = 110; const CY = 44;               // where the design surface starts inside the builder window
+const PX = 626;                              // properties panel
+const SURF_W = 500; const SURF_H = 400;      // largest app window the builder designs (the runner allows more)
+
+struct Wd {
+    kind: int, x: int, y: int, w: int, h: int, color: int,
+    act: int, target: int, hid: int, chk: int,
+    act2: int, target2: int, val: int,
+    text: u8[32],
+    arg: u8[32],
+    arg2: u8[32]
+}
+
+var pal10: int[10] = [0xFFFFFF, 0xECEFF4, 0xDCE6FA, 0x1B2433, 0xE74C3C, 0xF39C12, 0xF1C40F, 0x27AE60, 0x1F6FEB, 0x8E44AD];
+var empty_s: u8[4];
+
+// ---------------------------------------------------------------- small helpers
+var r_yaw: int[40]; var r_spin_t: int[40]; var r_pitch: int[40]; var r_dx = 0; var r_dy = 0; var r_moved = 0;
+// 3D view widget: val packs model (bits 0-3), style (4-5) and spin speed 0..4 (6-8)
+fn v3_model(v: int) -> int { return imin(v & 15, G3_MODELS - 1); }
+fn v3_style(v: int) -> int { return imin((v >> 4) & 3, 2); }
+fn v3_spin(v: int) -> int { return imin((v >> 6) & 7, 4); }
+fn kind_name(k: int) -> *u8 {
+    if (k == WK_LABEL) { return "Label"; }
+    if (k == WK_BUTTON) { return "Button"; }
+    if (k == WK_TEXT) { return "Text box"; }
+    if (k == WK_CHECK) { return "Checkbox"; }
+    if (k == WK_BAR) { return "Progress"; }
+    if (k == WK_SLIDER) { return "Slider"; }
+    if (k == WK_ICON) { return "Icon"; }
+    if (k == WK_TIMER) { return "Timer"; }
+    if (k == WK_VIEW3D) { return "3D view"; }
+    return "Panel";
+}
+fn act_name(a: int) -> *u8 {
+    if (a == 1) { return "Set text"; }
+    if (a == 2) { return "Add number"; }
+    if (a == 3) { return "Multiply"; }
+    if (a == 4) { return "Copy text from"; }
+    if (a == 5) { return "Clear text"; }
+    if (a == 6) { return "Show / hide"; }
+    if (a == 7) { return "Set colour"; }
+    if (a == 8) { return "Open app"; }
+    if (a == 9) { return "Beep"; }
+    if (a == 10) { return "Close window"; }
+    if (a == 11) { return "Append text"; }
+    if (a == 12) { return "Calculate"; }
+    if (a == 13) { return "Show message"; }
+    if (a == 14) { return "Switch to app"; }
+    if (a == 15) { return "If text equals"; }
+    if (a == 16) { return "If number is >"; }
+    if (a == 17) { return "Random 1..N"; }
+    return "Do nothing";
+}
+fn act_hint(a: int) -> *u8 {
+    if (a == 1) { return "text to put there"; }
+    if (a == 2) { return "number (default 1)"; }
+    if (a == 3) { return "number to multiply by"; }
+    if (a == 4) { return "pick source widget"; }
+    if (a == 7) { return "colour 0-9"; }
+    if (a == 8) { return "calc notes paint ..."; }
+    if (a == 11) { return "text to append"; }
+    if (a == 12) { return "e.g. 1+2 (widget #s)"; }
+    if (a == 13) { return "message to show"; }
+    if (a == 14) { return "app file name (no .pea)"; }
+    if (a == 15) { return "text to compare with"; }
+    if (a == 16) { return "number to compare with"; }
+    if (a == 17) { return "N (default 6)"; }
+    return "(not used)";
+}
+fn act_help(a: int) -> *u8 {
+    if (a == 6) { return "Hides the target, or shows it again. On a timer: pause / resume."; }
+    if (a == 12) { return "Result goes into the target. Operators + - * / %"; }
+    if (a == 14) { return "Closes this app and starts another one."; }
+    if (a == 15) { return "Continues with the Then action only when equal."; }
+    if (a == 16) { return "Continues with the Then action only when greater."; }
+    if (a == 17) { return "Puts a number from 1 to N into the target."; }
+    if (a == 13) { return "Pops up a notification."; }
+    if (a == 0) { return "Pick what happens with the arrows."; }
+    return "";
+}
+fn act_needs_target(a: int) -> bool { return (a >= 1 && a <= 7) || a == 11 || a == 12 || a == 15 || a == 16 || a == 17; }
+fn act_needs_arg(a: int) -> bool { return a == 1 || a == 2 || a == 3 || a == 4 || a == 7 || a == 8 || a == 11 || a == 12 || (a >= 13 && a <= 17); }
+fn kind_has_action(k: int) -> bool { return k == WK_BUTTON || k == WK_CHECK || k == WK_TEXT || k == WK_SLIDER || k == WK_ICON || k == WK_TIMER || k == WK_VIEW3D; }
+
+// accessors for the two action slots of a widget
+fn w_act(wd: *Wd, i: int, s: int) -> int { if (s == 0) { return wd[i].act; } return wd[i].act2; }
+fn w_tgt(wd: *Wd, i: int, s: int) -> int { if (s == 0) { return wd[i].target; } return wd[i].target2; }
+fn w_arg(wd: *Wd, i: int, s: int) -> *u8 { if (s == 0) { return &wd[i].arg[0]; } return &wd[i].arg2[0]; }
+fn w_set_act(wd: *Wd, i: int, s: int, v: int) { if (s == 0) { wd[i].act = v; } else { wd[i].act2 = v; } }
+fn w_set_tgt(wd: *Wd, i: int, s: int, v: int) { if (s == 0) { wd[i].target = v; } else { wd[i].target2 = v; } }
+
+// the icons a widget can show (SVG glyphs)
+var ico_t: int[24]; var ico_ready = false;
+const ICO_N = 24;
+fn ico_fill() {
+    ico_ready = true;
+    ico_t[0] = G_HOME; ico_t[1] = G_FOLDER; ico_t[2] = G_SEARCH; ico_t[3] = G_PLAY; ico_t[4] = G_PAUSE; ico_t[5] = G_STOP;
+    ico_t[6] = G_FLAG; ico_t[7] = G_CHECK; ico_t[8] = G_PLUS; ico_t[9] = G_ALARM; ico_t[10] = G_CLOCK; ico_t[11] = G_SUN;
+    ico_t[12] = G_PALETTE; ico_t[13] = G_IMAGE; ico_t[14] = G_INFO; ico_t[15] = G_TRASH; ico_t[16] = G_SAVE; ico_t[17] = G_POWER;
+    ico_t[18] = G_TERMINAL; ico_t[19] = G_TEXT; ico_t[20] = G_GRID; ico_t[21] = G_TODAY; ico_t[22] = G_REFRESH; ico_t[23] = G_STOPWATCH;
+}
+fn ico_g(i: int) -> int { if (!ico_ready) { ico_fill(); } return ico_t[((i % ICO_N) + ICO_N) % ICO_N]; }
+
+fn contrast(c: int) -> int {
+    let lum = (((c >> 16) & 255) * 3 + ((c >> 8) & 255) * 6 + (c & 255)) / 10;
+    if (lum < 140) { return 0xFFFFFF; }
+    return C_INK;
+}
+fn ends_with(s: *u8, suf: *u8) -> bool {
+    let a = kstrlen(s); let b = kstrlen(suf);
+    if (a < b) { return false; }
+    return kstreq(&s[a - b], suf);
+}
+fn fld_edit(buf: *u8, cap: int, k: int, filt: int) -> bool {
+    let n = kstrlen(buf);
+    if (k == 8) { if (n > 0) { buf[n - 1] = 0; return true; } return false; }
+    if (k >= 32 && k <= 126 && k != '|' && n < cap - 1) {
+        if (filt == 1 && !((k >= 'a' && k <= 'z') || (k >= 'A' && k <= 'Z') || (k >= '0' && k <= '9') || k == '-' || k == '_')) { return false; }
+        buf[n] = k as u8; buf[n + 1] = 0;
+        return true;
+    }
+    return false;
+}
+fn text_fit(x: int, w: int, y: int, s: *u8, col: int) {
+    let tw = text_w(s);
+    if (tw <= w - 8) { draw_text(x + (w - tw) / 2, y, s, col); }
+    else { draw_text_n(x + 4, y, s, (w - 8) / 8, col); }
+}
+fn open_named(s: *u8) -> bool {
+    if (kstreq(s, "terminal")) { app_open(APP_TERM); }
+    else if (kstreq(s, "notes")) { app_open(APP_NOTES); }
+    else if (kstreq(s, "paint")) { app_open(APP_PAINT); }
+    else if (kstreq(s, "calc")) { app_open(APP_CALC); }
+    else if (kstreq(s, "info")) { app_open(APP_INFO); }
+    else if (kstreq(s, "files")) { app_open(APP_FILES); }
+    else if (kstreq(s, "cal") || kstreq(s, "calendar")) { app_open(APP_CAL); }
+    else if (kstreq(s, "clock")) { app_open(APP_CLOCK); }
+    else if (kstreq(s, "snake")) { app_open(APP_SNAKE); }
+    else if (kstreq(s, "mines")) { app_open(APP_MINES); }
+    else if (kstreq(s, "monitor")) { app_open(APP_MON); }
+    else if (kstreq(s, "web") || kstreq(s, "browser")) { app_open(APP_WEB); }
+    else if (kstreq(s, "builder")) { app_open(APP_BLD); }
+    else { return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- drawing one widget (builder and runner share it)
+fn slider_val(wd: *Wd, i: int) -> int { return imax(0, imin(100, katoi(&wd[i].text[0]))); }
+
+fn wd_draw(wd: *Wd, i: int, ox: int, oy: int, foc: bool, run: bool, pressed: bool) {
+    let k = wd[i].kind; let x = ox + wd[i].x; let y = oy + wd[i].y; let w = wd[i].w; let h = wd[i].h; let c = wd[i].color;
+    if (k == WK_PANEL) { rrect(x, y, w, h, 6, mix(c, 0x000000, 40), c, false); }
+    else if (k == WK_LABEL) {
+        if ((wd[i].hid & 2) != 0) { draw_text_sc(x, y + (h - 32) / 2, &wd[i].text[0], c, 2); }
+        else { draw_text_n(x, y + (h - 16) / 2, &wd[i].text[0], w / 8, c); }
+    } else if (k == WK_BAR) {
+        rrect(x, y, w, h, 5, 0xB6BFD3, 0xE4E7EE, false);
+        let v = slider_val(wd, i);
+        if (v > 0) { rfill(x + 1, y + 1, imax(6, (w - 2) * v / 100), h - 2, 4, c, false); }
+    } else if (k == WK_SLIDER) {
+        let ty = y + h / 2 - 3;
+        rfill(x, ty, w, 6, 3, 0xD3D9E6, false);
+        let kx = x + (w - 14) * slider_val(wd, i) / 100;
+        if (kx > x) { rfill(x, ty, kx - x + 7, 6, 3, c, false); }
+        rrect(kx, y + h / 2 - 8, 14, 16, 7, 0x8A97AD, pressed || foc ? mix(0xFFFFFF, c, 40) : 0xFFFFFF, false);
+    } else if (k == WK_ICON) {
+        var ic = c;
+        if (pressed) { ic = mix(c, 0x000000, 40); }
+        ui_glyph(ico_g(wd[i].val), x, y, w, h, imax(12, imin(w, h) - 4), ic);
+    } else if (k == WK_VIEW3D) {
+        rrect(x, y, w, h, 8, mix(c, 0x000000, 60), 0xE9EDF7, false);
+        vgrad(x + 1, y + 1, w - 2, h - 2, 0xF6F8FD, 0xC5CCDF);
+        var yw = 24; var pt = 14;
+        if (run) { yw = r_yaw[i]; pt = r_pitch[i]; }
+        g3_shadow = h >= 110; g3_zoom = 256;
+        g3_render(x + 3, y + 3, w - 6, h - 6, v3_model(wd[i].val), yw, pt, v3_style(wd[i].val), c);
+    } else if (k == WK_TIMER) {
+        if (!run) {
+            rrect(x, y, w, h, 6, 0xC3CAD8, 0xF1F3F9, false);
+            ui_glyph(G_TIMER, x + 2, y, 20, h, 16, (wd[i].hid & 1) != 0 ? 0x9AA6BF : 0x1F6FEB);
+            var tb: u8[24]; var q = 0;
+            tb[0] = 0; kstrncpy(&tb[0], "every ", 8); q = kstrlen(&tb[0]);
+            itoa(imax(1, wd[i].val), &tb[q]); q = kstrlen(&tb[0]); tb[q] = 's'; tb[q + 1] = 0;
+            draw_text(x + 24, y + (h - 16) / 2, &tb[0], 0x5A6680);
+        }
+    } else if (k == WK_BUTTON) {
+        var fillc = c;
+        if (pressed) { fillc = mix(c, 0x000000, 40); }
+        rrect(x, y, w, h, 6, mix(c, 0x000000, 70), fillc, false);
+        var o = 0;
+        if (pressed) { o = 1; }
+        text_fit(x, w, y + (h - 16) / 2 + o, &wd[i].text[0], contrast(fillc));
+    } else if (k == WK_TEXT) {
+        var edge = 0xC3CAD8;
+        if (foc) { edge = 0x1F6FEB; }
+        rrect(x, y, w, h, 5, edge, 0xFFFFFF, false);
+        let cols = (w - 12) / 8;
+        draw_text_n(x + 6, y + (h - 16) / 2, &wd[i].text[0], cols, C_INK);
+        if (foc && run) { fill(x + 6 + imin(kstrlen(&wd[i].text[0]), cols) * 8, y + (h - 16) / 2, 2, 16, C_INK); }
+    } else if (k == WK_CHECK) {
+        let by = y + (h - 16) / 2;
+        rrect(x, by, 16, 16, 4, 0x9AA6BF, 0xFFFFFF, false);
+        if (wd[i].chk != 0) { rfill(x + 4, by + 4, 8, 8, 2, c, false); }
+        draw_text_n(x + 24, by, &wd[i].text[0], (w - 24) / 8, C_INK);
+    }
+}
+
+fn wd_hit(wd: *Wd, n: int, mx: int, my: int, run: bool) -> int {
+    var i = n - 1;
+    while (i >= 0) {
+        let invisible = run && ((wd[i].hid & 1) != 0 || wd[i].kind == WK_TIMER);
+        if (!invisible && in_rect(mx, my, wd[i].x, wd[i].y, wd[i].w, wd[i].h)) { return i; }
+        i--;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------- the .pea file format
+fn sp(out: *u8, pos: int, s: *u8) -> int { var i = 0; while (s[i] != 0) { out[pos + i] = s[i]; i++; } return pos + i; }
+fn spn(out: *u8, pos: int, v: int) -> int { var b: u8[24]; itoa(v, &b[0]); var p = sp(out, pos, &b[0]); out[p] = '|'; return p + 1; }
+
+fn wd_ser(out: *u8, wd: *Wd, n: int, title: *u8, w: int, h: int, bg: int) -> int {
+    var p = sp(out, 0, "APP|");
+    p = sp(out, p, title); out[p] = '|'; p++;
+    p = spn(out, p, w); p = spn(out, p, h);
+    var b: u8[24]; itoa(bg, &b[0]); p = sp(out, p, &b[0]); out[p] = '\n'; p++;
+    var i = 0;
+    while (i < n) {
+        p = sp(out, p, "W|");
+        p = spn(out, p, wd[i].kind); p = spn(out, p, wd[i].x); p = spn(out, p, wd[i].y); p = spn(out, p, wd[i].w); p = spn(out, p, wd[i].h);
+        p = spn(out, p, wd[i].color); p = spn(out, p, wd[i].act); p = spn(out, p, wd[i].target); p = spn(out, p, wd[i].hid);
+        p = sp(out, p, &wd[i].text[0]); out[p] = '|'; p++;
+        p = sp(out, p, &wd[i].arg[0]); out[p] = '|'; p++;
+        p = spn(out, p, wd[i].act2); p = spn(out, p, wd[i].target2); p = spn(out, p, wd[i].val);
+        p = sp(out, p, &wd[i].arg2[0]); out[p] = '\n'; p++;
+        i++;
+    }
+    out[p] = 0;
+    return p;
+}
+
+/// parse a .pea file into wd; hdr = {w, h, background}; returns the widget count or -1 when it is not an app file.
+/// Older files (11 or 12 fields per widget) load with the new fields at their defaults.
+fn wd_parse_text(src: *u8, len: int, wd: *Wd, hdr: *int, title: *u8) -> int {
+    var ln: u8[240]; var fo: int[18];
+    var n = 0; var got = false; var pos = 0;
+    while (pos < len) {
+        var l = 0;
+        while (pos < len && src[pos] != '\n') { if (l < 239) { ln[l] = src[pos]; l++; } pos++; }
+        pos++;
+        ln[l] = 0;
+        var nf = 1; fo[0] = 0; var j = 0;
+        while (j < l) { if (ln[j] == '|') { ln[j] = 0; if (nf < 17) { fo[nf] = j + 1; nf++; } } j++; }
+        if (kstreq(&ln[0], "APP") && nf >= 5) {
+            kstrncpy(title, &ln[fo[1]], 32);
+            hdr[0] = katoi(&ln[fo[2]]); hdr[1] = katoi(&ln[fo[3]]); hdr[2] = katoi(&ln[fo[4]]);
+            got = true;
+        } else if (kstreq(&ln[0], "W") && nf >= 11 && n < WD_MAX) {
+            wd[n].kind = katoi(&ln[fo[1]]); wd[n].x = katoi(&ln[fo[2]]); wd[n].y = katoi(&ln[fo[3]]);
+            wd[n].w = katoi(&ln[fo[4]]); wd[n].h = katoi(&ln[fo[5]]); wd[n].color = katoi(&ln[fo[6]]);
+            wd[n].act = katoi(&ln[fo[7]]); wd[n].target = katoi(&ln[fo[8]]); wd[n].hid = katoi(&ln[fo[9]]);
+            wd[n].chk = 0;
+            kstrncpy(&wd[n].text[0], &ln[fo[10]], 32);
+            wd[n].arg[0] = 0;
+            if (nf >= 12) { kstrncpy(&wd[n].arg[0], &ln[fo[11]], 32); }
+            wd[n].act2 = 0; wd[n].target2 = -1; wd[n].val = 0; wd[n].arg2[0] = 0;
+            if (nf >= 16) {
+                wd[n].act2 = katoi(&ln[fo[12]]); wd[n].target2 = katoi(&ln[fo[13]]); wd[n].val = katoi(&ln[fo[14]]);
+                kstrncpy(&wd[n].arg2[0], &ln[fo[15]], 32);
+            }
+            if (wd[n].act < 0 || wd[n].act >= NACT) { wd[n].act = 0; }
+            if (wd[n].act2 < 0 || wd[n].act2 >= NACT) { wd[n].act2 = 0; }
+            if (wd[n].kind >= 1 && wd[n].kind <= WK_MAXK) { n++; }
+        }
+    }
+    if (!got) { return -1; }
+    hdr[3] = 0; hdr[4] = 0; hdr[5] = -1;
+    return n;
+}
+
+/// load a program: the binary .pea format, or (for old files and sources) the text format.  hdr = {w, h, bg, icon, flags, entry}.
+/// Returns the widget count, or a negative number (pea_last_err says why).
+fn wd_parse(src: *u8, len: int, wd: *Wd, hdr: *int, title: *u8) -> int {
+    pea_last_err = 0;
+    if (pea_is_binary(src, len)) {
+        let n = pea_decode(src, len, wd, hdr, title);
+        if (n < 0) { pea_last_err = n; }
+        return n;
+    }
+    let n = wd_parse_text(src, len, wd, hdr, title);
+    if (n < 0) { pea_last_err = PE_MAGIC; }
+    return n;
+}
+
+// ================================================================= the Runner
+var rwd: *Wd; var rn = 0; var r_title: u8[32]; var r_w = 320; var r_h = 220; var r_bg = 0xECEFF4;
+var r_focus = -1; var r_press = -1; var r_path: u8[128]; var r_drag = -1; var r_reload = false;
+var r_next: int[40];
+
+fn run_alloc() { if (rwd == (0 as *Wd)) { rwd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd; } }
+
+fn win_set_client(kind: int, cw: int, ch: int, title: *u8) {
+    let i = win_of_kind(kind);
+    if (i < 0) { return; }
+    win_rect_dmg(i);
+    wins[i].w = cw + 4; wins[i].h = ch + TB + 2;
+    if (wins[i].x + wins[i].w > fb_w) { wins[i].x = imax(0, fb_w - wins[i].w); }
+    if (wins[i].y + wins[i].h > fb_h - TASKBAR_H) { wins[i].y = imax(0, fb_h - TASKBAR_H - wins[i].h); }
+    if (title != (0 as *u8)) { kstrncpy(&wins[i].title[0], title, 32); }
+    win_rect_dmg(i);
+}
+
+/// load an app file and run it in the Runner window; returns false (with no window change) when the file is not an app
+fn run_load(path: *u8) -> bool {
+    let nd = fs_resolve(path);
+    if (nd < 0 || fs_nodes[nd].kind != K_FILE) { return false; }
+    run_alloc();
+    if (rwd == (0 as *Wd)) { return false; }
+    var hdr: int[6]; var tt: u8[32];
+    let n = wd_parse(fs_nodes[nd].data, fs_nodes[nd].size, rwd, &hdr[0], &tt[0]);
+    if (n < 0) { return false; }
+    rn = n; r_w = imax(120, imin(hdr[0], 760)); r_h = imax(80, imin(hdr[1], 440)); r_bg = hdr[2];
+    kstrncpy(&r_title[0], &tt[0], 32);
+    kstrncpy(&r_path[0], path, 128);
+    r_focus = -1; r_press = -1; r_drag = -1;
+    var q3 = 0; while (q3 < WD_MAX) { r_yaw[q3] = 24; r_pitch[q3] = 14; q3++; }
+    var t = 0;
+    while (t < rn) { r_next[t] = ticks + imax(1, rwd[t].val) * 100; t++; }
+    app_open(APP_RUN);
+    win_set_client(APP_RUN, r_w, r_h, &r_title[0]);
+    ui_inval_all(APP_RUN);
+    if (hdr[5] >= 0 && hdr[5] < rn) { run_act(hdr[5]); }          // the program's entry action
+    return true;
+}
+
+fn run_size(out: *int) { out[0] = r_w; out[1] = r_h; }
+fn run_init() { run_alloc(); }
+fn run_close() { r_focus = -1; r_drag = -1; }
+fn run_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, r_bg);
+    var i = 0;
+    while (i < rn) {
+        if ((rwd[i].hid & 1) == 0 && rwd[i].kind != WK_TIMER) { wd_draw(rwd, i, x, y, i == r_focus, true, i == r_press || i == r_drag); }
+        i++;
+    }
+}
+
+/// run one action slot of widget i; false = the chain stops here (a failed condition, or the app was replaced)
+fn run_one(i: int, s: int) -> bool {
+    let a = w_act(rwd, i, s); let t = w_tgt(rwd, i, s); let arg = w_arg(rwd, i, s);
+    var buf: u8[40];
+    if (a == 0) { return true; }
+    if (a == 9) { speaker_on(880); pit_sleep_ms(100); speaker_off(); return true; }
+    if (a == 8) { open_named(arg); return true; }
+    if (a == 10) { let wi = win_of_kind(APP_RUN); if (wi >= 0) { win_close(wi); } return false; }
+    if (a == 13) { toast(arg); return true; }
+    if (a == 14) {
+        var p: u8[128];
+        kstrncpy(&p[0], "/apps/", 128); kstrncpy(&p[6], arg, 100);
+        if (!ends_with(&p[0], ".pea")) { kstrncpy(&p[kstrlen(&p[0])], ".pea", 5); }
+        run_load(&p[0]);
+        return false;
+    }
+    if (t < 0 || t >= rn) { return true; }
+    if (a == 1) { kstrncpy(&rwd[t].text[0], arg, 32); }
+    else if (a == 11) { let l = kstrlen(&rwd[t].text[0]); kstrncpy(&rwd[t].text[l], arg, 32 - l); }
+    else if (a == 12) {
+        var ar = arg; var q = 0;
+        let ia = katoi(ar);
+        while (ar[q] >= '0' && ar[q] <= '9') { q++; }
+        let op = ar[q];
+        let ib = katoi(&ar[q + 1]);
+        if (ia >= 0 && ia < rn && ib >= 0 && ib < rn) {
+            let va = katoi(&rwd[ia].text[0]); let vb = katoi(&rwd[ib].text[0]);
+            var res = 0; var bad = false;
+            if (op == '+') { res = va + vb; } else if (op == '-') { res = va - vb; } else if (op == '*') { res = va * vb; }
+            else if (op == '/' && vb != 0) { res = va / vb; } else if (op == '%' && vb != 0) { res = va % vb; } else { bad = true; }
+            if (bad) { kstrncpy(&rwd[t].text[0], "err", 32); } else { itoa(res, &buf[0]); kstrncpy(&rwd[t].text[0], &buf[0], 32); }
+        } else { kstrncpy(&rwd[t].text[0], "err", 32); }
+    }
+    else if (a == 2 || a == 3) {
+        var d = 1;
+        if (a == 3) { d = 2; }
+        if (arg[0] != 0) { d = katoi(arg); }
+        var v = katoi(&rwd[t].text[0]);
+        if (a == 2) { v = v + d; } else { v = v * d; }
+        itoa(v, &buf[0]); kstrncpy(&rwd[t].text[0], &buf[0], 32);
+    } else if (a == 4) {
+        let src = katoi(arg);
+        if (src >= 0 && src < rn) { kstrncpy(&buf[0], &rwd[src].text[0], 32); kstrncpy(&rwd[t].text[0], &buf[0], 32); }
+    } else if (a == 5) { rwd[t].text[0] = 0; }
+    else if (a == 6) {
+        rwd[t].hid = rwd[t].hid ^ 1;
+        if (rwd[t].kind == WK_TIMER) { r_next[t] = ticks + imax(1, rwd[t].val) * 100; }          // resuming a timer restarts its interval
+    }
+    else if (a == 7) { rwd[t].color = pal10[katoi(arg) % 10]; }
+    else if (a == 15) { return kstreq(&rwd[t].text[0], arg); }
+    else if (a == 16) { return katoi(&rwd[t].text[0]) > katoi(arg); }
+    else if (a == 17) {
+        var n = katoi(arg);
+        if (n <= 0) { n = 6; }
+        itoa(rnd(n) + 1, &buf[0]); kstrncpy(&rwd[t].text[0], &buf[0], 32);
+    }
+    return true;
+}
+fn run_act(i: int) {
+    if (run_one(i, 0)) { run_one(i, 1); }
+}
+
+/// timers: called every frame; true when something was redrawn-worthy
+fn run_tick() -> bool {
+    if (rn == 0 || win_of_kind(APP_RUN) < 0) { return false; }
+    var ch = false; var i = 0;
+    while (i < rn && i < WD_MAX) {
+        if (rwd[i].kind == WK_VIEW3D && (rwd[i].hid & 1) == 0 && v3_spin(rwd[i].val) > 0 && r_drag != i && ticks - r_spin_t[i] >= 4) {
+            r_spin_t[i] = ticks; r_yaw[i] = (r_yaw[i] + v3_spin(rwd[i].val)) & 255; ch = true;
+        }
+        if (rwd[i].kind == WK_TIMER && (rwd[i].hid & 1) == 0 && ticks >= r_next[i]) {
+            r_next[i] = r_next[i] + imax(1, rwd[i].val) * 100;
+            if (r_next[i] <= ticks) { r_next[i] = ticks + imax(1, rwd[i].val) * 100; }        // never burst after a stall
+            run_act(i);
+            ch = true;
+            if (rn == 0) { return true; }
+        }
+        i++;
+    }
+    return ch;
+}
+
+fn run_slider_to(i: int, mx: int) {
+    var v = (mx - rwd[i].x - 7) * 100 / imax(1, rwd[i].w - 14);
+    v = imax(0, imin(100, v));
+    if (v != slider_val(rwd, i)) {
+        var b: u8[16]; itoa(v, &b[0]); kstrncpy(&rwd[i].text[0], &b[0], 32);
+        run_act(i);
+    }
+}
+
+fn run_mouse(mx: int, my: int, ev: int) {
+    if (ev == 1) {
+        let i = wd_hit(rwd, rn, mx, my, true);
+        r_focus = -1; r_press = -1; r_drag = -1;
+        if (i >= 0) {
+            let k = rwd[i].kind;
+            if (k == WK_TEXT) { r_focus = i; }
+            else if (k == WK_BUTTON || k == WK_ICON) { r_press = i; }
+            else if (k == WK_SLIDER) { r_drag = i; run_slider_to(i, mx); }
+            else if (k == WK_VIEW3D) { r_drag = i; r_dx = mx; r_dy = my; r_moved = 0; }
+            else if (k == WK_CHECK) { if (rwd[i].chk != 0) { rwd[i].chk = 0; } else { rwd[i].chk = 1; } run_act(i); }
+        }
+        ui_inval_all(APP_RUN);
+    } else if (ev == 2) {
+        if (r_drag >= 0 && r_drag < rn && rwd[r_drag].kind == WK_VIEW3D) {
+            r_yaw[r_drag] = (r_yaw[r_drag] + (mx - r_dx) / 2) & 255;
+            r_pitch[r_drag] = imax(-60, imin(60, r_pitch[r_drag] + (my - r_dy) / 3));
+            r_moved = r_moved + iabs(mx - r_dx) + iabs(my - r_dy); r_dx = mx; r_dy = my; ui_inval_all(APP_RUN);
+        } else if (r_drag >= 0 && r_drag < rn) { run_slider_to(r_drag, mx); ui_inval_all(APP_RUN); }
+    } else if (ev == 3) {
+        if (r_drag >= 0 && r_drag < rn && rwd[r_drag].kind == WK_VIEW3D && r_moved < 4) { let v = r_drag; r_drag = -1; run_act(v); ui_inval_all(APP_RUN); }
+        r_drag = -1;
+        if (r_press >= 0) {
+            let p = r_press; r_press = -1;
+            if (wd_hit(rwd, rn, mx, my, true) == p) { run_act(p); }
+            ui_inval_all(APP_RUN);
+        }
+    }
+}
+fn run_key(k: int) {
+    if (k == 9) {                                                  // Tab: next text box
+        var n = 0; var i = r_focus;
+        while (n < rn) { i = (i + 1) % rn; if (rwd[i].kind == WK_TEXT && (rwd[i].hid & 1) == 0) { r_focus = i; break; } n++; }
+        ui_inval_all(APP_RUN);
+        return;
+    }
+    if (r_focus >= 0 && r_focus < rn && rwd[r_focus].kind == WK_TEXT) {
+        if ((k == 10 || k == 13) && (rwd[r_focus].act != 0 || rwd[r_focus].act2 != 0)) { run_act(r_focus); ui_inval_all(APP_RUN); return; }
+        if (fld_edit(&rwd[r_focus].text[0], 32, k, 0)) { ui_inval_all(APP_RUN); }
+    }
+}
+
+// ================================================================= the Builder
+var bwd: *Wd; var bn = 0; var b_name: u8[32]; var b_title: u8[32]; var b_w = 300; var b_h = 200; var b_bg = 0xECEFF4;
+var bd_tool = 0; var bd_sel = -1; var bd_drag = 0; var bd_dx = 0; var bd_dy = 0; var bd_pick = 0; var bd_focus = 0; var bd_tab = 0;
+var bd_msg: u8[96]; var bd_list_on = false; var bd_list: int[14]; var bd_nlist = 0; var bd_ready = false;
+var bd_buf: *u8;
+var bd_warn = 0;
+
+fn bd_say(s: *u8) { kstrncpy(&bd_msg[0], s, 96); ui_inval_all(APP_BLD); }
+fn bd_path(out: *u8) {
+    kstrncpy(out, "/apps/", 128);
+    let n = kstrlen(out);
+    kstrncpy(&out[n], &b_name[0], 128 - n - 5);
+    let m = kstrlen(out);
+    kstrncpy(&out[m], ".pea", 5);
+}
+
+fn bd_new() {
+    ud_has = false;
+    bn = 0; bd_sel = -1; bd_tool = 0; bd_focus = 0; bd_pick = 0; bd_list_on = false; bd_tab = 0; bd_warn = 0;
+    b_w = 300; b_h = 200; b_bg = 0xECEFF4;
+    kstrncpy(&b_name[0], "myapp", 32); kstrncpy(&b_title[0], "My app", 32);
+    bd_say("new app");
+}
+
+/// check the design for mistakes; returns the number of problems and puts a description of the first one into msg
+fn bd_lint(msg: *u8) -> int {
+    var cnt = 0; var i = 0;
+    msg[0] = 0;
+    while (i < bn) {
+        let k = bwd[i].kind;
+        var s = 0;
+        while (s < 2 && kind_has_action(k)) {
+            let a = w_act(bwd, i, s); let t = w_tgt(bwd, i, s); let arg = w_arg(bwd, i, s);
+            var why = 0 as *u8;
+            if (act_needs_target(a) && (t < 0 || t >= bn)) { why = "has no target widget"; }
+            else if (a == 4 && (arg[0] == 0 || katoi(arg) >= bn)) { why = "has no source widget"; }
+            else if (a == 14 && arg[0] == 0) { why = "has no app to switch to"; }
+            else if (a == 14) {
+                var p: u8[128]; kstrncpy(&p[0], "/apps/", 128); kstrncpy(&p[6], arg, 100);
+                if (!ends_with(&p[0], ".pea")) { kstrncpy(&p[kstrlen(&p[0])], ".pea", 5); }
+                if (fs_resolve(&p[0]) < 0) { why = "switches to an app that does not exist"; }
+            }
+            else if (a == 12 && arg[0] == 0) { why = "has no formula"; }
+            else if (s == 1 && a != 0 && w_act(bwd, i, 0) == 0) { why = "has a Then action but no first action"; }
+            if (why != (0 as *u8)) {
+                if (cnt == 0) {
+                    kstrncpy(msg, "#", 8); itoa(i, &msg[1]);
+                    var q = kstrlen(msg); msg[q] = ' '; q++;
+                    kstrncpy(&msg[q], kind_name(k), 12); q = kstrlen(msg); msg[q] = ' '; q++;
+                    kstrncpy(&msg[q], why, 60 - q);
+                }
+                cnt++;
+            }
+            s++;
+        }
+        if (k == WK_TIMER && bwd[i].act == 0 && bwd[i].act2 == 0) {
+            if (cnt == 0) { kstrncpy(msg, "a timer does nothing: give it an action", 64); }
+            cnt++;
+        }
+        i++;
+    }
+    return cnt;
+}
+
+fn bd_save() -> bool {
+    if (b_name[0] == 0) { bd_say("give the app a name first"); return false; }
+    fs_create("/apps", K_DIR);
+    let len = pea_encode(bd_buf, bwd, bn, &b_title[0], b_w, b_h, b_bg, 0, -1);
+    var p: u8[128]; bd_path(&p[0]);
+    var nd = fs_resolve(&p[0]);
+    if (nd < 0) { nd = fs_create(&p[0], K_FILE); }
+    if (nd >= 0 && fs_write(nd, bd_buf, len, false)) {
+        fs_set_attr(nd, FA_EXEC, true);
+        var why: u8[64];
+        bd_warn = bd_lint(&why[0]);
+        if (bd_warn == 0) { bd_say("saved"); }
+        else {
+            var m: u8[96]; kstrncpy(&m[0], "saved, but check: ", 96); kstrncpy(&m[18], &why[0], 70);
+            bd_say(&m[0]);
+        }
+        return true;
+    }
+    bd_say("save failed (read-only file, or the disk is full)");
+    return false;
+}
+
+fn bd_load(nd: int) {
+    ud_has = false;
+    var hdr: int[6]; var tt: u8[32];
+    let n = wd_parse(fs_nodes[nd].data, fs_nodes[nd].size, bwd, &hdr[0], &tt[0]);
+    if (n < 0) { var em: u8[64]; kstrncpy(&em[0], "cannot open: ", 64); kstrncpy(&em[13], pea_err_str(pea_last_err), 48); bd_say(&em[0]); return; }
+    bn = n; b_w = imax(120, imin(hdr[0], SURF_W)); b_h = imax(80, imin(hdr[1], SURF_H)); b_bg = hdr[2];
+    kstrncpy(&b_name[0], &fs_nodes[nd].name[0], 32);
+    kstrncpy(&b_title[0], &tt[0], 32);
+    let l = kstrlen(&b_name[0]);
+    if (l > 4 && ends_with(&b_name[0], ".pea")) { b_name[l - 4] = 0; }
+    bd_sel = -1; bd_list_on = false; bd_tab = 0;
+    bd_say("opened");
+}
+
+fn bd_open_list() {
+    bd_nlist = 0;
+    let d = fs_resolve("/apps");
+    if (d >= 0) {
+        var ids: int[64];
+        let c = fs_list(d, &ids[0], 64, false);
+        var i = 0;
+        while (i < c && bd_nlist < 14) { if (fs_nodes[ids[i]].kind == K_FILE) { bd_list[bd_nlist] = ids[i]; bd_nlist++; } i++; }
+    }
+    bd_list_on = true;
+    if (bd_nlist == 0) { bd_say("no apps saved yet"); } else { bd_say("choose an app to open (x deletes it)"); }
+}
+
+fn bd_run() {
+    if (!bd_save()) { return; }
+    var p: u8[128]; bd_path(&p[0]);
+    if (run_load(&p[0])) { if (bd_warn == 0) { bd_say("running"); } } else { bd_say("could not run it"); }
+}
+
+fn bd_seed_defaults(i: int, kind: int, x: int, y: int) {
+    bwd[i].kind = kind; bwd[i].x = x; bwd[i].y = y; bwd[i].act = 0; bwd[i].target = -1; bwd[i].hid = 0; bwd[i].chk = 0;
+    bwd[i].act2 = 0; bwd[i].target2 = -1; bwd[i].val = 0; bwd[i].arg2[0] = 0;
+    bwd[i].text[0] = 0; bwd[i].arg[0] = 0;
+    bwd[i].color = C_INK;
+    if (kind == WK_LABEL) { bwd[i].w = 120; bwd[i].h = 20; kstrncpy(&bwd[i].text[0], "Label", 32); }
+    else if (kind == WK_BUTTON) { bwd[i].w = 96; bwd[i].h = 28; bwd[i].color = 0x1F6FEB; kstrncpy(&bwd[i].text[0], "Button", 32); }
+    else if (kind == WK_TEXT) { bwd[i].w = 150; bwd[i].h = 26; }
+    else if (kind == WK_BAR) { bwd[i].w = 160; bwd[i].h = 16; bwd[i].color = 0x1F6FEB; kstrncpy(&bwd[i].text[0], "50", 32); }
+    else if (kind == WK_SLIDER) { bwd[i].w = 160; bwd[i].h = 22; bwd[i].color = 0x1F6FEB; kstrncpy(&bwd[i].text[0], "50", 32); }
+    else if (kind == WK_ICON) { bwd[i].w = 32; bwd[i].h = 32; bwd[i].color = 0x1F6FEB; bwd[i].val = 0; }
+    else if (kind == WK_TIMER) { bwd[i].w = 96; bwd[i].h = 24; bwd[i].val = 1; }
+    else if (kind == WK_VIEW3D) { bwd[i].w = 150; bwd[i].h = 150; bwd[i].color = 0x4F7CFF; bwd[i].val = 4 | (1 << 6); }
+    else if (kind == WK_CHECK) { bwd[i].w = 140; bwd[i].h = 22; bwd[i].color = 0x1F6FEB; kstrncpy(&bwd[i].text[0], "Option", 32); }
+    else { bwd[i].w = 120; bwd[i].h = 80; bwd[i].color = 0xFFFFFF; }
+}
+
+/// renumber widget references after widget `i` was removed
+fn bd_fix_refs_after_delete(i: int) {
+    var j = 0;
+    while (j < bn) {
+        var s = 0;
+        while (s < 2) {
+            let t = w_tgt(bwd, j, s);
+            if (t == i) { w_set_tgt(bwd, j, s, -1); } else if (t > i) { w_set_tgt(bwd, j, s, t - 1); }
+            if (w_act(bwd, j, s) == 4 && w_arg(bwd, j, s)[0] != 0) {
+                var q = katoi(w_arg(bwd, j, s));
+                if (q == i) { w_arg(bwd, j, s)[0] = 0; } else if (q > i) { q = q - 1; itoa(q, w_arg(bwd, j, s)); }
+            }
+            s++;
+        }
+        j++;
+    }
+}
+
+fn bd_delete(i: int) {
+    bd_snap();
+    var j = i;
+    while (j + 1 < bn) { kmemcpy((bwd as *u8) + j * sizeof(Wd), (bwd as *u8) + (j + 1) * sizeof(Wd), sizeof(Wd)); j++; }
+    bn--;
+    bd_fix_refs_after_delete(i);
+    bd_sel = -1; bd_tab = 0;
+}
+
+var ud_buf: *Wd; var bd_tmp: *Wd; var ud_n = 0; var ud_w = 0; var ud_h = 0; var ud_bg = 0; var ud_has = false; var bd_snap_on = false;
+fn wcopy(dst: *Wd, di: int, src: *Wd, si: int) { kmemcpy((dst as *u8) + di * sizeof(Wd), (src as *u8) + si * sizeof(Wd), sizeof(Wd)); }
+fn sn(v: int) -> int { if (bd_snap_on) { return (v + 5) / 10 * 10; } return v; }
+/// remember the current design so Ctrl+Z / Undo can bring it back (Undo again = redo)
+fn bd_snap() {
+    var i = 0;
+    while (i < bn) { wcopy(ud_buf, i, bwd, i); i++; }
+    ud_n = bn; ud_w = b_w; ud_h = b_h; ud_bg = b_bg; ud_has = true;
+}
+fn bd_undo() {
+    if (!ud_has) { bd_say("nothing to undo"); return; }
+    var i = 0;
+    while (i < bn) { wcopy(bd_tmp, i, bwd, i); i++; }
+    let n0 = bn; let w0 = b_w; let h0 = b_h; let g0 = b_bg;
+    i = 0;
+    while (i < ud_n) { wcopy(bwd, i, ud_buf, i); i++; }
+    bn = ud_n; b_w = ud_w; b_h = ud_h; b_bg = ud_bg;
+    i = 0;
+    while (i < n0) { wcopy(ud_buf, i, bd_tmp, i); i++; }
+    ud_n = n0; ud_w = w0; ud_h = h0; ud_bg = g0;
+    bd_sel = -1; bd_focus = 0; bd_pick = 0; bd_tab = 0;
+    bd_say("undone (undo again to redo)");
+}
+fn bd_dup() {
+    if (bd_sel < 0 || bd_sel >= bn) { return; }
+    if (bn >= WD_MAX) { bd_say("too many widgets"); return; }
+    bd_snap();
+    wcopy(bwd, bn, bwd, bd_sel);
+    bwd[bn].x = imin(bwd[bn].x + 12, imax(0, b_w - bwd[bn].w)); bwd[bn].y = imin(bwd[bn].y + 12, imax(0, b_h - bwd[bn].h));
+    bd_sel = bn; bn++;
+    bd_say("duplicated");
+}
+/// move the selected widget to the front (drawn last) or back; references to widgets are renumbered
+fn bd_reorder(front: bool) {
+    let i = bd_sel;
+    if (i < 0 || i >= bn) { return; }
+    bd_snap();
+    var map: int[40]; var ord: int[40]; var k = 0; var pos = 0;
+    if (front) { while (k < bn) { if (k != i) { ord[pos] = k; pos++; } k++; } ord[pos] = i; }
+    else { ord[0] = i; pos = 1; while (k < bn) { if (k != i) { ord[pos] = k; pos++; } k++; } }
+    k = 0;
+    while (k < bn) { map[ord[k]] = k; wcopy(bd_tmp, k, bwd, ord[k]); k++; }
+    k = 0;
+    while (k < bn) { wcopy(bwd, k, bd_tmp, k); k++; }
+    k = 0;
+    while (k < bn) {
+        var s = 0;
+        while (s < 2) {
+            let t = w_tgt(bwd, k, s);
+            if (t >= 0 && t < bn) { w_set_tgt(bwd, k, s, map[t]); }
+            if (w_act(bwd, k, s) == 4 && w_arg(bwd, k, s)[0] != 0) { let a = katoi(w_arg(bwd, k, s)); if (a >= 0 && a < bn) { itoa(map[a], w_arg(bwd, k, s)); } }
+            s++;
+        }
+        k++;
+    }
+    bd_sel = map[i];
+    if (front) { bd_say("brought to front") ; } else { bd_say("sent to back"); }
+}
+/// align the selected widget inside the window: 0 left, 1 centre, 2 right, 3 top, 4 middle, 5 bottom
+fn bd_align(m: int) {
+    let s = bd_sel;
+    if (s < 0 || s >= bn) { return; }
+    bd_snap();
+    if (m == 0) { bwd[s].x = 0; } else if (m == 1) { bwd[s].x = (b_w - bwd[s].w) / 2; } else if (m == 2) { bwd[s].x = b_w - bwd[s].w; }
+    else if (m == 3) { bwd[s].y = 0; } else if (m == 4) { bwd[s].y = (b_h - bwd[s].h) / 2; } else { bwd[s].y = b_h - bwd[s].h; }
+}
+
+fn bd_init() {
+    if (bwd == (0 as *Wd)) { bwd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd; }
+    if (bd_buf == (0 as *u8)) { bd_buf = kzalloc(16384); }
+    if (ud_buf == (0 as *Wd)) { ud_buf = kzalloc(WD_MAX * sizeof(Wd)) as *Wd; bd_tmp = kzalloc(WD_MAX * sizeof(Wd)) as *Wd; }
+    if (!bd_ready) { bd_ready = true; bd_new(); }
+    fs_create("/apps", K_DIR);
+    bd_say("pick a widget on the left, then click the surface");
+}
+fn bd_close() { bd_focus = 0; bd_drag = 0; }
+fn bd_size(out: *int) { out[0] = BLD_W; out[1] = BLD_H; }
+
+fn lbl(x: int, y: int, s: *u8) { draw_text(x, y, s, 0x5A6680); }
+fn fld_draw(x: int, y: int, w: int, h: int, s: *u8, foc: bool) {
+    var edge = 0xC3CAD8;
+    if (foc) { edge = 0x1F6FEB; }
+    rrect(x, y, w, h, 5, edge, 0xFFFFFF, false);
+    let cols = (w - 12) / 8;
+    draw_text_n(x + 6, y + (h - 16) / 2, s, cols, C_INK);
+    if (foc) { fill(x + 6 + imin(kstrlen(s), cols) * 8, y + (h - 16) / 2, 2, 16, C_INK); }
+}
+fn swatches(x: int, y: int, sel: int) {
+    var i = 0;
+    while (i < 10) {
+        rrect(x + i * 21, y, 19, 19, 4, 0x8A97AD, pal10[i], false);
+        if (pal10[i] == sel) { rrect(x + i * 21 - 2, y - 2, 23, 23, 5, 0x1F6FEB, pal10[i], false); }
+        i++;
+    }
+}
+/// word-wrapped small print (max `lines` lines of `cols` characters)
+fn wrap_draw(x: int, y: int, cols: int, s: *u8, col: int, lines: int) {
+    var pos = 0; var ln = 0; let n = kstrlen(s);
+    while (pos < n && ln < lines) {
+        var e = pos + cols;
+        if (e >= n) { e = n; } else { while (e > pos && s[e] != ' ') { e--; } if (e == pos) { e = pos + cols; } }
+        var tmp: u8[48]; var q = 0;
+        while (pos + q < e && q < 47) { tmp[q] = s[pos + q]; q++; }
+        tmp[q] = 0;
+        draw_text(x, y + ln * 16, &tmp[0], col);
+        pos = e; while (pos < n && s[pos] == ' ') { pos++; }
+        ln++;
+    }
+}
+
+// ---- properties panel geometry (client coordinates; the draw and click code below share these)
+const BPP = 634;                                   // left edge of the property controls (PX + 8)
+const BPW = 216;                                   // width of a property control
+const P_TAB = 62; const P_ROW = 92;
+
+fn pb(i: int) -> int { return BPP + i * 73; }       // x of property tab i
+
+fn bd_tool_y(i: int) -> int { return 62 + (i - 1) * 28; }
+
+/// the action editor of slot s (tab "Action" or "Then")
+fn bd_act_draw(x: int, y: int, s: int) {
+    let sel = bd_sel;
+    var title = "When clicked";
+    let k = bwd[sel].kind;
+    if (s == 0) {
+        if (k == WK_TEXT) { title = "When Enter is pressed"; } else if (k == WK_SLIDER) { title = "When moved"; } else if (k == WK_TIMER) { title = "On every tick"; } else if (k == WK_CHECK) { title = "When ticked or unticked"; }
+    } else { title = "Then, after the first action"; }
+    lbl(x + BPP, y + P_ROW, title);
+    let a = w_act(bwd, sel, s);
+    a2_btn(x + BPP, y + 110, 26, 24, "<", 0xFFFFFF); a2_btn(x + BPP + BPW - 26, y + 110, 26, 24, ">", 0xFFFFFF);
+    text_c(x + BPP + 26, BPW - 52, y + 114, act_name(a), C_INK);
+    if (act_needs_target(a)) {
+        lbl(x + BPP, y + 142, "Target widget");
+        var tl: u8[48];
+        let t = w_tgt(bwd, sel, s);
+        if (bd_pick == 1 + s * 2) { kstrncpy(&tl[0], "click a widget...", 40); }
+        else if (t >= 0 && t < bn) { kstrncpy(&tl[0], "#", 4); itoa(t, &tl[1]); kstrncpy(&tl[kstrlen(&tl[0])], " ", 3); kstrncpy(&tl[kstrlen(&tl[0])], &bwd[t].text[0], 20); }
+        else { kstrncpy(&tl[0], "pick on canvas", 40); }
+        a2_btn(x + BPP, y + 160, BPW, 24, &tl[0], bd_pick == 1 + s * 2 ? 0xBFD6FF : 0xFFFFFF);
+    }
+    if (act_needs_arg(a)) {
+        lbl(x + BPP, y + 192, act_hint(a));
+        if (a == 4) {
+            var sl: u8[48];
+            if (bd_pick == 2 + s * 2) { kstrncpy(&sl[0], "click a widget...", 40); }
+            else if (w_arg(bwd, sel, s)[0] != 0) { kstrncpy(&sl[0], "from #", 40); kstrncpy(&sl[6], w_arg(bwd, sel, s), 8); }
+            else { kstrncpy(&sl[0], "pick on canvas", 40); }
+            a2_btn(x + BPP, y + 210, BPW, 24, &sl[0], bd_pick == 2 + s * 2 ? 0xBFD6FF : 0xFFFFFF);
+        } else { fld_draw(x + BPP, y + 210, BPW, 24, w_arg(bwd, sel, s), bd_focus == 2); }
+    }
+    wrap_draw(x + BPP, y + 246, 27, act_help(a), 0x7A8498, 3);
+    if (s == 1 && (w_act(bwd, sel, 0) == 15 || w_act(bwd, sel, 0) == 16)) { wrap_draw(x + BPP, y + 300, 27, "Runs only when the condition above holds.", 0x1E8449, 2); }
+}
+
+/// clicks in the action editor; returns true when handled
+fn bd_act_click(mx: int, my: int, s: int) -> bool {
+    let sel = bd_sel;
+    let a = w_act(bwd, sel, s);
+    if (in_rect(mx, my, BPP, 110, 26, 24)) { bd_cycle(s, -1); return true; }
+    if (in_rect(mx, my, BPP + BPW - 26, 110, 26, 24)) { bd_cycle(s, 1); return true; }
+    if (act_needs_target(a) && in_rect(mx, my, BPP, 160, BPW, 24)) { bd_pick = 1 + s * 2; bd_say("click the widget this should change"); return true; }
+    if (act_needs_arg(a) && in_rect(mx, my, BPP, 210, BPW, 24)) {
+        if (a == 4) { bd_pick = 2 + s * 2; bd_say("click the widget to copy text from"); } else { bd_snap(); bd_focus = 2; }
+        return true;
+    }
+    return false;
+}
+
+fn bd_cycle(s: int, d: int) {
+    bd_snap();
+    var a = w_act(bwd, bd_sel, s) + d;
+    if (a < 0) { a = NACT - 1; }
+    if (a >= NACT) { a = 0; }
+    w_set_act(bwd, bd_sel, s, a);
+    w_arg(bwd, bd_sel, s)[0] = 0;
+}
+
+fn bd_draw(x: int, y: int, w: int, h: int) {
+    var b: u8[24];
+    fill(x, y, w, h, C_PANEL);
+    // toolbar
+    fill(x, y, w, 38, 0xF6F8FB); hline(x, y + 37, w, 0xD3D9E6);
+    a2_btn(x + 8, y + 6, 56, 26, "New", 0xFFFFFF); a2_btn(x + 68, y + 6, 56, 26, "Open", 0xFFFFFF);
+    a2_btn(x + 128, y + 6, 56, 26, "Save", 0xFFFFFF); a2_btn(x + 188, y + 6, 64, 26, "Check", bd_warn > 0 ? 0xFFE3B0 : 0xFFFFFF);
+    a2_btn(x + 258, y + 6, 72, 26, "Run >", 0x8FE0B0);
+    if (ud_has) { a2_btn(x + 338, y + 6, 56, 26, "Undo", 0xFFFFFF); } else { a2_btn(x + 338, y + 6, 56, 26, "Undo", 0xE4E7EE); }
+    if (bd_snap_on) { a2_btn(x + 398, y + 6, 84, 26, "Snap: on", 0xBFD6FF); } else { a2_btn(x + 398, y + 6, 84, 26, "Snap: off", 0xFFFFFF); }
+    // toolbox
+    lbl(x + 8, y + 42, "Add widget");
+    var i = 1;
+    while (i <= WK_MAXK) {
+        var col = 0xFFFFFF;
+        if (bd_tool == i) { col = 0xBFD6FF; }
+        a2_btn(x + 8, y + bd_tool_y(i), 88, 24, kind_name(i), col);
+        i++;
+    }
+    lbl(x + 8, y + 346, "Tips:");
+    draw_text(x + 8, y + 366, "drag  move", 0x7A8498); draw_text(x + 8, y + 382, "corner size", 0x7A8498);
+    draw_text(x + 8, y + 398, "arrows nudge", 0x7A8498); draw_text(x + 8, y + 414, "Ctrl+Z undo", 0x7A8498);
+    draw_text(x + 8, y + 430, "Ctrl+D copy", 0x7A8498); draw_text(x + 8, y + 446, "Ctrl+S save", 0x7A8498);
+    draw_text(x + 8, y + 462, "Tab next", 0x7A8498);
+    // design surface
+    fill(x + 102, y + 38, PX - 4 - 102, h - 38 - 24, 0xD9DEE8);
+    fill(x + CX, y + CY, b_w, b_h, b_bg);
+    var gy = 10;
+    while (gy < b_h) { var gx = 10; while (gx < b_w) { px(x + CX + gx, y + CY + gy, mix(b_bg, 0x000000, 28)); gx = gx + 20; } gy = gy + 20; }
+    var sv: int[4];
+    clip_push(&sv[0], x + CX, y + CY, x + CX + b_w, y + CY + b_h);
+    i = 0;
+    while (i < bn) { wd_draw(bwd, i, x + CX, y + CY, false, false, false); i++; }
+    clip_pop(&sv[0]);
+    frame(x + CX - 1, y + CY - 1, b_w + 2, b_h + 2, 0x8A97AD);
+    if (bd_sel >= 0 && bd_sel < bn) {
+        let s = bd_sel;
+        frame(x + CX + bwd[s].x - 2, y + CY + bwd[s].y - 2, bwd[s].w + 4, bwd[s].h + 4, 0x1F6FEB);
+        fill(x + CX + bwd[s].x + bwd[s].w - 4, y + CY + bwd[s].y + bwd[s].h - 4, 8, 8, 0x1F6FEB);
+    }
+    if (bd_list_on) {
+        rrect(x + CX, y + CY, 300, 28 + bd_nlist * 24, 6, 0x8A97AD, 0xFFFFFF, false);
+        draw_text(x + CX + 10, y + CY + 6, "Open app:", 0x5A6680);
+        i = 0;
+        while (i < bd_nlist) { draw_text(x + CX + 18, y + CY + 28 + i * 24, &fs_nodes[bd_list[i]].name[0], C_INK); draw_text(x + CX + 272, y + CY + 28 + i * 24, "x", 0xE74C3C); i++; }
+    }
+    // properties
+    fill(x + PX - 4, y + 38, w - PX + 4, h - 38, 0xF6F8FB); vline(x + PX - 4, y + 38, h - 38, 0xD3D9E6);
+    if (bd_sel >= 0 && bd_sel < bn) {
+        let s = bd_sel; let k = bwd[s].kind;
+        draw_text(x + BPP, y + 42, kind_name(k), 0x1F6FEB);
+        itoa(s, &b[0]); draw_text(x + BPP + 80, y + 42, "#", 0x9AA6BF); draw_text(x + BPP + 92, y + 42, &b[0], 0x5A6680);
+        if (kind_has_action(k)) {
+            var t = 0;
+            while (t < 3) {
+                var tl = "Look"; if (t == 1) { tl = "Action"; } else if (t == 2) { tl = "Then"; }
+                if (t == bd_tab) { rfill(x + pb(t), y + P_TAB, 70, 22, 9, 0x1F6FEB, false); draw_text(x + pb(t) + (70 - text_w(tl)) / 2, y + P_TAB + 3, tl, 0xFFFFFF); }
+                else { rfill(x + pb(t), y + P_TAB, 70, 22, 9, 0xE4E7EE, false); draw_text(x + pb(t) + (70 - text_w(tl)) / 2, y + P_TAB + 3, tl, 0x5A6680); }
+                t++;
+            }
+        } else { bd_tab = 0; }
+        if (bd_tab > 0 && kind_has_action(k)) { bd_act_draw(x, y, bd_tab - 1); }
+        else {
+            if (k == WK_ICON) {
+                lbl(x + BPP, y + P_ROW, "Icon");
+                a2_btn(x + BPP, y + 110, 26, 24, "<", 0xFFFFFF); a2_btn(x + BPP + BPW - 26, y + 110, 26, 24, ">", 0xFFFFFF);
+                ui_glyph(ico_g(bwd[s].val), x + BPP + 26, y + 108, BPW - 52, 28, 22, bwd[s].color);
+            } else if (k == WK_VIEW3D) {
+                lbl(x + BPP, y + P_ROW, "Model");
+                a2_btn(x + BPP, y + 110, 26, 24, "<", 0xFFFFFF); a2_btn(x + BPP + BPW - 26, y + 110, 26, 24, ">", 0xFFFFFF);
+                text_c(x + BPP + 26, BPW - 52, y + 114, g3_name(v3_model(bwd[s].val)), C_INK);
+            } else if (k == WK_TIMER) {
+                lbl(x + BPP, y + P_ROW, "Run every (seconds)");
+                a2_btn(x + BPP, y + 110, 26, 24, "-", 0xFFFFFF); a2_btn(x + BPP + BPW - 26, y + 110, 26, 24, "+", 0xFFFFFF);
+                itoa(imax(1, bwd[s].val), &b[0]); text_c(x + BPP + 26, BPW - 52, y + 114, &b[0], C_INK);
+            } else if (k != WK_PANEL) {
+                if (k == WK_BAR || k == WK_SLIDER) { lbl(x + BPP, y + P_ROW, "Value (0-100)"); } else { lbl(x + BPP, y + P_ROW, "Text"); }
+                fld_draw(x + BPP, y + 110, BPW, 24, &bwd[s].text[0], bd_focus == 1);
+            }
+            if (k == WK_VIEW3D) {
+                var sb: u8[24]; kstrncpy(&sb[0], "Style: ", 8);
+                if (v3_style(bwd[s].val) == 0) { kstrncpy(&sb[7], "solid", 12); } else if (v3_style(bwd[s].val) == 1) { kstrncpy(&sb[7], "wire", 12); } else { kstrncpy(&sb[7], "solid + edges", 12); }
+                a2_btn(x + BPP, y + 312, BPW, 24, &sb[0], 0xFFFFFF);
+                var sp: u8[24]; kstrncpy(&sp[0], "Spin: ", 8); itoa(v3_spin(bwd[s].val), &sp[6]);
+                a2_btn(x + BPP, y + 340, BPW, 24, &sp[0], 0xFFFFFF);
+            }
+            if (k != WK_TIMER) { lbl(x + BPP, y + 142, "Colour"); swatches(x + BPP, y + 160, bwd[s].color); }
+            lbl(x + BPP, y + 188, "x  y  w  h");
+            var pbuf: u8[64]; var q = 0;
+            itoa(bwd[s].x, &pbuf[0]); q = kstrlen(&pbuf[0]); pbuf[q] = ' '; q++;
+            itoa(bwd[s].y, &pbuf[q]); q = kstrlen(&pbuf[0]); pbuf[q] = ' '; q++;
+            itoa(bwd[s].w, &pbuf[q]); q = kstrlen(&pbuf[0]); pbuf[q] = ' '; q++;
+            itoa(bwd[s].h, &pbuf[q]);
+            draw_text(x + BPP, y + 206, &pbuf[0], C_INK);
+            lbl(x + BPP, y + 228, "Align in window");
+            var am = 0;
+            while (am < 6) {
+                var al = "L"; if (am == 1) { al = "C"; } else if (am == 2) { al = "R"; } else if (am == 3) { al = "T"; } else if (am == 4) { al = "M"; } else if (am == 5) { al = "B"; }
+                a2_btn(x + BPP + am * 36, y + 246, 32, 24, al, 0xFFFFFF);
+                am++;
+            }
+            var hl = "Starts visible";
+            if (k == WK_TIMER) { hl = "Starts running"; if ((bwd[s].hid & 1) != 0) { hl = "Starts paused"; } }
+            else if ((bwd[s].hid & 1) != 0) { hl = "Starts hidden"; }
+            a2_btn(x + BPP, y + 282, BPW, 24, hl, 0xFFFFFF);
+            if (k == WK_LABEL) {
+                if ((bwd[s].hid & 2) != 0) { a2_btn(x + BPP, y + 312, BPW, 24, "Large text: on", 0xBFD6FF); }
+                else { a2_btn(x + BPP, y + 312, BPW, 24, "Large text: off", 0xFFFFFF); }
+            }
+        }
+        a2_btn(x + BPP, y + 470, 52, 24, "Dup", 0xFFFFFF); a2_btn(x + BPP + 54, y + 470, 52, 24, "Front", 0xFFFFFF);
+        a2_btn(x + BPP + 108, y + 470, 52, 24, "Back", 0xFFFFFF); a2_btn(x + BPP + 162, y + 470, 54, 24, "Del", 0xF8C9C4);
+    } else {
+        draw_text(x + BPP, y + 42, "Your app", 0x1F6FEB);
+        lbl(x + BPP, y + 70, "File name");
+        fld_draw(x + BPP, y + 88, BPW, 24, &b_name[0], bd_focus == 3);
+        lbl(x + BPP, y + 118, "Window title");
+        fld_draw(x + BPP, y + 136, BPW, 24, &b_title[0], bd_focus == 4);
+        lbl(x + BPP, y + 166, "Width");
+        a2_btn(x + BPP, y + 184, 26, 24, "-", 0xFFFFFF); a2_btn(x + BPP + BPW - 26, y + 184, 26, 24, "+", 0xFFFFFF);
+        itoa(b_w, &b[0]); text_c(x + BPP + 26, BPW - 52, y + 188, &b[0], C_INK);
+        lbl(x + BPP, y + 214, "Height");
+        a2_btn(x + BPP, y + 232, 26, 24, "-", 0xFFFFFF); a2_btn(x + BPP + BPW - 26, y + 232, 26, 24, "+", 0xFFFFFF);
+        itoa(b_h, &b[0]); text_c(x + BPP + 26, BPW - 52, y + 236, &b[0], C_INK);
+        lbl(x + BPP, y + 262, "Background");
+        swatches(x + BPP, y + 280, b_bg);
+        var info: u8[40]; kstrncpy(&info[0], "Widgets: ", 12); itoa(bn, &info[9]); var iq = kstrlen(&info[0]); kstrncpy(&info[iq], " of ", 6); itoa(WD_MAX, &info[iq + 4]);
+        draw_text(x + BPP, y + 316, &info[0], 0x5A6680);
+        wrap_draw(x + BPP, y + 340, 27, "Run saves your app and opens it in a window. Check looks for mistakes. Files live in /apps.", 0x7A8498, 5);
+    }
+    // status line
+    fill(x, y + h - 24, w, 24, 0xE4E7EE);
+    draw_text_n(x + 8, y + h - 20, &bd_msg[0], 80, 0x5A6680);
+    if (bd_pick != 0) { draw_text(x + w - 100, y + h - 20, "PICK MODE", 0x1F6FEB); }
+}
+
+fn bd_mouse(mx: int, my: int, ev: int) {
+    if (ev == 2) {
+        if (bd_drag != 0 && bd_sel >= 0) {
+            let s = bd_sel;
+            if (bd_drag == 1) {
+                bwd[s].x = imax(0, imin(sn(mx - CX - bd_dx), b_w - bwd[s].w)); bwd[s].y = imax(0, imin(sn(my - CY - bd_dy), b_h - bwd[s].h));
+            } else {
+                bwd[s].w = imax(8, imin(sn(mx - CX - bwd[s].x), b_w - bwd[s].x)); bwd[s].h = imax(8, imin(sn(my - CY - bwd[s].y), b_h - bwd[s].y));
+            }
+            ui_inval_all(APP_BLD);
+        }
+        return;
+    }
+    if (ev == 3) { bd_drag = 0; return; }
+    if (ev != 1) { return; }
+    ui_inval_all(APP_BLD);
+    // toolbar
+    if (in_rect(mx, my, 8, 6, 56, 26)) { bd_new(); return; }
+    if (in_rect(mx, my, 68, 6, 56, 26)) { bd_open_list(); return; }
+    if (in_rect(mx, my, 128, 6, 56, 26)) { bd_save(); return; }
+    if (in_rect(mx, my, 188, 6, 64, 26)) {
+        var why: u8[64]; bd_warn = bd_lint(&why[0]);
+        if (bd_warn == 0) { bd_say("no problems found"); }
+        else { var m: u8[96]; kstrncpy(&m[0], &why[0], 70); var q = kstrlen(&m[0]); kstrncpy(&m[q], "  (", 4); itoa(bd_warn, &m[q + 3]); q = kstrlen(&m[0]); kstrncpy(&m[q], " found)", 8); bd_say(&m[0]); }
+        return;
+    }
+    if (in_rect(mx, my, 258, 6, 72, 26)) { bd_run(); return; }
+    if (in_rect(mx, my, 338, 6, 56, 26)) { bd_undo(); return; }
+    if (in_rect(mx, my, 398, 6, 84, 26)) { bd_snap_on = !bd_snap_on; return; }
+    // toolbox
+    var i = 1;
+    while (i <= WK_MAXK) {
+        if (in_rect(mx, my, 8, bd_tool_y(i), 88, 24)) { bd_tool = i; bd_pick = 0; bd_list_on = false; bd_say("now click on the design surface"); return; }
+        i++;
+    }
+    // open-app list
+    if (bd_list_on) {
+        i = 0;
+        while (i < bd_nlist) {
+            if (in_rect(mx, my, CX, CY + 24 + i * 24, 300, 24)) {
+                if (mx >= CX + 262) { fs_remove(bd_list[i]); bd_open_list(); bd_say("app deleted"); } else { bd_load(bd_list[i]); }
+                return;
+            }
+            i++;
+        }
+        bd_list_on = false;
+        return;
+    }
+    // design surface
+    if (in_rect(mx, my, CX, CY, b_w, b_h)) {
+        bd_focus = 0;
+        let px0 = mx - CX; let py0 = my - CY;
+        if (bd_pick != 0) {
+            let t = wd_hit(bwd, bn, px0, py0, false);
+            if (t >= 0 && bd_sel >= 0) {
+                bd_snap();
+                let sl = (bd_pick - 1) / 2;
+                if ((bd_pick - 1) % 2 == 0) { w_set_tgt(bwd, bd_sel, sl, t); } else { itoa(t, w_arg(bwd, bd_sel, sl)); }
+                bd_pick = 0; bd_say("picked");
+            }
+            return;
+        }
+        if (bd_tool != 0) {
+            if (bn >= WD_MAX) { bd_say("too many widgets"); bd_tool = 0; return; }
+            bd_snap();
+            bd_seed_defaults(bn, bd_tool, sn(imax(0, px0 - 8)), sn(imax(0, py0 - 8)));
+            bwd[bn].x = imax(0, imin(bwd[bn].x, b_w - bwd[bn].w)); bwd[bn].y = imax(0, imin(bwd[bn].y, b_h - bwd[bn].h));
+            bd_sel = bn; bn++; bd_tool = 0; bd_tab = 0; bd_say("placed - drag to move, edit on the right");
+            return;
+        }
+        if (bd_sel >= 0 && in_rect(px0, py0, bwd[bd_sel].x + bwd[bd_sel].w - 6, bwd[bd_sel].y + bwd[bd_sel].h - 6, 12, 12)) { bd_snap(); bd_drag = 2; return; }
+        let t = wd_hit(bwd, bn, px0, py0, false);
+        if (t != bd_sel) { bd_tab = 0; }
+        bd_sel = t;
+        if (t >= 0) { bd_snap(); bd_drag = 1; bd_dx = px0 - bwd[t].x; bd_dy = py0 - bwd[t].y; }
+        return;
+    }
+    // properties
+    if (bd_sel >= 0 && bd_sel < bn) {
+        let s = bd_sel; let k = bwd[s].kind;
+        if (kind_has_action(k) && my >= P_TAB && my < P_TAB + 22) {
+            var t = 0;
+            while (t < 3) { if (in_rect(mx, my, pb(t), P_TAB, 70, 22)) { bd_tab = t; bd_focus = 0; bd_pick = 0; return; } t++; }
+        }
+        if (bd_tab > 0 && kind_has_action(k)) { if (bd_act_click(mx, my, bd_tab - 1)) { return; } }
+        else {
+            if (k == WK_ICON) {
+                if (in_rect(mx, my, BPP, 110, 26, 24)) { bd_snap(); bwd[s].val = (bwd[s].val + ICO_N - 1) % ICO_N; return; }
+                if (in_rect(mx, my, BPP + BPW - 26, 110, 26, 24)) { bd_snap(); bwd[s].val = (bwd[s].val + 1) % ICO_N; return; }
+            } else if (k == WK_VIEW3D) {
+                if (in_rect(mx, my, BPP, 110, 26, 24)) { bd_snap(); bwd[s].val = (bwd[s].val & ~15) | ((v3_model(bwd[s].val) + G3_MODELS - 1) % G3_MODELS); return; }
+                if (in_rect(mx, my, BPP + BPW - 26, 110, 26, 24)) { bd_snap(); bwd[s].val = (bwd[s].val & ~15) | ((v3_model(bwd[s].val) + 1) % G3_MODELS); return; }
+            } else if (k == WK_TIMER) {
+                if (in_rect(mx, my, BPP, 110, 26, 24)) { bd_snap(); bwd[s].val = imax(1, bwd[s].val - 1); return; }
+                if (in_rect(mx, my, BPP + BPW - 26, 110, 26, 24)) { bd_snap(); bwd[s].val = imin(60, imax(1, bwd[s].val) + 1); return; }
+            } else if (k != WK_PANEL && in_rect(mx, my, BPP, 110, BPW, 24)) { bd_snap(); bd_focus = 1; return; }
+            if (k != WK_TIMER) {
+                i = 0;
+                while (i < 10) { if (in_rect(mx, my, BPP + i * 21, 160, 19, 19)) { bd_snap(); bwd[s].color = pal10[i]; return; } i++; }
+            }
+            i = 0;
+            while (i < 6) { if (in_rect(mx, my, BPP + i * 36, 246, 32, 24)) { bd_align(i); return; } i++; }
+            if (in_rect(mx, my, BPP, 282, BPW, 24)) { bd_snap(); bwd[s].hid = bwd[s].hid ^ 1; return; }
+            if (k == WK_VIEW3D && in_rect(mx, my, BPP, 312, BPW, 24)) { bd_snap(); bwd[s].val = (bwd[s].val & ~48) | (((v3_style(bwd[s].val) + 1) % 3) << 4); return; }
+            if (k == WK_VIEW3D && in_rect(mx, my, BPP, 340, BPW, 24)) { bd_snap(); bwd[s].val = (bwd[s].val & ~448) | (((v3_spin(bwd[s].val) + 1) % 5) << 6); return; }
+            if (k == WK_LABEL && in_rect(mx, my, BPP, 312, BPW, 24)) {
+                bd_snap(); bwd[s].hid = bwd[s].hid ^ 2;
+                if ((bwd[s].hid & 2) != 0) { bwd[s].h = imax(bwd[s].h, 32); bwd[s].w = imax(bwd[s].w, 8 * imax(kstrlen(&bwd[s].text[0]), 1) * 2); }
+                return;
+            }
+        }
+        if (in_rect(mx, my, BPP, 470, 52, 24)) { bd_dup(); return; }
+        if (in_rect(mx, my, BPP + 54, 470, 52, 24)) { bd_reorder(true); return; }
+        if (in_rect(mx, my, BPP + 108, 470, 52, 24)) { bd_reorder(false); return; }
+        if (in_rect(mx, my, BPP + 162, 470, 54, 24)) { bd_delete(s); bd_say("deleted (Ctrl+Z undoes)"); return; }
+    } else {
+        if (in_rect(mx, my, BPP, 88, BPW, 24)) { bd_focus = 3; return; }
+        if (in_rect(mx, my, BPP, 136, BPW, 24)) { bd_focus = 4; return; }
+        if (in_rect(mx, my, BPP, 184, 26, 24) || in_rect(mx, my, BPP + BPW - 26, 184, 26, 24) || in_rect(mx, my, BPP, 232, 26, 24) || in_rect(mx, my, BPP + BPW - 26, 232, 26, 24)) { bd_snap(); }
+        if (in_rect(mx, my, BPP, 184, 26, 24)) { b_w = imax(120, b_w - 20); return; }
+        if (in_rect(mx, my, BPP + BPW - 26, 184, 26, 24)) { b_w = imin(SURF_W, b_w + 20); return; }
+        if (in_rect(mx, my, BPP, 232, 26, 24)) { b_h = imax(80, b_h - 20); return; }
+        if (in_rect(mx, my, BPP + BPW - 26, 232, 26, 24)) { b_h = imin(SURF_H, b_h + 20); return; }
+        i = 0;
+        while (i < 10) { if (in_rect(mx, my, BPP + i * 21, 280, 19, 19)) { bd_snap(); b_bg = pal10[i]; return; } i++; }
+    }
+}
+
+fn bd_key(k: int) {
+    ui_inval_all(APP_BLD);
+    if (k == 19) { bd_save(); return; }
+    if (k == 26) { bd_undo(); return; }
+    if (k == 4) { bd_dup(); return; }
+    if (k == 9 && bd_focus == 0 && bn > 0) { bd_sel = (bd_sel + 1) % bn; bd_tab = 0; return; }
+    if (bd_focus == 1 && bd_sel >= 0) { if (k == 10 || k == 13 || k == 27) { bd_focus = 0; } else { fld_edit(&bwd[bd_sel].text[0], 32, k, 0); } return; }
+    if (bd_focus == 2 && bd_sel >= 0 && bd_tab > 0) { if (k == 10 || k == 13 || k == 27) { bd_focus = 0; } else { fld_edit(w_arg(bwd, bd_sel, bd_tab - 1), 32, k, 0); } return; }
+    if (bd_focus == 3) { if (k == 10 || k == 13 || k == 27) { bd_focus = 0; } else { fld_edit(&b_name[0], 24, k, 1); } return; }
+    if (bd_focus == 4) { if (k == 10 || k == 13 || k == 27) { bd_focus = 0; } else { fld_edit(&b_title[0], 32, k, 0); } return; }
+    if (k == 27) { bd_tool = 0; bd_pick = 0; bd_list_on = false; return; }
+    if (bd_sel < 0 || bd_sel >= bn) { return; }
+    let s = bd_sel;
+    if (k == KEY_DEL || k == 127) { bd_delete(s); return; }
+    if (k == KEY_LEFT) { bwd[s].x = imax(0, bwd[s].x - 1); }
+    else if (k == KEY_RIGHT) { bwd[s].x = imin(b_w - bwd[s].w, bwd[s].x + 1); }
+    else if (k == KEY_UP) { bwd[s].y = imax(0, bwd[s].y - 1); }
+    else if (k == KEY_DOWN) { bwd[s].y = imin(b_h - bwd[s].h, bwd[s].y + 1); }
+}

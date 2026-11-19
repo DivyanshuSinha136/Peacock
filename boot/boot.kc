@@ -1,0 +1,263 @@
+// boot.kc -- the Peacock boot stage (BIOS / MBR), written in KingCobra.  Author: Divyanshu Sinha (MIT License)
+//
+// Run it with the KingCobra interpreter:   kingcobra boot/boot.kc build/boot.bin
+// It emits stage 1 (the MBR) and stage 2 (2 KiB) as machine code through boot/x86.kc.  No NASM, no KASM, no C.
+// (kcc emits x86-64 only; real mode and 32-bit protected mode are what a BIOS boot stage needs, so they are emitted here.)
+//
+// Disk layout:  LBA 0 stage 1 (512 B)   LBA 1..4 stage 2 (2 KiB)   LBA 5.. kernel (flat binary, loaded at KERNEL_BASE = 2 MiB)
+// The image builder (tools/mkimage.kc) patches the kernel sector count (u32) into the last 4 bytes of stage 2 (image offset 2556).
+//
+// Stage 2: A20, text mode 3 for messages, E820 memory map, picks a VBE linear-
+// framebuffer mode (32 bpp preferred, 24 bpp accepted), builds page tables (4 GiB identity map in 2 MiB pages, >=3 GiB
+// uncached for devices), loads the kernel by ATA PIO to 2 MiB (up to 64 MiB), enables SSE, enters long mode and jumps to the kernel.
+//
+// Hand-over to the kernel (long mode, identity-mapped first 4 GiB, interrupts off, SSE on):
+//   0x500  u32 magic 'PEAC' | u32 E820 entry count | u32 boot drive | u32 kernel sectors
+//   0x510  E820 entries, 24 bytes each, at most 20 (up to 0x6F0)
+//   0x6F0  u32 VBE mode number that was set (0 = none)
+//   0x700  VBE ModeInfoBlock of that mode (256 bytes): pitch @+0x10 u16, width @+0x12, height @+0x14, bpp @+0x19 u8, PhysBasePtr @+0x28 u32
+//   PML4 @ 0x1000, PDPT @ 0x2000, PDs @ 0x3000..0x6000.  Stage 2 leaves a throw-away GDT at 0x7E00+: the kernel loads its own first.
+import "x86.kc" as x;
+import std.fbin;
+import std.system;
+
+const KERNEL_BASE = 0x200000; const STAGE2_BASE = 0x7E00; const BOOTINFO = 0x500;
+const E820_BUF = 0x510; const E820_MAX = 20; const VBEMODE = 0x6F0; const VBEINFO = 0x700; const STAGE2_SECTORS = 4; const PML4 = 0x1000; const PDPT = 0x2000; const PD0 = 0x3000;
+const AH = 4; const DL = 2;
+
+fn main() {
+    x.org(0x7C00); x.bits(16);
+    // ---- stage 1
+    x.label("stage1");
+    x.cli(); x.alu_rr(x.OP_XOR, x.AX, x.AX, 16); x.mov_sr(x.DS, x.AX); x.mov_sr(x.ES, x.AX); x.mov_sr(x.SS, x.AX);
+    x.mov_ri(x.SP, 0x7C00, 16); x.sti(); x.mov_mr("boot_drive", x.DX, 8);
+    x.mov_ri(x.SI, "msg_boot", 16); x.call_n("puts16");
+    // EDD (INT 13h extensions) must exist: the loader reads with LBA packets
+    x.mov_rm(x.DX, "boot_drive", 8); x.mov_ri(AH, 0x41, 8); x.mov_ri(x.BX, 0x55AA, 16); x.int_(0x13);
+    x.jcc(x.CC_B, "no_edd"); x.alu_ri(x.OP_CMP, x.BX, 0xAA55, 16); x.jcc(x.CC_E, "edd_ok");
+    x.label("no_edd"); x.mov_ri(x.SI, "msg_edd", 16); x.call_n("puts16"); x.jmp_s("rd_hang");
+    x.label("edd_ok");
+    x.mov_mi("dap_lba", 1, 32); x.mov_mi("dap_cnt", STAGE2_SECTORS, 16); x.mov_mi("dap_off", STAGE2_BASE, 16); x.mov_mi("dap_seg", 0, 16);
+    x.call_n("read_dap");
+    x.alu_mi(x.OP_CMP, STAGE2_BASE + STAGE2_SECTORS * 512 - 12, 0x32455045, 32); x.jcc(x.CC_E, "s2_ok");    // stage 2 signature 'PEE2'
+    x.mov_ri(x.SI, "msg_s2", 16); x.call_n("puts16"); x.jmp_s("rd_hang");
+    x.label("s2_ok");
+    x.mov_rm(x.DX, "boot_drive", 8);
+    x.jmp_far(0x0000, STAGE2_BASE, 2);
+    // read with up to 3 tries; between tries the controller is reset (INT 13h AH=0).  The last BIOS error code is printed on failure.
+    x.label("read_dap");
+    x.mov_mi("retries", 3, 8);
+    x.label("rd_try");
+    x.mov_ri(x.SI, "dap", 16); x.mov_rm(x.DX, "boot_drive", 8); x.mov_ri(AH, 0x42, 8); x.int_(0x13); x.jcc(x.CC_AE, "rd_ret");
+    x.mov_mr("errc", AH, 8);
+    x.alu_rr(x.OP_XOR, x.AX, x.AX, 16); x.mov_rm(x.DX, "boot_drive", 8); x.int_(0x13);
+    x.alu_mi(x.OP_SUB, "retries", 1, 8); x.jcc(x.CC_NE, "rd_try");
+    x.mov_ri(x.SI, "msg_err", 16); x.call_n("puts16"); x.mov_rm(x.AX, "errc", 8); x.call_n("puthex8");
+    x.label("rd_hang"); x.hlt(); x.jmp_s("rd_hang");
+    x.label("rd_ret"); x.ret();
+    x.label("puthex8");
+    x.push_r(x.AX, 16); x.shr_ri(x.AX, 4, 8); x.call_n("hexd"); x.pop_r(x.AX, 16); x.alu_ri(x.OP_AND, x.AX, 0x0F, 8);
+    x.label("hexd");
+    x.alu_ri(x.OP_CMP, x.AX, 10, 8); x.jcc(x.CC_B, "hexd1"); x.alu_ri(x.OP_ADD, x.AX, 7, 8);
+    x.label("hexd1");
+    x.alu_ri(x.OP_ADD, x.AX, 48, 8); x.mov_ri(AH, 0x0E, 8); x.mov_ri(x.BX, 7, 16); x.int_(0x10); x.ret();
+    x.label("puts16");
+    x.lodsb(); x.test_rr(x.AX, x.AX, 8); x.jcc(x.CC_E, "pt_done"); x.mov_ri(AH, 0x0E, 8); x.mov_ri(x.BX, 7, 16); x.int_(0x10); x.jmp_s("puts16");
+    x.label("pt_done"); x.ret();
+    x.label("boot_drive"); x.db(0);
+    x.label("retries"); x.db(0);
+    x.label("errc"); x.db(0);
+    x.label("msg_boot"); x.cstr("Peacock boot 1.5"); x.db(13); x.db(10); x.db(0);
+    x.label("msg_err"); x.cstr("disk error "); x.db(0);
+    x.label("msg_edd"); x.cstr("BIOS has no LBA disk support"); x.db(13); x.db(10); x.db(0);
+    x.label("msg_s2"); x.cstr("bad boot stage 2 (rebuild the image)"); x.db(13); x.db(10); x.db(0);
+    x.align(4, 0x90);
+    x.label("dap"); x.db(0x10); x.db(0);
+    x.label("dap_cnt"); x.dw(0); x.label("dap_off"); x.dw(0); x.label("dap_seg"); x.dw(0); x.label("dap_lba"); x.dq(0);
+    x.pad_to(0x7C00 + 0x1FC);
+    x.label("kernel_sectors"); x.dw(0); x.dw(0xAA55);
+    // ---- stage 2
+    x.label("stage2");
+    x.alu_rr(x.OP_XOR, x.AX, x.AX, 16); x.mov_sr(x.DS, x.AX); x.mov_sr(x.ES, x.AX);
+    x.mov_mi(BOOTINFO, 0x43414550, 32);   // 'PEAC'
+    x.movzx_rm(x.AX, "boot_drive", 8, 32); x.mov_mr(BOOTINFO + 8, x.AX, 32);
+    x.mov_rm(x.AX, "ksec32", 32); x.mov_mr(BOOTINFO + 12, x.AX, 32);
+    x.mov_mi(VBEMODE, 0, 32);
+    x.mov_ri(x.AX, 3, 16); x.int_(0x10);
+    x.mov_ri(x.SI, "msg2", 16); x.call_n("puts16");
+    // ---- CPU: long mode (CPUID 0x80000001 EDX bit 29) and SSE2 (CPUID 1 EDX bit 26) are required
+    x.mov_ri(x.AX, 0x80000000, 32); x.cpuid(); x.alu_ri(x.OP_CMP, x.AX, 0x80000001, 32); x.jcc(x.CC_B, "cpu_bad");
+    x.mov_ri(x.AX, 0x80000001, 32); x.cpuid(); x.alu_ri(x.OP_AND, x.DX, 0x20000000, 32); x.jcc(x.CC_E, "cpu_bad");
+    x.mov_ri(x.AX, 1, 32); x.cpuid(); x.alu_ri(x.OP_AND, x.DX, 0x04000000, 32); x.jcc(x.CC_NE, "cpu_ok");
+    x.label("cpu_bad"); x.mov_ri(x.SI, "msg_cpu", 16); x.jmp_n("fatal");
+    x.label("cpu_ok");
+    // ---- A20: BIOS INT 15h AX=2401, then the fast gate (port 0x92), then the keyboard controller; each is verified by a wrap-around test
+    x.call_n("a20_test"); x.test_rr(x.AX, x.AX, 16); x.jcc(x.CC_NE, "a20_ok");
+    x.mov_ri(x.AX, 0x2401, 16); x.int_(0x15);
+    x.call_n("a20_test"); x.test_rr(x.AX, x.AX, 16); x.jcc(x.CC_NE, "a20_ok");
+    x.in_al(0x92); x.alu_ri(x.OP_OR, x.AX, 2, 8); x.alu_ri(x.OP_AND, x.AX, 0xFE, 8); x.out_al(0x92);
+    x.call_n("a20_test"); x.test_rr(x.AX, x.AX, 16); x.jcc(x.CC_NE, "a20_ok");
+    x.call_n("kbc_wait"); x.mov_ri(x.AX, 0xD1, 8); x.out_al(0x64); x.call_n("kbc_wait"); x.mov_ri(x.AX, 0xDF, 8); x.out_al(0x60); x.call_n("kbc_wait");
+    x.call_n("a20_test"); x.test_rr(x.AX, x.AX, 16); x.jcc(x.CC_NE, "a20_ok");
+    x.mov_ri(x.SI, "msg_a20", 16); x.jmp_n("fatal");
+    x.label("a20_ok");
+    x.alu_rr(x.OP_XOR, x.BX, x.BX, 32); x.alu_rr(x.OP_XOR, x.BP, x.BP, 16); x.mov_ri(x.DI, E820_BUF, 16);
+    x.label("e820");
+    x.mov_ind_i(x.DI, 20, 1, 32); x.mov_ri(x.AX, 0xE820, 32); x.mov_ri(x.DX, 0x534D4150, 32); x.mov_ri(x.CX, 24, 32);
+    x.int_(0x15); x.jcc(x.CC_B, "e820_done");
+    x.alu_ri(x.OP_CMP, x.AX, 0x534D4150, 32); x.jcc(x.CC_NE, "e820_done");
+    x.jcxz("e820_skip"); x.inc_r(x.BP, 16); x.alu_ri(x.OP_ADD, x.DI, 24, 16);
+    x.label("e820_skip");
+    x.alu_ri(x.OP_CMP, x.BP, E820_MAX, 16); x.jcc(x.CC_AE, "e820_done");
+    x.test_rr(x.BX, x.BX, 32); x.jcc(x.CC_NE, "e820");
+    x.label("e820_done");
+    x.test_rr(x.BP, x.BP, 16); x.jcc(x.CC_E, "e820_fb"); x.jmp_n("e820_ok"); x.label("e820_fb");
+    // no E820: build the map from INT 15h AX=E801 (CX = KiB at 1 MiB, DX = 64 KiB blocks at 16 MiB), then AH=88h, else assume 15 MiB
+    x.mov_ri(x.AX, 0xE801, 16); x.int_(0x15); x.jcc(x.CC_AE, "e801_ok");
+    x.mov_ri(x.AX, 0x8800, 16); x.int_(0x15); x.jcc(x.CC_AE, "e88_ok");
+    x.mov_ri(x.CX, 0x3C00, 16); x.jmp_s("e_dx0");
+    x.label("e88_ok"); x.mov_rr(x.CX, x.AX, 16);
+    x.label("e_dx0"); x.alu_rr(x.OP_XOR, x.DX, x.DX, 16); x.jmp_s("e_build");
+    x.label("e801_ok"); x.test_rr(x.CX, x.CX, 16); x.jcc(x.CC_NE, "e_build"); x.mov_rr(x.CX, x.AX, 16); x.mov_rr(x.DX, x.BX, 16);
+    x.label("e_build");
+    x.mov_mi(E820_BUF, 0x100000, 32); x.mov_mi(E820_BUF + 4, 0, 32);
+    x.movzx_rr(x.AX, x.CX, 16, 32); x.shl_ri(x.AX, 10, 32); x.mov_mr(E820_BUF + 8, x.AX, 32); x.mov_mi(E820_BUF + 12, 0, 32); x.mov_mi(E820_BUF + 16, 1, 32);
+    x.mov_ri(x.BP, 1, 16); x.test_rr(x.DX, x.DX, 16); x.jcc(x.CC_E, "e820_ok");
+    x.mov_mi(E820_BUF + 24, 0x1000000, 32); x.mov_mi(E820_BUF + 28, 0, 32);
+    x.movzx_rr(x.AX, x.DX, 16, 32); x.shl_ri(x.AX, 16, 32); x.mov_mr(E820_BUF + 32, x.AX, 32); x.mov_mi(E820_BUF + 36, 0, 32); x.mov_mi(E820_BUF + 40, 1, 32);
+    x.mov_ri(x.BP, 2, 16);
+    x.label("e820_ok");
+    x.movzx_rr(x.AX, x.BP, 16, 32); x.mov_mr(BOOTINFO + 4, x.AX, 32);
+    // (the kernel itself is read later, in 32-bit mode, by ATA PIO straight to KERNEL_BASE: BIOS INT 13h cannot reach above 1 MiB)
+    x.mov_ri(x.SI, "msg3", 16); x.call_n("puts16");
+    // ---- VBE: take the first mode from the table that is a graphics mode with a linear framebuffer at 32 or 24 bpp
+    x.mov_mi("vbe_ptr", "vbe_modes", 16);
+    x.label("vbe_next");
+    x.mov_rm(x.SI, "vbe_ptr", 16); x.lodsw(); x.mov_mr("vbe_ptr", x.SI, 16);
+    x.test_rr(x.AX, x.AX, 16); x.jcc(x.CC_E, "vbe_none");
+    x.mov_mr("vbe_cur", x.AX, 16); x.mov_rr(x.CX, x.AX, 16);
+    x.mov_ri(x.AX, 0x4F01, 16); x.mov_ri(x.DI, VBEINFO, 16); x.int_(0x10);          // get mode info
+    x.alu_ri(x.OP_CMP, x.AX, 0x004F, 16); x.jcc(x.CC_NE, "vbe_next");
+    x.mov_rm(x.AX, VBEINFO, 16); x.alu_ri(x.OP_AND, x.AX, 0x91, 16); x.alu_ri(x.OP_CMP, x.AX, 0x91, 16); x.jcc(x.CC_NE, "vbe_next");   // supported + graphics + LFB
+    x.mov_rm(x.AX, VBEINFO + 0x19, 8); x.alu_ri(x.OP_CMP, x.AX, 32, 8); x.jcc(x.CC_E, "vbe_set"); x.alu_ri(x.OP_CMP, x.AX, 24, 8); x.jcc(x.CC_NE, "vbe_next");
+    x.label("vbe_set");
+    // size window: first pass wants 1024x768 .. 1920x1200; if no such mode exists a second pass accepts anything from 640x480 (the kernel itself handles up to 4096x2400, and switches to 1920x1080 after boot on QEMU/Bochs VGA)
+    x.mov_rm(x.AX, VBEINFO + 0x12, 16); x.mov_rm(x.BX, "vbe_minw", 16); x.alu_rr(x.OP_CMP, x.AX, x.BX, 16); x.jcc(x.CC_B, "vbe_nx");
+    x.alu_ri(x.OP_CMP, x.AX, 1920, 16); x.jcc(x.CC_A, "vbe_nx");
+    x.mov_rm(x.AX, VBEINFO + 0x14, 16); x.mov_rm(x.BX, "vbe_minh", 16); x.alu_rr(x.OP_CMP, x.AX, x.BX, 16); x.jcc(x.CC_B, "vbe_nx");
+    x.alu_ri(x.OP_CMP, x.AX, 1200, 16); x.jcc(x.CC_A, "vbe_nx");
+    x.mov_rm(x.BX, "vbe_cur", 16); x.alu_ri(x.OP_OR, x.BX, 0x4000, 16); x.mov_ri(x.AX, 0x4F02, 16); x.int_(0x10);   // set mode, linear framebuffer
+    x.alu_ri(x.OP_CMP, x.AX, 0x004F, 16); x.jcc(x.CC_NE, "vbe_nx");
+    x.movzx_rm(x.AX, "vbe_cur", 16, 32); x.mov_mr(VBEMODE, x.AX, 32);
+    x.jmp_s("vbe_done");
+    x.label("vbe_nx"); x.jmp_n("vbe_next");
+    x.label("vbe_none");
+    x.mov_rm(x.AX, "vbe_minw", 16); x.alu_ri(x.OP_CMP, x.AX, 640, 16); x.jcc(x.CC_E, "vbe_fail");
+    x.mov_mi("vbe_minw", 640, 16); x.mov_mi("vbe_minh", 480, 16); x.mov_mi("vbe_ptr", "vbe_modes", 16); x.jmp_n("vbe_next");   // second pass, relaxed sizes
+    x.label("vbe_fail");
+    x.mov_ri(x.SI, "msg_novbe", 16); x.call_n("puts16");
+    x.label("vbe_hang"); x.hlt(); x.jmp_s("vbe_hang");
+    x.label("vbe_done");
+    x.cli(); x.lgdt_m("gdt_desc"); x.mov_r_cr(x.AX, 0); x.alu_ri(x.OP_OR, x.AX, 1, 32); x.mov_cr_r(0, x.AX);
+    x.jmp_far(0x08, "pm32", 2);
+    x.label("vbe_ptr"); x.dw(0);
+    x.label("vbe_cur"); x.dw(0);
+    x.label("vbe_minw"); x.dw(1024);
+    x.label("vbe_minh"); x.dw(768);
+    x.label("vbe_modes"); x.dw(0x14A); x.dw(0x144); x.dw(0x118); x.dw(0x145); x.dw(0x11B); x.dw(0x14B); x.dw(0x149); x.dw(0x143); x.dw(0x115); x.dw(0x142); x.dw(0x112); x.dw(0x141); x.dw(0x117); x.dw(0);   // Bochs/QEMU 1280x800, 1024x768, VESA 1024x768, Bochs 1280x1024, VESA 1280x1024, Bochs 1280x960, 1280x720; then (pass 2) 800x600, 640x480 variants
+    x.label("fatal"); x.call_n("puts16");
+    x.label("fatal_h"); x.hlt(); x.jmp_s("fatal_h");
+    // a20_test: AX = 1 when address bit 20 is live (0000:04F0 and FFFF:0500 are different bytes), else 0.  Clobbers BX, ES.
+    x.label("a20_test");
+    x.mov_mi(0x4F0, 0x55AA, 16); x.mov_ri(x.AX, 0xFFFF, 16); x.mov_sr(x.ES, x.AX);
+    x.db(0x26); x.mov_rm(x.BX, 0x500, 16); x.alu_ri(x.OP_CMP, x.BX, 0x55AA, 16); x.jcc(x.CC_NE, "a20_yes");
+    x.mov_mi(0x4F0, 0xAA55, 16);
+    x.db(0x26); x.mov_rm(x.BX, 0x500, 16); x.alu_ri(x.OP_CMP, x.BX, 0xAA55, 16); x.jcc(x.CC_NE, "a20_yes");
+    x.alu_rr(x.OP_XOR, x.AX, x.AX, 16); x.jmp_s("a20_end");
+    x.label("a20_yes"); x.mov_ri(x.AX, 1, 16);
+    x.label("a20_end"); x.alu_rr(x.OP_XOR, x.BX, x.BX, 16); x.mov_sr(x.ES, x.BX); x.ret();
+    x.label("kbc_wait"); x.in_al(0x64); x.alu_ri(x.OP_AND, x.AX, 2, 8); x.jcc(x.CC_NE, "kbc_wait"); x.ret();
+    x.label("msg_cpu"); x.cstr("this CPU lacks 64-bit mode or SSE2"); x.db(13); x.db(10); x.db(0);
+    x.label("msg_a20"); x.cstr("cannot enable the A20 line"); x.db(13); x.db(10); x.db(0);
+    x.label("msg_novbe"); x.cstr("no VBE linear-framebuffer mode: Peacock needs a VBE BIOS (QEMU: -vga std)"); x.db(13); x.db(10); x.db(0);
+    x.label("msg2"); x.cstr("loading Peacock..."); x.db(13); x.db(10); x.db(0);
+    x.label("msg3"); x.cstr("entering long mode"); x.db(13); x.db(10); x.db(0);
+    x.bits(32);
+    x.label("pm32");
+    x.mov_ri(x.AX, 0x10, 16); x.mov_sr(x.DS, x.AX); x.mov_sr(x.ES, x.AX); x.mov_sr(x.SS, x.AX); x.mov_sr(x.FS, x.AX); x.mov_sr(x.GS, x.AX);
+    x.mov_ri(x.SP, 0x7000, 32);
+    // ---- load the kernel: ATA PIO (primary bus, master, LBA28), LBA 5.. -> KERNEL_BASE, up to 128 sectors per command
+    x.mov_ri(x.DI, KERNEL_BASE, 32); x.mov_ri(x.BX, 1 + STAGE2_SECTORS, 32);
+    x.label("ata_loop");
+    x.mov_rm(x.AX, "ksec32", 32); x.test_rr(x.AX, x.AX, 32); x.jcc(x.CC_NE, "ata_go"); x.jmp_n("ata_done");
+    x.label("ata_go");
+    x.mov_ri(x.SI, 128, 32); x.alu_ri(x.OP_CMP, x.AX, 128, 32); x.jcc(x.CC_AE, "ata_chunk"); x.mov_rr(x.SI, x.AX, 32);
+    x.label("ata_chunk");
+    x.alu_rr(x.OP_SUB, x.AX, x.SI, 32); x.mov_mr("ksec32", x.AX, 32);
+    x.mov_ri(x.DX, 0x1F7, 16);
+    x.label("ata_bsy"); x.in_dx(); x.alu_ri(x.OP_AND, x.AX, 0x80, 8); x.jcc(x.CC_NE, "ata_bsy");
+    x.mov_ri(x.DX, 0x1F6, 16); x.mov_rr(x.AX, x.BX, 32); x.shr_ri(x.AX, 24, 32); x.alu_ri(x.OP_AND, x.AX, 0x0F, 8); x.alu_ri(x.OP_OR, x.AX, 0xE0, 8); x.out_dx();
+    x.mov_ri(x.DX, 0x1F2, 16); x.mov_rr(x.AX, x.SI, 32); x.out_dx();
+    x.mov_ri(x.DX, 0x1F3, 16); x.mov_rr(x.AX, x.BX, 32); x.out_dx();
+    x.mov_ri(x.DX, 0x1F4, 16); x.mov_rr(x.AX, x.BX, 32); x.shr_ri(x.AX, 8, 32); x.out_dx();
+    x.mov_ri(x.DX, 0x1F5, 16); x.mov_rr(x.AX, x.BX, 32); x.shr_ri(x.AX, 16, 32); x.out_dx();
+    x.mov_ri(x.DX, 0x1F7, 16); x.mov_ri(x.AX, 0x20, 8); x.out_dx();
+    x.mov_rr(x.BP, x.SI, 32);
+    x.label("ata_sec");
+    x.mov_ri(x.DX, 0x1F7, 16); x.in_dx(); x.in_dx(); x.in_dx(); x.in_dx();           // 400 ns settle
+    x.label("ata_poll");
+    x.in_dx(); x.mov_rr(x.CX, x.AX, 8);
+    x.alu_ri(x.OP_AND, x.AX, 0x80, 8); x.jcc(x.CC_NE, "ata_poll");                      // BSY
+    x.mov_rr(x.AX, x.CX, 8); x.alu_ri(x.OP_AND, x.AX, 0x21, 8); x.jcc(x.CC_NE, "ata_fail");   // ERR | DF
+    x.mov_rr(x.AX, x.CX, 8); x.alu_ri(x.OP_AND, x.AX, 0x08, 8); x.jcc(x.CC_E, "ata_poll");    // wait for DRQ
+    x.mov_ri(x.DX, 0x1F0, 16); x.mov_ri(x.CX, 128, 32); x.rep_insd();
+    x.alu_ri(x.OP_SUB, x.BP, 1, 32); x.jcc(x.CC_NE, "ata_sec");
+    x.alu_rr(x.OP_ADD, x.BX, x.SI, 32); x.jmp_n("ata_loop");
+    x.label("ata_fail");
+    x.mov_mi(0xB8000, 0x4F524F45, 32); x.mov_mi(0xB8004, 0x4F214F52, 32);              // "ERR!" on screen
+    x.label("ata_hang"); x.hlt(); x.jmp_s("ata_hang");
+    x.label("ata_done");
+    // verify the kernel image: 32-bit wrap-around sum of all its dwords must equal the value mkimage stored in stage 2
+    x.mov_ri(x.SI, KERNEL_BASE, 32); x.mov_rm(x.CX, BOOTINFO + 12, 32); x.shl_ri(x.CX, 7, 32); x.alu_rr(x.OP_XOR, x.AX, x.AX, 32);
+    x.test_rr(x.CX, x.CX, 32); x.jcc(x.CC_E, "ck_done");
+    x.label("ck_sum"); x.db(0x03); x.db(0x06); x.alu_ri(x.OP_ADD, x.SI, 4, 32); x.alu_ri(x.OP_SUB, x.CX, 1, 32); x.jcc(x.CC_NE, "ck_sum");
+    x.label("ck_done");
+    x.mov_rm(x.BX, "kcsum", 32); x.alu_rr(x.OP_CMP, x.AX, x.BX, 32); x.jcc(x.CC_E, "ck_ok");
+    x.mov_mi(0xB8000, 0x4F524F43, 32); x.mov_mi(0xB8004, 0x4F214F43, 32);              // "CRC!" on screen: the kernel image is damaged
+    x.label("ck_hang"); x.hlt(); x.jmp_s("ck_hang");
+    x.label("ck_ok");
+    x.mov_ri(x.DI, PML4, 32); x.alu_rr(x.OP_XOR, x.AX, x.AX, 32); x.mov_ri(x.CX, 0x6000 / 4, 32); x.rep_stosd();
+    x.mov_mi(PML4, PDPT | 3, 32);
+    x.mov_mi(PDPT + 0, (PD0 + 0x0000) | 3, 32); x.mov_mi(PDPT + 8, (PD0 + 0x1000) | 3, 32);
+    x.mov_mi(PDPT + 16, (PD0 + 0x2000) | 3, 32); x.mov_mi(PDPT + 24, (PD0 + 0x3000) | 3, 32);
+    x.mov_ri(x.DI, PD0, 32); x.alu_rr(x.OP_XOR, x.AX, x.AX, 32); x.alu_rr(x.OP_XOR, x.CX, x.CX, 32);
+    x.label("pd");
+    x.mov_rr(x.DX, x.AX, 32); x.alu_ri(x.OP_OR, x.DX, 0x83, 32); x.alu_ri(x.OP_CMP, x.CX, 1536, 32); x.jcc(x.CC_B, "cached");
+    x.alu_ri(x.OP_OR, x.DX, 0x18, 32);
+    x.label("cached");
+    x.mov_ind_r(x.DI, 0, x.DX, 32); x.mov_ind_i(x.DI, 4, 0, 32); x.alu_ri(x.OP_ADD, x.DI, 8, 32); x.alu_ri(x.OP_ADD, x.AX, 0x200000, 32);
+    x.inc_r(x.CX, 32); x.alu_ri(x.OP_CMP, x.CX, 2048, 32); x.jcc(x.CC_B, "pd");
+    x.mov_r_cr(x.AX, 4); x.alu_ri(x.OP_OR, x.AX, 0x620, 32); x.mov_cr_r(4, x.AX);
+    x.mov_ri(x.AX, PML4, 32); x.mov_cr_r(3, x.AX);
+    x.mov_ri(x.CX, 0xC0000080, 32); x.rdmsr(); x.alu_ri(x.OP_OR, x.AX, 0x100, 32); x.wrmsr();
+    x.mov_r_cr(x.AX, 0); x.alu_ri(x.OP_OR, x.AX, 0x80000023, 32); x.alu_ri(x.OP_OR, x.AX, 2, 32); x.alu_ri(x.OP_AND, x.AX, 0xFFFFFFFB, 32); x.mov_cr_r(0, x.AX);
+    x.jmp_far(0x18, "lm64", 4);
+    x.bits(64);
+    x.label("lm64");
+    x.mov_ri(x.AX, 0x10, 16); x.mov_sr(x.DS, x.AX); x.mov_sr(x.ES, x.AX); x.mov_sr(x.SS, x.AX);
+    x.alu_rr(x.OP_XOR, x.AX, x.AX, 32); x.mov_sr(x.FS, x.AX); x.mov_sr(x.GS, x.AX);
+    x.mov_ri(x.AX, KERNEL_BASE, 32); x.jmp_r(x.AX);
+    x.align(8, 0x90);
+    x.label("gdt"); x.dq(0); x.dq(0x00CF9A000000FFFF); x.dq(0x00CF92000000FFFF); x.dq(0x00209A0000000000);
+    x.label("gdt_end");
+    x.label("gdt_desc"); x.dw(x.addr_of("gdt_end") - x.addr_of("gdt") - 1); x.val("gdt", 4);
+    x.pad_to(0x7C00 + 512 + STAGE2_SECTORS * 512 - 12);
+    x.label("s2sig"); x.dd(0x32455045);            // 'PEE2': stage 1 checks it after reading stage 2
+    x.label("kcsum"); x.dd(0);                     // kernel checksum (u32), patched by tools/mkimage.kc at image offset 2552
+    x.label("ksec32"); x.dd(0);                    // kernel sector count (u32), patched by tools/mkimage.kc at image offset 2556
+    let out = x.finish();
+    let s = fbin.buffer();
+    fbin.write_bytes(s, out);
+    fbin.save(s, system.args()[0]);
+    println("boot: wrote " + str(len(out)) + " bytes");
+}

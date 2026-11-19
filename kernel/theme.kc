@@ -1,0 +1,306 @@
+// theme.kc -- desktop themes: seven pictures (assets/themes/*.jpg, prepared by tools/mkthemes.py and stored in the disk image) each with
+// its own accent colours, the "Appearance" app to choose one, the `theme` terminal command and the remembered choice (/etc/theme).
+// Author: Divyanshu Sinha (MIT License)
+//
+// Disk block at themes_lba():   9 thumbnails (96x60, 0x00RRGGBB, 45 sectors each)  then  9 wallpapers (640x400, R,G,B bytes, 1500 sectors each).
+// The wallpaper is scaled (bilinear) to the screen size into `wall`; without the block (no disk / old image) the old procedural wallpaper is used.
+const TH_N = 9;
+const TH_TW = 96; const TH_TH = 60; const TH_TSECT = 45;
+const TH_WW = 640; const TH_WH = 400; const TH_WSECT = 1500;
+const TH_WALL0 = 405;                                   // sector offset of the first wallpaper inside the block
+
+var th_cur = 4;                                         // the pink peacock is the default
+var th_thumbs: *u32;                                    // loaded while the Appearance app is open
+var th_xs: *int;                                        // bilinear tables for one screen width (allocated per load)
+var th_fxs: *int;
+var th_acc_t: int[9] = [0x2FA89A, 0x7A5AD8, 0x1FA8C8, 0xF2742C, 0xD6579A, 0xC9A227, 0xD31A62, 0xD9A93B, 0xF2922B];
+var th_tint_t: int[9] = [0x0A1F26, 0x151233, 0x08202B, 0x0B1F33, 0x24101F, 0x0F1330, 0x2A0C1C, 0x0E0D0B, 0x1A0E06];
+
+/// shown on the splash and by the `theme` command so you can tell which build is running
+fn os_version() -> *u8 { return "Peacock OS 1.9 - 64-bit Pipeline"; }
+
+fn th_name(n: int) -> *u8 {
+    if (n == 0) { return "Misty Forest"; }
+    if (n == 1) { return "Violet Plume"; }
+    if (n == 2) { return "Aqua Crest"; }
+    if (n == 3) { return "Marigold"; }
+    if (n == 4) { return "Rose Plume"; }
+    if (n == 5) { return "Moon Mandala"; }
+    if (n == 6) { return "Flute & Eye"; }
+    if (n == 7) { return "Gold Line"; }
+    return "Om Glow";
+}
+
+/// the accent colours of the taskbar, start menu and windows
+fn th_colours(n: int) {
+    let a = th_acc_t[n]; let t = th_tint_t[n];
+    th_acc = a;
+    th_acc_dk = mix(a, 0x000000, 70);
+    th_edge = mix(a, 0xFFFFFF, 80);
+    th_tint = t;
+    th_menu = mix(t, 0x000000, 20);
+    th_line = mix(t, a, 90);
+    th_tab = mix(t, 0xFFFFFF, 30);
+    th_tabh = mix(t, 0xFFFFFF, 52);
+    th_taba = mix(t, a, 120);
+    th_hov = mix(t, a, 100);
+}
+
+var th_why = 0;                                         // why the pictures could not be loaded: 0 ok, 1 no disk, 2 disk too small, 3 out of memory, 4 read error, 5 screen too wide
+fn th_why_text() -> *u8 {
+    if (th_why == 1) { return "no disk found (IDE needed)"; }
+    if (th_why == 2) { return "disk too small - use the whole peacock.img"; }
+    if (th_why == 3) { return "out of memory"; }
+    if (th_why == 4) { return "disk read error"; }
+    if (th_why == 5) { return "screen wider than 4096"; }
+    return "ok";
+}
+fn th_block_ok() -> bool { return disk_present && disk_sectors >= themes_lba() + TH_WALL0 + TH_N * TH_WSECT; }   // the last sector read is LBA end-1
+
+/// wallpaper of theme n, scaled to the screen, into `wall`; false when the pictures are not on the disk
+fn th_load_wall(n: int) -> bool {
+    th_why = 0;
+    if (!disk_present) { th_why = 1; return false; }
+    if (!th_block_ok()) { th_why = 2; return false; }
+    if (fb_w > 4096) { th_why = 5; return false; }
+    let buf = kmalloc(TH_WSECT * 512);
+    if (buf == (0 as *u8)) { th_why = 3; return false; }
+    th_xs = kmalloc(fb_w * 8) as *int; th_fxs = kmalloc(fb_w * 8) as *int;
+    if (th_xs == (0 as *int) || th_fxs == (0 as *int)) { kfree(buf); if (th_xs != (0 as *int)) { kfree(th_xs as *u8); } if (th_fxs != (0 as *int)) { kfree(th_fxs as *u8); } th_why = 3; return false; }
+    if (!ata_read(themes_lba() + TH_WALL0 + n * TH_WSECT, TH_WSECT, buf)) { kfree(buf); kfree(th_xs as *u8); kfree(th_fxs as *u8); th_why = 4; return false; }
+    var x = 0;
+    while (x < fb_w) {
+        let sx = (x * ((TH_WW - 1) << 8)) / imax(1, fb_w - 1);
+        th_xs[x] = sx >> 8; th_fxs[x] = sx & 255;
+        x++;
+    }
+    var y = 0;
+    while (y < fb_h) {
+        let sy = (y * ((TH_WH - 1) << 8)) / imax(1, fb_h - 1);
+        let iy = sy >> 8; let fy = sy & 255;
+        let r0 = iy * TH_WW * 3;
+        let r1 = imin(iy + 1, TH_WH - 1) * TH_WW * 3;
+        let drow = y * fb_w;
+        x = 0;
+        while (x < fb_w) {
+            let ix = th_xs[x]; let fx = th_fxs[x];
+            let i0 = ix * 3; let i1 = imin(ix + 1, TH_WW - 1) * 3;
+            var out = 0;
+            var k = 0;
+            while (k < 3) {
+                let top = ((buf[r0 + i0 + k] as int) * (256 - fx) + (buf[r0 + i1 + k] as int) * fx) >> 8;
+                let bot = ((buf[r1 + i0 + k] as int) * (256 - fx) + (buf[r1 + i1 + k] as int) * fx) >> 8;
+                out = (out << 8) | ((top * (256 - fy) + bot * fy) >> 8);
+                k++;
+            }
+            wall[drow + x] = out as u32;
+            x++;
+        }
+        y++;
+    }
+    kfree(buf); kfree(th_xs as *u8); kfree(th_fxs as *u8);
+    return true;
+}
+
+/// (re)build the wallpaper of the current theme and set its colours; the caller repaints
+fn theme_wall() {
+    th_colours(th_cur);
+    if (!th_load_wall(th_cur)) {
+        make_wallpaper();
+        ser_puts("[peacock] theme pictures not loaded: "); ser_puts(th_why_text()); ser_puts(" (disk sectors "); ser_putdec(disk_sectors); ser_puts(", need "); ser_putdec(themes_lba() + TH_WALL0 + TH_N * TH_WSECT); ser_puts(")\n");
+    }
+}
+
+fn th_save() {
+    var b: u8[2];
+    b[0] = ('1' + th_cur) as u8; b[1] = 10;
+    var n = fs_resolve("/etc/theme");
+    if (n < 0) { n = fs_create("/etc/theme", K_FILE); }
+    if (n >= 0) { fs_write(n, &b[0], 2, false); }
+    fs_save();
+}
+
+/// switch theme (0..6) now; save = remember it for the next boot
+fn theme_apply(n: int, save: bool) {
+    if (n < 0 || n >= TH_N) { return; }
+    th_cur = n;
+    theme_wall();
+    dmg_add(0, 0, fb_w, fb_h);
+    if (save) { th_save(); toast_theme(); }
+}
+
+/// at start-up: pick up the remembered theme (called after the file system is loaded)
+fn theme_load_pref() {
+    let n = fs_resolve("/etc/theme");
+    if (n >= 0 && fs_nodes[n].size >= 1) {
+        let d = (fs_nodes[n].data[0] as int) - '1';
+        if (d >= 0 && d < TH_N) { th_cur = d; }
+    }
+}
+
+/// diagnostics for the terminal: why the pictures are (not) used, disk and screen size
+fn th_report() {
+    t_puts(os_version(), 3); t_puts("\n", 0);
+    if (th_why != 0) { t_puts("wallpaper NOT loaded: ", 2); t_puts(th_why_text(), 2); t_puts("\n", 2); }
+    else { t_puts("wallpaper loaded from disk\n", 3); }
+    t_puts("screen ", 0); t_putdec(fb_w, 0); t_puts("x", 0); t_putdec(fb_h, 0);
+    t_puts("  disk sectors ", 0); t_putdec(disk_sectors, 0); t_puts(" (need ", 0); t_putdec(themes_lba() + TH_WALL0 + TH_N * TH_WSECT, 0); t_puts(")\n", 0);
+}
+
+/// terminal: `theme` lists, `theme N` applies
+fn th_cmd() {
+    if (targc >= 2) {
+        let d = katoi(t_av(1)) - 1;
+        if (d < 0 || d >= TH_N) { t_puts("theme: choose 1 to 9\n", 2); return; }
+        theme_apply(d, true);
+        t_puts("theme: ", 0); t_puts(th_name(d), 0); t_puts("\n", 0);
+        th_report();
+        return;
+    }
+    var i = 0;
+    while (i < TH_N) {
+        t_putdec(i + 1, 0);
+        if (i == th_cur) { t_puts("* ", 0); } else { t_puts("  ", 0); }
+        t_puts(th_name(i), 0); t_puts("\n", 0);
+        i++;
+    }
+    th_report();
+    t_puts("use: theme <1-9>   (or open appearance)\n", 0);
+}
+
+// ================================================================= the Appearance app
+const TH_CW = 108; const TH_TOP = 46; const TH_RH = 112;
+
+fn th_size(out: *int) { out[0] = 12 + 5 * TH_CW + 4; out[1] = TH_TOP + 2 * TH_RH + 108; }
+
+fn depth_name(d: int) -> *u8 {
+    if (d == 0) { return "Flat"; }
+    if (d == 1) { return "Soft"; }
+    return "3D";
+}
+fn depth_save() {
+    var b: u8[2];
+    b[0] = ('0' + ui_depth) as u8; b[1] = 10;
+    var n = fs_resolve("/etc/depth");
+    if (n < 0) { n = fs_create("/etc/depth", K_FILE); }
+    if (n >= 0) { fs_write(n, &b[0], 2, false); }
+    fs_save();
+}
+fn depth_apply(d: int, save: bool) {
+    if (d < 0 || d > 2) { return; }
+    ui_depth = d;
+    if (save) { depth_save(); }
+    dmg_add(0, 0, fb_w, fb_h);
+}
+fn depth_load_pref() {
+    let n = fs_resolve("/etc/depth");
+    if (n >= 0 && fs_nodes[n].size >= 1) {
+        let d = (fs_nodes[n].data[0] as int) - 48;
+        if (d >= 0 && d <= 2) { ui_depth = d; }
+    }
+}
+
+fn th_init() {
+    th_thumbs = 0 as *u32;
+    if (th_block_ok()) {
+        let b = kmalloc(TH_N * TH_TSECT * 512);
+        if (b != (0 as *u8)) {
+            if (ata_read(themes_lba(), TH_N * TH_TSECT, b)) { th_thumbs = b as *u32; } else { kfree(b); th_why = 4; }
+        }
+    }
+}
+fn th_close() {
+    if (th_thumbs != (0 as *u32)) { kfree(th_thumbs as *u8); th_thumbs = 0 as *u32; }
+}
+
+fn th_blit(x: int, y: int, src: *u32) {
+    var j = 0;
+    while (j < TH_TH) {
+        let yy = y + j;
+        if (yy >= clip_y0 && yy < clip_y1) {
+            var i = 0;
+            while (i < TH_TW) {
+                let xx = x + i;
+                if (xx >= clip_x0 && xx < clip_x1) { bb[yy * fb_w + xx] = p64(src[j * TH_TW + i] as int) as u64; }
+                i++;
+            }
+        }
+        j++;
+    }
+}
+
+fn th_draw(x: int, y: int, w: int, h: int) {
+    fill(x, y, w, h, C_PANEL);
+    draw_text_sc(x + 14, y + 10, "Choose a theme", C_INK, 2);
+    var n = 0;
+    while (n < TH_N) {
+        let tx = x + 12 + (n % 5) * TH_CW; let ty = y + TH_TOP + (n / 5) * TH_RH;
+        if (n == th_cur) { rfill(tx - 5, ty - 5, TH_TW + 10, TH_TH + 28 + 8, 8, th_acc_t[n], false); }
+        else { rfill(tx - 4, ty - 4, TH_TW + 8, TH_TH + 28 + 6, 7, 0xDCE1EA, false); }
+        if (th_thumbs != (0 as *u32)) { th_blit(tx, ty, th_thumbs + n * TH_TW * TH_TH); }
+        else { fill(tx, ty, TH_TW, TH_TH, th_tint_t[n]); fill(tx + 30, ty + 20, 36, 32, th_acc_t[n]); }
+        let nm = th_name(n);
+        draw_text(tx + (TH_TW - text_w(nm)) / 2, ty + TH_TH + 7, nm, n == th_cur ? 0xFFFFFF : C_INK);
+        n++;
+    }
+    let dy = y + TH_TOP + 2 * TH_RH + 6;
+    draw_text(x + 14, dy + 5, "Button style", C_INK);
+    var d = 0;
+    while (d < 3) {
+        let on = d == ui_depth;
+        let cx = x + 124 + d * 70;
+        if (on) { rfill(cx - 2, dy - 2, 68, 30, 8, th_acc, false); }
+        a2_btn(cx, dy, 64, 26, depth_name(d), on ? 0xDCE6FA : 0xFFFFFF);
+        d++;
+    }
+    if (disp_probe()) {
+        let ry = dy + 36;
+        draw_text(x + 14, ry + 5, "Display", C_INK);
+        var m = 0;
+        while (m < DISP_N) {
+            let ok = disp_fits(disp_w(m), disp_h(m));
+            let on = m == disp_cur();
+            let cx = x + 84 + m * 92;
+            if (on) { rfill(cx - 2, ry - 2, 92, 30, 8, th_acc, false); }
+            a2_btn(cx, ry, 88, 26, disp_label(m), on ? 0xDCE6FA : (ok ? 0xFFFFFF : 0xE4E4E8));
+            m++;
+        }
+    }
+    if (th_why != 0) { draw_text(x + 14, y + h - 18, "Pictures missing: ", 0xC0392B); draw_text(x + 14 + 144, y + h - 18, th_why_text(), 0xC0392B); }
+    else { draw_text(x + 14, y + h - 18, "Click a picture or press 1-9. Saved automatically.", 0x6A7488); }
+}
+
+fn th_pick(n: int) {
+    if (n == th_cur) { return; }
+    theme_apply(n, true);
+    ui_inval_all(APP_THEME);
+}
+
+fn th_mouse(mx: int, my: int, ev: int) {
+    if (ev != 1) { return; }
+    var d = 0;
+    while (d < 3) { if (in_rect(mx, my, 124 + d * 70, TH_TOP + 2 * TH_RH + 6, 64, 26)) { depth_apply(d, true); ui_inval_all(APP_THEME); return; } d++; }
+    if (disp_probe()) {
+        var m = 0;
+        while (m < DISP_N) {
+            if (in_rect(mx, my, 84 + m * 92, TH_TOP + 2 * TH_RH + 42, 88, 26)) {
+                if (disp_set(disp_w(m), disp_h(m))) { disp_save(); }
+                else { klog("resolution not available"); }
+                ui_inval_all(APP_THEME); return;
+            }
+            m++;
+        }
+    }
+    var n = 0;
+    while (n < TH_N) {
+        let tx = 12 + (n % 5) * TH_CW; let ty = TH_TOP + (n / 5) * TH_RH;
+        if (mx >= tx - 4 && mx < tx + TH_TW + 4 && my >= ty - 4 && my < ty + TH_TH + 30) { th_pick(n); return; }
+        n++;
+    }
+}
+
+fn th_key(k: int) {
+    if (k >= '1' && k <= '9') { th_pick(k - '1'); }
+    else if (k == KEY_RIGHT) { th_pick((th_cur + 1) % TH_N); }
+    else if (k == KEY_LEFT) { th_pick((th_cur + TH_N - 1) % TH_N); }
+}

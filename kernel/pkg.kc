@@ -1,0 +1,74 @@
+// pkg.kc -- the install bundle: a packed directory tree that tools/mkbundle.kc writes into the disk image at BUNDLE_LBA.
+// Author: Divyanshu Sinha (MIT License)
+//
+// header sector: "PKGB0001" | u64 payload bytes @8 | u64 record count @16 | u64 adler32 of the payload @24 | root name (NUL-terminated) @32
+// payload: records { u32 kind (1 file, 2 dir), u32 path length, u32 size, u32 reserved }  path bytes  file bytes
+// Needs: kstr.kc, fs.kc and the hooks disk_present, disk_sectors, ata_read(lba, count, buf), kmalloc/kfree.
+fn pkg_lba() -> int { return bundle_lba(); }
+const PKG_MAX = 12582912;            // 12 MiB
+
+var pk_name: u8[40];
+var pk_bytes = 0; var pk_records = 0; var pk_sum = 0;
+
+fn pk_u32(p: *u8) -> int { return *(p as *u32) as int; }
+fn pk_u64(p: *u8) -> int { return *(p as *u64) as int; }
+
+/// read the header; false when the disk has no bundle
+fn pkg_header() -> bool {
+    if (!disk_present || disk_sectors <= pkg_lba() + 1) { return false; }
+    var h: u8[512];
+    if (!ata_read(pkg_lba(), 1, &h[0])) { return false; }
+    if (!kstarts(&h[0], "PKGB0001")) { return false; }
+    pk_bytes = pk_u64(&h[8]); pk_records = pk_u64(&h[16]); pk_sum = pk_u64(&h[24]);
+    kstrncpy(&pk_name[0], &h[32], 40);
+    pk_name[39] = 0;
+    if (pk_bytes <= 0 || pk_bytes > PKG_MAX || pk_records <= 0) { return false; }
+    return true;
+}
+
+/// install the bundle under `dest` (absolute path).  out[0]=files out[1]=dirs out[2]=bytes out[3]=skipped
+/// returns 0 ok, 1 no bundle, 2 corrupt, 3 out of memory, 4 filesystem full
+fn pkg_install(dest: *u8, out: *int) -> int {
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+    if (!pkg_header()) { return 1; }
+    let nsec = (pk_bytes + 511) >> 9;
+    let buf = kmalloc(nsec * 512 + 16);
+    if (buf == (0 as *u8)) { return 3; }
+    if (!ata_read(pkg_lba() + 1, nsec, buf)) { kfree(buf); return 2; }
+    var a1 = 1; var b1 = 0; var i = 0;                          // Adler-32, the same sum std.fbin computes
+    while (i < pk_bytes) { a1 = (a1 + (buf[i] as int)) % 65521; b1 = (b1 + a1) % 65521; i++; }
+    if (((b1 << 16) | a1) != pk_sum) { kfree(buf); return 2; }
+    if (fs_mkdirs(dest) < 0) { kfree(buf); return 4; }
+    var path: u8[128];
+    var p = 0; var r = 0; var rc = 0;
+    while (r < pk_records && p + 16 <= pk_bytes) {
+        let kind = pk_u32(buf + p); let plen = pk_u32(buf + p + 4); let size = pk_u32(buf + p + 8);
+        let name = buf + p + 16;
+        let data = buf + p + 16 + plen;
+        p = p + 16 + plen + size;
+        r++;
+        if (p > pk_bytes || plen <= 0 || plen > 90) { out[3]++; continue; }
+        kstrncpy(&path[0], dest, 128);
+        var o = kstrlen(&path[0]);
+        if (o > 0 && path[o - 1] != '/') { path[o] = '/'; o++; }
+        var j = 0;
+        while (j < plen && o < 126) { path[o] = name[j]; o++; j++; }
+        path[o] = 0;
+        if (kind == 2) {
+            if (fs_mkdirs(&path[0]) < 0) { rc = 4; break; }
+            out[1]++;
+        } else {
+            // make sure the parent directory exists (the tool lists directories first, but be safe)
+            var k = o - 1;
+            while (k > 0 && path[k] != '/') { k--; }
+            if (k > 0) { path[k] = 0; fs_mkdirs(&path[0]); path[k] = '/'; }
+            var n = fs_resolve(&path[0]);
+            if (n < 0) { n = fs_create(&path[0], K_FILE); }
+            if (n < 0 || fs_nodes[n].kind != K_FILE) { rc = 4; break; }
+            if (!fs_write(n, data, size, false)) { rc = 3; break; }
+            out[0]++; out[2] = out[2] + size;
+        }
+    }
+    kfree(buf);
+    return rc;
+}

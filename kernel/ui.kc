@@ -1,0 +1,948 @@
+// ui.kc -- the Peacock desktop: wallpaper, icons, taskbar, start menu, window manager and the frame loop.
+// Author: Divyanshu Sinha (MIT License)
+//
+// Hardware independent: it reads the input queues (input.kc), draws with gfx.kc and asks apps.kc what to show.
+// A window's client area belongs to an app (apps.kc); the window frame is drawn here.
+// Platform hooks it expects: `ticks` (100 Hz), rtc_read(out), hal_reboot(), hal_poweroff(), klog(s), kmalloc/kfree.
+
+const TB = 26;                 // title bar height
+const TOPBAR_H = 30;            // slim glass bar at the top: launcher pill + focused window, tray
+const TASKBAR_H = 64;           // bottom area reserved for the floating dock (windows stay above it)
+const DOCK_H = 46;
+const MAXWIN = 16;
+const NAPPS = 18;                   // app kinds 1..NAPPS (some are hidden from the launcher: see app_hidden)
+const NMENU = 14;                   // apps shown in the launcher grid
+const NDESK = 5;                    // icons on the desktop (root window)
+const APP_SETTINGS = 18;
+const APP_TERM = 1; const APP_NOTES = 2; const APP_PAINT = 3; const APP_CALC = 4; const APP_INFO = 5;
+const APP_WEB = 12; const APP_BLD = 13; const APP_THEME = 14; const APP_FONT = 15; const APP_3D = 16; const APP_RUN = 17;
+const APP_FILES = 6; const APP_CAL = 7; const APP_CLOCK = 8; const APP_SNAKE = 9; const APP_MINES = 10; const APP_MON = 11;
+
+const C_NAVY = 0x07173A; const C_TEAL = 0x0E7C86; const C_AQUA = 0x2EB6A8; const C_GOLD = 0xE8B923;
+// theme colours (set by theme_apply() in theme.kc; the defaults are the first theme's)
+var th_acc = 0x1F6FEB; var th_acc_dk = 0x1556B8; var th_edge = 0x7FA6E8; var th_tint = 0x0F1B33; var th_menu = 0x121F3B;
+var th_line = 0x2A3B63; var th_tab = 0x1B2B4D; var th_tabh = 0x243962; var th_taba = 0x30497F; var th_hov = 0x24467F;
+const C_BLUE = 0x1F4FA8; const C_PANEL = 0xF3F5FA; const C_INK = 0x1B2433;
+
+struct Win {
+    used: int,
+    kind: int,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    minimized: int,
+    anim: int,                 // tick when the window opened (fade-in), 0 = none
+    title: u8[32]
+}
+
+var wins: Win[16];
+var zorder: int[16];
+var nz = 0;
+var focus = -1;               // window index with the keyboard focus, -1 = none
+var drag_win = -1;
+var drag_dx = 0;
+var drag_dy = 0;
+var capture_win = -1;         // window that gets mouse moves while the left button is held
+var cur_x = 0;
+var cur_kind = 0;
+var cur_y = 0;
+var last_btn = 0;
+var menu_open = false;
+var menu_hover = -1;
+var menu_q: u8[24];           // start-menu search text
+var menu_qn = 0;
+var menu_list: int[16];       // apps matching the search (index = app kind - 1)
+var menu_n = 0;
+var ctx_open = false; var ctx_x = 0; var ctx_y = 0; var ctx_hover = -1;       // desktop context menu
+var toast_txt: u8[64]; var toast_t0 = -100000;                               // notification toast
+var fade_buf: *u64; var fade_x = 0; var fade_y = 0; var fade_w = 0; var fade_h = 0;
+var date_txt: u8[16];
+var last_caret = 0;
+var wbtn_hover = -1;          // window-control hover: window*4 + 1 (minimise) / 2 (close)
+var icon_sel = -1;
+var last_click_tick = 0;
+var last_click_icon = -1;
+var last_sec = -1;
+var cascade = 0;
+var clock_txt: u8[16];
+var ui_ready = false;
+var frames = 0;
+
+// ================================================================= artwork
+/// a peacock-feather "eye": concentric ellipses, r = horizontal radius of the outer ring
+fn feather(cx: int, cy: int, r: int) {
+    ellipse(cx, cy, r, r * 4 / 3, 0x0A2F7A);
+    ellipse(cx, cy, r * 85 / 100, r * 108 / 100, 0x1B6FB0);
+    ellipse(cx, cy, r * 68 / 100, r * 88 / 100, 0x17A38F);
+    ellipse(cx, cy, r * 52 / 100, r * 66 / 100, 0x45C98A);
+    ellipse(cx, cy, r * 38 / 100, r * 48 / 100, C_GOLD);
+    ellipse(cx, cy, r * 26 / 100, r * 33 / 100, 0x1B8F9C);
+    ellipse(cx, cy, r * 14 / 100, r * 19 / 100, 0x081A4A);
+}
+
+fn make_wallpaper() {
+    clip_reset();
+    vgrad(0, 0, fb_w, fb_h, 0x06122E, 0x0B6B73);
+    // faint diagonal sheen
+    var i = 0;
+    while (i < 9) {
+        shade(0, fb_h * i / 9, fb_w, 2, 0x2EB6A8, 22);
+        i++;
+    }
+    let u = fb_h / 12;
+    // stems, then the eyes
+    fill(fb_w * 78 / 100 - 1, fb_h * 40 / 100, 3, fb_h, 0x0A4A55);
+    fill(fb_w * 62 / 100 - 1, fb_h * 58 / 100, 3, fb_h, 0x0A4A55);
+    fill(fb_w * 90 / 100 - 1, fb_h * 70 / 100, 3, fb_h, 0x0A4A55);
+    feather(fb_w * 78 / 100, fb_h * 38 / 100, u * 2);
+    feather(fb_w * 62 / 100, fb_h * 56 / 100, u + u / 3);
+    feather(fb_w * 90 / 100, fb_h * 66 / 100, u);
+    feather(fb_w * 70 / 100, fb_h * 18 / 100, u / 2);
+    // title
+    let tx = fb_w - 8 * 3 * 7 - 28;
+    draw_text_sc(tx + 2, fb_h - TASKBAR_H - 70 + 2, "Peacock", 0x03101F, 3);
+    draw_text_sc(tx, fb_h - TASKBAR_H - 70, "Peacock", 0xE9FBF6, 3);
+    draw_text(tx + 4, fb_h - TASKBAR_H - 70 + 50, "written in KingCobra", 0x9FE3D6);
+    // copy to the wallpaper buffer
+    var n = fb_w * fb_h;
+    i = 0;
+    while (i < n) { wall[i] = px32(bb[i] as int) as u32; i++; }
+}
+
+// ================================================================= apps: names, sizes
+fn app_name(kind: int) -> *u8 {
+    if (kind == APP_TERM) { return "Terminal"; }
+    if (kind == APP_NOTES) { return "Notes"; }
+    if (kind == APP_PAINT) { return "Paint"; }
+    if (kind == APP_CALC) { return "Calculator"; }
+    if (kind == APP_INFO) { return "System Info"; }
+    if (kind == APP_FILES) { return "Files"; }
+    if (kind == APP_CAL) { return "Calendar"; }
+    if (kind == APP_CLOCK) { return "Clock"; }
+    if (kind == APP_SNAKE) { return "Snake"; }
+    if (kind == APP_MINES) { return "Minesweeper"; }
+    if (kind == APP_MON) { return "Monitor"; }
+    if (kind == APP_WEB) { return "Browser"; }
+    if (kind == APP_BLD) { return "App Builder"; }
+    if (kind == APP_THEME) { return "Appearance"; }
+    if (kind == APP_FONT) { return "Fonts"; }
+    if (kind == APP_3D) { return "3D Studio"; }
+    if (kind == APP_RUN) { return "App"; }
+    if (kind == APP_SETTINGS) { return "Settings"; }
+    return "?";
+}
+
+// ================================================================= window bookkeeping
+fn win_rect_dmg(i: int) { dmg_add(wins[i].x - 6, wins[i].y - 4, wins[i].w + 12, wins[i].h + 12); }
+/// the dock strip (plus the room for its hover tooltip above it)
+fn taskbar_dmg() { dmg_add(0, fb_h - TASKBAR_H - 34, fb_w, TASKBAR_H + 34); }
+fn topbar_dmg() { dmg_add(0, 0, fb_w, TOPBAR_H); }
+
+fn win_of_kind(kind: int) -> int {
+    var i = 0;
+    while (i < MAXWIN) { if (wins[i].used != 0 && wins[i].kind == kind) { return i; } i++; }
+    return -1;
+}
+
+fn z_remove(i: int) {
+    var j = 0;
+    var o = 0;
+    while (j < nz) { if (zorder[j] != i) { zorder[o] = zorder[j]; o++; } j++; }
+    nz = o;
+}
+
+fn top_visible() -> int {
+    var j = nz - 1;
+    while (j >= 0) { if (wins[zorder[j]].minimized == 0) { return zorder[j]; } j--; }
+    return -1;
+}
+
+fn raise(i: int) {
+    z_remove(i);
+    zorder[nz] = i; nz++;
+    wins[i].minimized = 0;
+    if (focus != i) { if (focus >= 0 && wins[focus].used != 0) { win_rect_dmg(focus); } focus = i; }
+    win_rect_dmg(i);
+    taskbar_dmg();
+}
+
+fn win_minimize(i: int) {
+    wins[i].minimized = 1;
+    win_rect_dmg(i);
+    if (focus == i) { focus = top_visible(); if (focus >= 0) { win_rect_dmg(focus); } }
+    taskbar_dmg();
+}
+
+/// close button / tab right-click: apps with unsaved work may ask first
+fn win_close_req(i: int) {
+    if (wins[i].kind == APP_NOTES && !np_close_ok()) { return; }
+    win_close(i);
+}
+
+fn win_close(i: int) {
+    if (wins[i].kind == APP_TERM) { term_glass_ok = false; }
+    win_rect_dmg(i);
+    app_close(wins[i].kind);
+    wins[i].used = 0;
+    z_remove(i);
+    if (capture_win == i) { capture_win = -1; }
+    if (drag_win == i) { drag_win = -1; }
+    if (focus == i) { focus = top_visible(); if (focus >= 0) { win_rect_dmg(focus); } }
+    taskbar_dmg();
+}
+
+/// the old Appearance / Fonts / System Info apps live inside Settings now; App-run windows and the merged apps are not launcher entries
+fn app_hidden(kind: int) -> bool { return kind == APP_THEME || kind == APP_FONT || kind == APP_INFO || kind == APP_RUN; }
+/// desktop icon i -> app kind
+fn desk_kind(i: int) -> int {
+    if (i == 0) { return APP_FILES; } if (i == 1) { return APP_WEB; } if (i == 2) { return APP_TERM; }
+    if (i == 3) { return APP_NOTES; }
+    return APP_SETTINGS;
+}
+
+fn app_open(kind0: int) {
+    var kind = kind0;
+    let pg = set_page_for(kind0);
+    if (pg >= 0) { kind = APP_SETTINGS; set_page = pg; }
+    let ex = win_of_kind(kind);
+    if (ex >= 0 && pg >= 0) { ui_inval_all(APP_SETTINGS); }
+    if (ex >= 0) { raise(ex); return; }
+    var i = 0;
+    while (i < MAXWIN && wins[i].used != 0) { i++; }
+    if (i == MAXWIN) { return; }
+    var sz: int[2];
+    app_size(kind, &sz[0]);
+    wins[i].used = 1; wins[i].kind = kind; wins[i].minimized = 0;
+    wins[i].w = sz[0] + 4; wins[i].h = sz[1] + TB + 2;
+    var px0 = 70 + cascade * 28;
+    var py0 = TOPBAR_H + 14 + cascade * 26;
+    if (px0 + wins[i].w > fb_w - 8) { px0 = imax(4, fb_w - wins[i].w - 8); }
+    if (py0 + wins[i].h > fb_h - TASKBAR_H - 4) { py0 = imax(4, fb_h - TASKBAR_H - wins[i].h - 4); }
+    wins[i].x = px0; wins[i].y = py0;
+    cascade = (cascade + 1) % 5;
+    kstrncpy(&wins[i].title[0], app_name(kind), 32);
+    app_init(kind);
+    wins[i].anim = ticks + 1;
+    raise(i);
+    klog("window opened");
+}
+
+fn win_at(x: int, y: int) -> int {
+    var j = nz - 1;
+    while (j >= 0) {
+        let i = zorder[j];
+        if (wins[i].used != 0 && wins[i].minimized == 0 && x >= wins[i].x && x < wins[i].x + wins[i].w && y >= wins[i].y && y < wins[i].y + wins[i].h) { return i; }
+        j--;
+    }
+    return -1;
+}
+
+/// invalidate part of an app's client area (coordinates relative to the client's top-left)
+fn ui_inval(kind: int, rx: int, ry: int, rw: int, rh: int) {
+    var i = win_of_kind(kind);
+    var ox = 0;
+    if (i < 0 && set_wraps(kind)) { i = win_of_kind(APP_SETTINGS); ox = SET_SB; }     // hosted by the Settings window
+    if (i < 0 || wins[i].minimized != 0) { return; }
+    if (wins[i].kind == APP_TERM) { dmg_add_cur(wins[i].x + 2 + rx + ox, wins[i].y + TB + ry, rw, rh); }
+    else { dmg_add(wins[i].x + 2 + rx + ox, wins[i].y + TB + ry, rw, rh); }
+}
+fn ui_inval_all(kind: int) {
+    var i = win_of_kind(kind);
+    if (i < 0 && set_wraps(kind)) { i = win_of_kind(APP_SETTINGS); }
+    if (i < 0 || wins[i].minimized != 0) { return; }
+    if (wins[i].kind == APP_TERM) { dmg_add_cur(wins[i].x + 2, wins[i].y + TB, wins[i].w - 4, wins[i].h - TB - 2); }
+    else { dmg_add(wins[i].x + 2, wins[i].y + TB, wins[i].w - 4, wins[i].h - TB - 2); }
+}
+
+// ================================================================= drawing: windows
+fn draw_window(i: int) {
+    let x = wins[i].x; let y = wins[i].y; let w = wins[i].w; let h = wins[i].h;
+    let foc = (i == focus);
+    soft_shadow(x, y, w, h);
+    glass_grab(0, x + 1, y + 1, w - 2, TB);                                  // frosted title bar: blur what is behind it
+    let t_cheap = (wins[i].kind == APP_TERM && drag_win == i);                // while dragging, skip the blur (it is nearly hidden by the tint anyway)
+    if (t_cheap) { term_glass_ok = false; }
+    else if (wins[i].kind == APP_TERM && !(term_glass_ok && !dmg_noncur_now)) { glass_grab(1, x + 2, y + TB, w - 4, h - TB - 2); term_glass_ok = true; }
+    var edge = 0xC3CAD8;
+    if (foc) { edge = th_edge; }
+    rrect(x, y, w, h, 12, edge, C_PANEL, true);
+    // title bar: flat, light, with a thin separator
+    var tb0 = 0xFAFBFD; var tb1 = 0xEDF0F6; var ink = C_INK;
+    if (!foc) { tb0 = 0xEEF0F5; tb1 = 0xE4E7EE; ink = 0x7A8498; }
+    var ga = 214;
+    if (!foc) { ga = 196; }
+    glass_put(0, x + 1, y + 1, w - 2, TB, tb0, ga, 11, true);
+    hline(x + 1, y + TB - 1, w - 2, 0xD3D9E6);
+    // app badge + title
+    var badge = th_acc;
+    if (!foc) { badge = 0xAEB7CB; }
+    if (svg_has(wins[i].kind)) { svg_draw(wins[i].kind, x + 7, y + 5, 16, foc ? 256 : 150, false); }
+    else { disc(x + 15, y + 13, 6, badge); disc(x + 15, y + 13, 3, 0xFFFFFF); disc(x + 15, y + 13, 1, badge); }
+    draw_text(x + 29, y + 5, &wins[i].title[0], ink);
+    // window buttons: SVG glyphs (minimise, close); a soft circle appears on hover, red for close
+    let hm = (wbtn_hover == i * 4 + 1); let hc = (wbtn_hover == i * 4 + 2);
+    var gi = 0x8A94AB;
+    if (foc) { gi = 0x3A4660; }
+    if (hm) { disc(x + w - 40, y + 13, 10, 0xDDE2EE); gi = 0x1B2433; }
+    svg_tint(G_MINIMIZE, x + w - 47, y + 6, 14, gi, 256);
+    if (hc) { disc(x + w - 16, y + 13, 10, 0xE5484D); svg_tint(G_CLOSE, x + w - 23, y + 6, 14, 0xFFFFFF, 256); }
+    else { svg_tint(G_CLOSE, x + w - 23, y + 6, 14, gi, 256); }
+    // client area (square bottom corners: the apps paint to the edge)
+    if (t_cheap) { shade(x + 2, y + TB, w - 4, h - TB - 2, 0x0B1220, 224); }
+    else if (wins[i].kind == APP_TERM) { glass_put(1, x + 2, y + TB, w - 4, h - TB - 2, 0x0B1220, 224, 0, true); }
+    else { fill(x + 2, y + TB, w - 4, h - TB - 2, C_PANEL); }
+    var save: int[4];
+    clip_push(&save[0], x + 2, y + TB, x + w - 2, y + h - 2);
+    app_draw(wins[i].kind, x + 2, y + TB, w - 4, h - TB - 2, foc);
+    clip_pop(&save[0]);
+}
+
+// ================================================================= drawing: desktop icons
+/// live clock hands over the SVG face of the Clock icon (any size)
+fn clock_hands(ix: int, iy: int, size: int) {
+    var ct: int[6]; rtc_read(&ct[0]);
+    let c = size / 2;
+    let hk = (ct[3] % 12) * 5 + ct[4] / 12;
+    let lh = size * 10 / 48; let lm = size * 15 / 48; let ls = size * 17 / 48;
+    if (size >= 32) {
+        a2_line2(ix + c, iy + c, ix + c + sin60(hk) * lh / 1000, iy + c - cos60(hk) * lh / 1000, 0x1B2433);
+        a2_line2(ix + c, iy + c, ix + c + sin60(ct[4]) * lm / 1000, iy + c - cos60(ct[4]) * lm / 1000, 0x1B2433);
+    } else {
+        a2_line(ix + c, iy + c, ix + c + sin60(hk) * lh / 1000, iy + c - cos60(hk) * lh / 1000, 0x1B2433);
+        a2_line(ix + c, iy + c, ix + c + sin60(ct[4]) * lm / 1000, iy + c - cos60(ct[4]) * lm / 1000, 0x1B2433);
+    }
+    a2_line(ix + c, iy + c, ix + c + sin60(ct[5]) * ls / 1000, iy + c - cos60(ct[5]) * ls / 1000, 0xE0392B);
+    disc(ix + c, iy + c, size >= 32 ? 2 : 1, 0xE0392B);
+}
+/// today's day of the month on the Calendar icon (two SVG digits)
+fn cal_date(ix: int, iy: int) {
+    var ct: int[6]; rtc_read(&ct[0]);
+    let d = ct[2];
+    if (d >= 10) { svg_draw(32 + d / 10, ix + 2, iy + 16, 30, 256, false); svg_draw(32 + d % 10, ix + 16, iy + 16, 30, 256, false); }
+    else { svg_draw(32 + d, ix + 9, iy + 16, 30, 256, false); }
+}
+const ICON_X = 18; const ICON_Y = 46; const ICON_SP = 84; const ICON_W = 92; const ICON_H = 76; const ICON_CW = 104;
+
+/// icons per column: as many as fit above the taskbar
+fn icon_rows() -> int { return imax(1, (fb_h - TASKBAR_H - ICON_Y) / ICON_SP); }
+fn icon_rect_x(i: int) -> int { return ICON_X + (i / icon_rows()) * ICON_CW; }
+fn icon_rect_y(i: int) -> int { return ICON_Y + (i % icon_rows()) * ICON_SP; }
+fn icon_dmg(i: int) { dmg_add(icon_rect_x(i) - 2, icon_rect_y(i) - 2, ICON_W + 4, ICON_H + 4); }
+
+/// the 48x48 artwork of an app (desktop icons and the start menu)
+fn draw_app_art_px(kind: int, ix: int, iy: int) {
+    fill(ix + 2, iy + 3, 48, 48, 0x021018);
+    shade(ix + 2, iy + 3, 48, 48, 0x000000, 90);
+    if (kind == APP_TERM) {
+        fill(ix, iy, 48, 48, 0x111C2B); frame(ix, iy, 48, 48, 0x5C7BA6);
+        fill(ix, iy, 48, 8, 0x30415C);
+        draw_text_sc(ix + 6, iy + 12, ">_", 0x3CF0C8, 2);
+    } else if (kind == APP_NOTES) {
+        fill(ix, iy, 48, 48, 0xFFF9D6); frame(ix, iy, 48, 48, 0xC9A93A);
+        fill(ix, iy, 48, 9, 0xE8B923);
+        var k = 0;
+        while (k < 4) { hline(ix + 6, iy + 17 + k * 7, 36, 0x7C8DA8); k++; }
+    } else if (kind == APP_PAINT) {
+        fill(ix, iy, 48, 48, 0xF4F6FA); frame(ix, iy, 48, 48, 0x8FA2C2);
+        disc(ix + 14, iy + 15, 7, 0xE74C3C); disc(ix + 34, iy + 15, 7, 0xF1C40F);
+        disc(ix + 14, iy + 35, 7, 0x2ECC71); disc(ix + 34, iy + 35, 7, 0x3498DB);
+    } else if (kind == APP_CALC) {
+        fill(ix, iy, 48, 48, 0x2E3A52); frame(ix, iy, 48, 48, 0x8FA2C2);
+        fill(ix + 5, iy + 5, 38, 11, 0xBFE8DD);
+        var r = 0;
+        while (r < 3) { var c = 0; while (c < 4) { fill(ix + 5 + c * 10, iy + 21 + r * 9, 8, 7, 0xD7DEEA); c++; } r++; }
+    } else if (kind == APP_INFO) {
+        fill(ix, iy, 48, 48, 0x1F4FA8); frame(ix, iy, 48, 48, 0x9CC1FF);
+        disc(ix + 24, iy + 24, 17, 0x2EB6A8);
+        draw_text_sc(ix + 16, iy + 8, "i", 0xFFFFFF, 2);
+    } else if (kind == APP_FILES) {
+        fill(ix, iy, 48, 48, 0x2A3A66); frame(ix, iy, 48, 48, 0x8FA2C2);
+        fill(ix + 4, iy + 9, 20, 7, 0xD9A621);
+        fill(ix + 4, iy + 14, 40, 28, 0xE8B923);
+        fill(ix + 4, iy + 22, 40, 20, 0xF7D774);
+        hline(ix + 4, iy + 22, 40, 0xFFF1B8);
+    } else if (kind == APP_CAL) {
+        fill(ix, iy, 48, 48, 0xFFFFFF); frame(ix, iy, 48, 48, 0x8FA2C2);
+        fill(ix, iy, 48, 13, 0xC0392B);
+        fill(ix + 10, iy - 3, 4, 8, 0x1B2433); fill(ix + 34, iy - 3, 4, 8, 0x1B2433);
+        var r = 0;
+        while (r < 3) { var c = 0; while (c < 5) { fill(ix + 5 + c * 8, iy + 18 + r * 9, 5, 6, c == 3 && r == 1 ? 0xE8B923 : 0xB8C4DA); c++; } r++; }
+    } else if (kind == APP_CLOCK) {
+        // live icon: the hands follow the real time
+        var ct: int[6]; rtc_read(&ct[0]);
+        fill(ix, iy, 48, 48, 0x0F1830); frame(ix, iy, 48, 48, 0x5C7BA6);
+        disc(ix + 24, iy + 24, 22, th_acc); disc(ix + 24, iy + 24, 20, 0xF7F8FC);
+        var tk = 0;
+        while (tk < 12) {
+            a2_line(ix + 24 + sin60(tk * 5) * 15 / 1000, iy + 24 - cos60(tk * 5) * 15 / 1000, ix + 24 + sin60(tk * 5) * 18 / 1000, iy + 24 - cos60(tk * 5) * 18 / 1000, tk % 3 == 0 ? 0x1B2433 : 0x9AA3B8);
+            tk++;
+        }
+        let hk2 = (ct[3] % 12) * 5 + ct[4] / 12;
+        a2_line2(ix + 24, iy + 24, ix + 24 + sin60(hk2) * 10 / 1000, iy + 24 - cos60(hk2) * 10 / 1000, 0x1B2433);
+        a2_line2(ix + 24, iy + 24, ix + 24 + sin60(ct[4]) * 15 / 1000, iy + 24 - cos60(ct[4]) * 15 / 1000, 0x1B2433);
+        a2_line(ix + 24, iy + 24, ix + 24 + sin60(ct[5]) * 17 / 1000, iy + 24 - cos60(ct[5]) * 17 / 1000, 0xE0392B);
+        disc(ix + 24, iy + 24, 2, 0xE0392B);
+    } else if (kind == APP_SNAKE) {
+        fill(ix, iy, 48, 48, 0x0F3B2E); frame(ix, iy, 48, 48, 0x2EB6A8);
+        fill(ix + 6, iy + 8, 30, 7, 0x45C98A); fill(ix + 29, iy + 8, 7, 22, 0x45C98A);
+        fill(ix + 14, iy + 23, 22, 7, 0x45C98A); fill(ix + 14, iy + 23, 7, 17, 0x45C98A);
+        fill(ix + 12, iy + 34, 11, 6, 0xE8B923);
+        disc(ix + 40, iy + 40, 4, 0xE74C3C);
+    } else if (kind == APP_MINES) {
+        fill(ix, iy, 48, 48, 0xBFC9DC); frame(ix, iy, 48, 48, 0x6A7A9A);
+        bevel(ix + 1, iy + 1, 46, 46, 0xFFFFFF, 0x8A97AD);
+        disc(ix + 24, iy + 24, 11, 0x1B2433);
+        hline(ix + 8, iy + 24, 32, 0x1B2433); vline(ix + 24, iy + 8, 32, 0x1B2433);
+        a2_line(ix + 12, iy + 12, ix + 36, iy + 36, 0x1B2433); a2_line(ix + 36, iy + 12, ix + 12, iy + 36, 0x1B2433);
+        fill(ix + 19, iy + 19, 4, 4, 0xFFFFFF);
+    } else if (kind == APP_THEME) {
+        fill(ix, iy, 48, 48, 0x1B1B2E); frame(ix, iy, 48, 48, th_edge);
+        disc(ix + 24, iy + 24, 18, 0xF2F2F8);
+        disc(ix + 16, iy + 17, 5, 0xD6579A); disc(ix + 30, iy + 16, 5, 0x1FA8C8);
+        disc(ix + 13, iy + 29, 5, 0xE8B923); disc(ix + 25, iy + 34, 5, 0x7A5AD8); disc(ix + 35, iy + 28, 4, 0x2FA89A);
+        disc(ix + 33, iy + 37, 5, 0x1B1B2E);
+    } else if (kind == APP_BLD) {
+        fill(ix, iy, 48, 48, 0x1B2B4D); frame(ix, iy, 48, 48, 0x5C9BDB);
+        rrect(ix + 5, iy + 6, 38, 30, 4, 0x8A97AD, 0xF6F8FB, false);
+        rfill(ix + 9, iy + 11, 14, 6, 2, 0x1F6FEB, false); rfill(ix + 9, iy + 21, 22, 5, 2, 0xE8B923, false);
+        rfill(ix + 26, iy + 11, 12, 6, 2, 0x27AE60, false);
+        fill(ix + 5, iy + 39, 38, 3, 0x5C9BDB); disc(ix + 34, iy + 38, 5, 0xEC5F57);
+    } else if (kind == APP_WEB) {
+        fill(ix, iy, 48, 48, 0x0B2A5C); frame(ix, iy, 48, 48, 0x5C9BDB);
+        disc(ix + 24, iy + 24, 20, 0x2E86DE); disc(ix + 24, iy + 24, 17, 0x1B6FB0);
+        fill(ix + 8, iy + 14, 12, 8, 0x45C98A); fill(ix + 20, iy + 26, 14, 10, 0x45C98A); fill(ix + 30, iy + 14, 8, 6, 0x45C98A);
+        vline(ix + 24, iy + 4, 40, 0xBFE0FF); hline(ix + 4, iy + 24, 40, 0xBFE0FF);
+        disc(ix + 24, iy + 24, 9, 0x1B6FB0); frame(ix + 15, iy + 4, 18, 40, 0xBFE0FF);
+    } else {
+        fill(ix, iy, 48, 48, 0x111C2B); frame(ix, iy, 48, 48, 0x5C7BA6);
+        fill(ix + 6, iy + 28, 7, 14, 0x2EB6A8); fill(ix + 16, iy + 18, 7, 24, 0x3E7BD6);
+        fill(ix + 26, iy + 24, 7, 18, 0xE8B923); fill(ix + 36, iy + 10, 7, 32, 0x45C98A);
+        hline(ix + 4, iy + 43, 40, 0x5C7BA6);
+    }
+}
+
+/// app artwork: the SVG icon (with a soft shadow), plus live details for Clock and Calendar; old pixel art when there is no SVG
+fn draw_app_art(kind: int, ix: int, iy: int) {
+    if (!svg_has(kind)) { draw_app_art_px(kind, ix, iy); return; }
+    svg_draw(kind, ix + 1, iy + 3, 48, 70, true);
+    svg_draw(kind, ix, iy, 48, 256, false);
+    if (kind == APP_CLOCK) { clock_hands(ix, iy, 48); }
+    if (kind == APP_CAL) { cal_date(ix, iy); }
+}
+fn draw_icon(i: int) {
+    let kind = desk_kind(i);
+    let x = icon_rect_x(i); let y = icon_rect_y(i);
+    if (icon_sel == i) { shade(x, y, ICON_W, ICON_H, th_edge, 70); frame(x, y, ICON_W, ICON_H, th_edge); }
+    draw_app_art(kind, x + (ICON_W - 48) / 2, y + 6);
+    let nm = app_name(kind);
+    let tw = text_w(nm);
+    draw_text_sh(x + (ICON_W - tw) / 2, y + 58, nm, 0xFFFFFF, 0x02121C);
+}
+
+fn icon_at(x: int, y: int) -> int {
+    var i = 0;
+    while (i < NDESK) {
+        let iy = icon_rect_y(i); let ix = icon_rect_x(i);
+        if (x >= ix && x < ix + ICON_W && y >= iy && y < iy + ICON_H) { return i; }
+        i++;
+    }
+    return -1;
+}
+
+// ================================================================= drawing: taskbar and start menu
+const START_W = 46;
+const MENU_W = 428; const SM_PAD = 14; const SM_COLS = 4; const SM_CW = 100; const SM_CH = 72; const SM_GRID = 74; const SM_FOOT = 56;
+
+fn menu_h() -> int { return SM_GRID + ((NMENU + SM_COLS - 1) / SM_COLS) * SM_CH + 8 + SM_FOOT; }
+fn menu_x() -> int { return imax(4, (fb_w - MENU_W) / 2); }
+fn menu_y() -> int { return fb_h - TASKBAR_H - menu_h(); }
+
+// ---- the floating dock: a centred glass pill with the launcher button, five pinned apps, the other open windows and a "+"
+const NPIN = 5; const DOCK_ITEM = 46;
+var tab_hover = -1;
+fn dock_pin(i: int) -> int {
+    if (i == 0) { return APP_WEB; } if (i == 1) { return APP_FILES; } if (i == 2) { return APP_TERM; }
+    if (i == 3) { return APP_NOTES; }
+    return APP_SETTINGS;
+}
+fn is_pinned(kind: int) -> bool { var i = 0; while (i < NPIN) { if (dock_pin(i) == kind) { return true; } i++; } return false; }
+/// number of dock items: the pinned apps, then one per open window of any other app (in the order they were opened)
+fn dock_n() -> int {
+    var n = NPIN; var i = 0;
+    while (i < MAXWIN) { if (wins[i].used != 0 && !is_pinned(wins[i].kind)) { n++; } i++; }
+    return n;
+}
+/// window of dock item k (-1 = the app is not running)
+fn dock_win(k: int) -> int {
+    if (k < NPIN) { return win_of_kind(dock_pin(k)); }
+    var c = NPIN; var i = 0;
+    while (i < MAXWIN) {
+        if (wins[i].used != 0 && !is_pinned(wins[i].kind)) { if (c == k) { return i; } c++; }
+        i++;
+    }
+    return -1;
+}
+fn dock_kind(k: int) -> int {
+    if (k < NPIN) { return dock_pin(k); }
+    let w = dock_win(k);
+    if (w < 0) { return 0; }
+    return wins[w].kind;
+}
+fn dock_w() -> int { return 8 + START_W + 14 + dock_n() * DOCK_ITEM + 38 + 8; }
+fn dock_x() -> int { return imax(4, (fb_w - dock_w()) / 2); }
+fn dock_y() -> int { return fb_h - DOCK_H - 10; }
+fn tab_x(j: int) -> int { return dock_x() + 8 + START_W + 14 + j * DOCK_ITEM; }
+fn plus_x() -> int { return tab_x(dock_n()); }
+fn in_dock(x: int, y: int) -> bool { return x >= dock_x() && x < dock_x() + dock_w() && y >= dock_y() && y < dock_y() + DOCK_H; }
+fn app_color(kind: int) -> int {
+    if (kind == APP_TERM) { return 0x2D3A55; }
+    if (kind == APP_NOTES) { return 0xE8B923; }
+    if (kind == APP_PAINT) { return 0xE74C3C; }
+    if (kind == APP_CALC) { return 0x27AE60; }
+    if (kind == APP_INFO) { return 0x1F6FEB; }
+    if (kind == APP_FILES) { return 0xF39C12; }
+    if (kind == APP_CAL) { return 0xC0392B; }
+    if (kind == APP_CLOCK) { return 0x16A6A0; }
+    if (kind == APP_SNAKE) { return 0x2E9E6A; }
+    if (kind == APP_MINES) { return 0x6A7A9A; }
+    if (kind == APP_MON) { return 0x3E7BD6; }
+    if (kind == APP_WEB) { return 0x2E86DE; }
+    if (kind == APP_BLD) { return 0x8E44AD; }
+    if (kind == APP_THEME) { return 0xD6579A; }
+    if (kind == APP_FONT) { return 0x14A89A; }
+    if (kind == APP_3D) { return 0x6C4DE0; }
+    if (kind == APP_SETTINGS) { return 0x1A5E8C; }
+    return 0x5C7BA6;
+}
+
+
+// ---------------------------------------------------------------- the Start button's peacock (peacockicon.kc, 48x48 RGBA)
+var pk_px: *u32;
+fn pk_init() -> bool {
+    if (pk_px != (0 as *u32)) { return true; }
+    pk_px = kmalloc(PK_N * PK_N * 4) as *u32;
+    if (pk_px == (0 as *u32)) { return false; }
+    var i = 0;
+    while (i < PK_N * PK_N) {
+        var v = 0; var k = 0;
+        let at = i * 8;
+        let h = pk_piece(at / PK_CHUNK);
+        while (k < 8) { v = (v << 4) | khexval(h[(at % PK_CHUNK) + k] as int); k++; }
+        pk_px[i] = v as u32;                                   // 0xRRGGBBAA
+        i++;
+    }
+    return true;
+}
+/// draw the peacock `size` pixels square at (x, y): area-averaged scaling with alpha, blended over the back buffer
+fn pk_draw(x: int, y: int, size: int) {
+    if (!pk_init()) { return; }
+    var dy = 0;
+    while (dy < size) {
+        var dx = 0;
+        let sy0 = dy * PK_N / size; let sy1 = imax(sy0 + 1, (dy + 1) * PK_N / size);
+        while (dx < size) {
+            let X = x + dx; let Y = y + dy;
+            if (X >= clip_x0 && X < clip_x1 && Y >= clip_y0 && Y < clip_y1) {
+                let sx0 = dx * PK_N / size; let sx1 = imax(sx0 + 1, (dx + 1) * PK_N / size);
+                var sr = 0; var sg = 0; var sb = 0; var sa = 0; var cnt = 0;
+                var sy = sy0;
+                while (sy < sy1) {
+                    var sx = sx0;
+                    while (sx < sx1) {
+                        let v = pk_px[sy * PK_N + sx] as int;
+                        let a = v & 255;
+                        sr = sr + ((v >> 24) & 255) * a; sg = sg + ((v >> 16) & 255) * a; sb = sb + ((v >> 8) & 255) * a; sa = sa + a; cnt++;
+                        sx++;
+                    }
+                    sy++;
+                }
+                if (sa > 0) {
+                    let col = ((sr / sa) << 16) | ((sg / sa) << 8) | (sb / sa);
+                    let al = (sa * 256) / (cnt * 255);
+                    if (al >= 250) { bb[Y * fb_w + X] = p64(col) as u64; }
+                    else { bb[Y * fb_w + X] = mixp(bb[Y * fb_w + X] as int, col, al) as u64; }
+                }
+            }
+            dx++;
+        }
+        dy++;
+    }
+}
+
+fn draw_dock() {
+    let dx = dock_x(); let dy = dock_y(); let dw = dock_w();
+    glass_grab(0, dx + 1, dy + 1, dw - 2, DOCK_H - 2);
+    soft_shadow(dx, dy, dw, DOCK_H);
+    rfill(dx, dy, dw, DOCK_H, 17, th_line, false);
+    glass_put(0, dx + 1, dy + 1, dw - 2, DOCK_H - 2, th_tint, 208, 16, false);
+    // launcher button
+    let sx = dx + 8;
+    if (menu_open) { rfill(sx, dy + 5, START_W, DOCK_H - 10, 13, th_acc_dk, false); }
+    else if (tab_hover == -3) { rfill(sx, dy + 5, START_W, DOCK_H - 10, 13, th_tabh, false); }
+    else { rfill(sx, dy + 5, START_W, DOCK_H - 10, 13, mix(th_tint, 0xFFFFFF, 16), false); }
+    pk_draw(sx + (START_W - 32) / 2, dy + (DOCK_H - 32) / 2, 32);
+    vline(sx + START_W + 6, dy + 12, DOCK_H - 24, th_line);
+    // apps: icon (lifts and grows under the pointer), an accent bar under the focused one, a dot under the other running ones
+    let n = dock_n();
+    var k = 0;
+    while (k < n) {
+        let kind = dock_kind(k); let w = dock_win(k);
+        let ix = tab_x(k);
+        let hov = (k == tab_hover);
+        let open = (w >= 0);
+        let act = (open && w == focus && wins[w].minimized == 0);
+        let dim = (open && wins[w].minimized != 0);
+        if (act) { rfill(ix + 2, dy + 5, DOCK_ITEM - 4, DOCK_H - 10, 12, th_taba, false); }
+        else if (hov) { rfill(ix + 2, dy + 5, DOCK_ITEM - 4, DOCK_H - 10, 12, th_tabh, false); }
+        var sz = 24;
+        if (hov) { sz = 30; }
+        let icx = ix + (DOCK_ITEM - sz) / 2;
+        var icy = dy + 22 - sz / 2;
+        if (hov) { icy = icy - 2; }
+        if (svg_has(kind)) { svg_draw(kind, icx, icy, sz, dim ? 120 : 256, false); }
+        else { let bc = app_color(kind); rfill(icx, icy, sz, sz, 6, bc, false); draw_char(icx + sz / 2 - 4, icy + sz / 2 - 8, app_name(kind)[0] as int, contrast(bc)); }
+        if (act) { rfill(ix + 15, dy + DOCK_H - 8, 16, 3, 1, th_edge, false); }
+        else if (open) { rfill(ix + 20, dy + DOCK_H - 8, 6, 3, 1, 0x8E98B5, false); }
+        k++;
+    }
+    // "+" opens the launcher too
+    let px = plus_x();
+    if (tab_hover == -2) { rfill(px + 2, dy + 5, 34, DOCK_H - 10, 12, th_tabh, false); }
+    svg_tint(G_PLUS, px + 10, dy + 14, 18, 0xC8D0E4, 256);
+    // tooltip with the app name above the hovered item
+    if (tab_hover >= 0 && tab_hover < n) {
+        let tn = app_name(dock_kind(tab_hover));
+        let tw = text_w(tn) + 22;
+        var tx = tab_x(tab_hover) + DOCK_ITEM / 2 - tw / 2;
+        tx = imax(4, imin(tx, fb_w - tw - 4));
+        let ty = dy - 34;
+        soft_shadow(tx, ty, tw, 26);
+        rfill(tx, ty, tw, 26, 10, th_line, false);
+        rfill(tx + 1, ty + 1, tw - 2, 24, 9, th_menu, false);
+        draw_text(tx + 11, ty + 5, tn, 0xE6ECF8);
+    }
+}
+
+/// dock item under (x, y): index >= 0, -2 the "+", -3 the launcher button, -1 none
+fn win_button_at(x: int, y: int) -> int {
+    if (!in_dock(x, y)) { return -1; }
+    if (x >= dock_x() + 8 && x < dock_x() + 8 + START_W) { return -3; }
+    let n = dock_n();
+    var j = 0;
+    while (j < n) { if (x >= tab_x(j) && x < tab_x(j) + DOCK_ITEM) { return j; } j++; }
+    if (x >= plus_x() && x < plus_x() + 38) { return -2; }
+    return -1;
+}
+
+// ================================================================= the scene
+fn draw_scene() {
+    draw_wall();
+    var i = 0;
+    while (i < NDESK) { draw_icon(i); i++; }
+    var j = 0;
+    while (j < nz) {
+        let w = zorder[j];
+        if (wins[w].used != 0 && wins[w].minimized == 0) {
+            if (fade_active(w)) { fade_begin(w); draw_window(w); fade_end(w); }
+            else { draw_window(w); }
+        }
+        j++;
+    }
+    draw_topbar();
+    draw_dock();
+    if (menu_open) { draw_menu(); }
+    if (ctx_open) { draw_ctx(); }
+    draw_toast();
+    draw_cursor(cur_x, cur_y, cur_kind);
+}
+
+/// frosted elements are blurred from what lies behind them, so any damage touching one must repaint all of it
+var term_glass_ok = false;           // slot 1 holds the Terminal's blurred backdrop from an earlier full draw
+var dmg_noncur_now = true;           // the frame being drawn has damage other than the cursor
+fn glass_grow_damage() {
+    if (!dmg_on) { return; }
+    dmg_noncur_now = dmg_noncur;
+    let nc = dmg_noncur;
+    var pass = 0;
+    while (pass < 3) {
+        if (rect_hit(0, 0, fb_w, TOPBAR_H)) { dmg_add(0, 0, fb_w, TOPBAR_H); }
+        if (rect_hit(dock_x() - 8, dock_y() - 8, dock_w() + 16, DOCK_H + 16)) { dmg_add(dock_x() - 8, dock_y() - 8, dock_w() + 16, DOCK_H + 16); }
+        if (menu_open && rect_hit(menu_x() - 8, menu_y() - 8, MENU_W + 16, menu_h() + 16)) { dmg_add(menu_x() - 8, menu_y() - 8, MENU_W + 16, menu_h() + 16); }
+        if (ctx_open && rect_hit(ctx_x - 8, ctx_y - 8, CTX_W + 16, ctx_h() + 16)) { ctx_dmg(); }
+        if (toast_active() && rect_hit(fb_w - toast_w() - 40, TOPBAR_H, toast_w() + 40, 78)) { toast_dmg(); }
+        var j = 0;
+        while (j < nz) {
+            let w = zorder[j];
+            if (wins[w].used != 0 && wins[w].minimized == 0) {
+                if (rect_hit(wins[w].x, wins[w].y, wins[w].w, TB)) { dmg_add(wins[w].x, wins[w].y, wins[w].w, TB); }
+                if (wins[w].kind == APP_TERM && (nc || !term_glass_ok) && rect_hit(wins[w].x, wins[w].y, wins[w].w, wins[w].h)) { dmg_add(wins[w].x - 6, wins[w].y - 4, wins[w].w + 12, wins[w].h + 12); }
+            }
+            j++;
+        }
+        pass++;
+    }
+}
+
+fn repaint() {
+    if (!dmg_on) { return; }
+    glass_grow_damage();
+    clip_set(dmg_x0, dmg_y0, dmg_x1, dmg_y1);
+    draw_scene();
+    clip_reset();
+    present();
+}
+
+// ================================================================= clock
+fn fmt2(v: int, out: *u8) { out[0] = ('0' + (v / 10) % 10) as u8; out[1] = ('0' + v % 10) as u8; }
+
+fn update_clock() {
+    var t: int[6];
+    rtc_read(&t[0]);
+    fmt2(t[3], &clock_txt[0]); clock_txt[2] = ':';
+    fmt2(t[4], &clock_txt[3]); clock_txt[5] = ':';
+    fmt2(t[5], &clock_txt[6]); clock_txt[8] = 0;
+    update_date(t[0], t[1], t[2]);
+}
+
+// ================================================================= input handling
+fn handle_press(x: int, y: int) {
+    if (ctx_open) {
+        let ci = ctx_item_at(x, y);
+        ctx_hide();
+        if (ci >= 0) { ctx_action(ci); }
+        return;
+    }
+    if (menu_open) {
+        let it = menu_item_at(x, y);
+        let inside = (x >= menu_x() && x < menu_x() + MENU_W && y >= menu_y() && y < menu_y() + menu_h());
+        if (inside && it == -1) { return; }                      // search box, gaps: keep the menu open
+        menu_hide();
+        if (it != -1) { menu_action(it); }
+        else if (y < TOPBAR_H || in_dock(x, y)) { handle_press(x, y); }
+        return;
+    }
+    if (y < TOPBAR_H) {
+        let t = topbar_hit(x);
+        if (t == 1) { menu_show(); }
+        else if (t == 2) { set_open(SP_NET); }
+        else if (t == 3) { app_open(APP_CAL); }
+        else if (t == 4) { app_open(APP_CLOCK); }
+        return;
+    }
+    if (in_dock(x, y)) {
+        let b = win_button_at(x, y);
+        if (b == -2 || b == -3) { menu_show(); return; }
+        if (b >= 0) {
+            let w = dock_win(b);
+            if (w < 0) { app_open(dock_kind(b)); }
+            else if (wins[w].minimized != 0 || w != focus) { raise(w); }
+            else { win_minimize(w); }
+        }
+        return;
+    }
+    let hit = win_at(x, y);
+    if (hit >= 0) {
+        raise(hit);
+        let wx = wins[hit].x; let wy = wins[hit].y; let ww = wins[hit].w;
+        if (y < wy + TB) {
+            if (x >= wx + ww - 26 && x < wx + ww - 6 && y >= wy + 4 && y < wy + 22) { win_close_req(hit); return; }
+            if (x >= wx + ww - 50 && x < wx + ww - 30 && y >= wy + 4 && y < wy + 22) { win_minimize(hit); return; }
+            drag_win = hit; drag_dx = x - wx; drag_dy = y - wy;
+            return;
+        }
+        capture_win = hit;
+        app_mouse(wins[hit].kind, x - wx - 2, y - wy - TB, 1, wins[hit].w - 4, wins[hit].h - TB - 2);
+        return;
+    }
+    // desktop
+    let ic = icon_at(x, y);
+    if (focus >= 0) { win_rect_dmg(focus); focus = -1; taskbar_dmg(); }
+    if (ic >= 0) {
+        if (ic == last_click_icon && ticks - last_click_tick < 50) { app_open(desk_kind(ic)); last_click_icon = -1; }
+        else { last_click_icon = ic; last_click_tick = ticks; }
+    } else { last_click_icon = -1; }
+    if (icon_sel != ic) {
+        if (icon_sel >= 0) { icon_dmg(icon_sel); }
+        icon_sel = ic;
+        if (ic >= 0) { icon_dmg(ic); }
+    }
+}
+
+/// right button pressed: apps get ev = 4 (title bar, taskbar and desktop ignore it)
+fn handle_rpress(x: int, y: int) {
+    if (!menu_open && (in_dock(x, y) || y < TOPBAR_H)) {      // right-click a dock item: close its window
+        let b = win_button_at(x, y);
+        if (b >= 0) { let w = dock_win(b); if (w >= 0) { win_close_req(w); } }
+        return;
+    }
+    if (menu_open) { return; }
+    if (ctx_open) { ctx_hide(); }
+    let hit = win_at(x, y);
+    if (hit < 0) {
+        if (y >= TOPBAR_H && !in_dock(x, y)) { ctx_show(x, y); }
+        return;
+    }
+    raise(hit);
+    let wx = wins[hit].x; let wy = wins[hit].y;
+    if (y >= wy + TB) { app_mouse(wins[hit].kind, x - wx - 2, y - wy - TB, 4, wins[hit].w - 4, wins[hit].h - TB - 2); }
+}
+
+/// which pointer to show at (x, y): arrow, hand over things that can be clicked, text beam over text areas
+fn cursor_kind_at(x: int, y: int) -> int {
+    if (ctx_open && x >= ctx_x && x < ctx_x + CTX_W && y >= ctx_y && y < ctx_y + ctx_h()) {
+        if (ctx_item_at(x, y) >= 0) { return CUR_HAND; }
+        return CUR_ARROW;
+    }
+    if (menu_open && x >= menu_x() && x < menu_x() + MENU_W && y >= menu_y() && y < menu_y() + menu_h()) {
+        if (menu_item_at(x, y) != -1) { return CUR_HAND; }
+        if (y < menu_y() + 50) { return CUR_BEAM; }
+        return CUR_ARROW;
+    }
+    if (in_dock(x, y) && win_button_at(x, y) != -1) { return CUR_HAND; }
+    if (y < TOPBAR_H) { if (topbar_hit(x) != 0) { return CUR_HAND; } return CUR_ARROW; }
+    let hit = win_at(x, y);
+    if (hit < 0) { if (icon_at(x, y) >= 0) { return CUR_HAND; } return CUR_ARROW; }
+    let wx = wins[hit].x; let wy = wins[hit].y;
+    if (y < wy + TB) { if (x >= wx + wins[hit].w - 52 && y >= wy + 4 && y < wy + 22) { return CUR_HAND; } return CUR_ARROW; }
+    let kind = wins[hit].kind;
+    let mx = x - wx - 2; let my = y - wy - TB;
+    if (kind == APP_NOTES || kind == APP_TERM) { return CUR_BEAM; }
+    if (kind == APP_RUN) {
+        let wi = wd_hit(rwd, rn, mx, my, true);
+        if (wi >= 0) { if (rwd[wi].kind == WK_TEXT) { return CUR_BEAM; } if (rwd[wi].kind == WK_BUTTON || rwd[wi].kind == WK_CHECK) { return CUR_HAND; } }
+    }
+    if (kind == APP_WEB) {
+        let wc = web_cursor(mx, my);
+        if (wc == 1) { return CUR_HAND; }
+        if (wc == 2) { return CUR_BEAM; }
+    }
+    return CUR_ARROW;
+}
+
+fn handle_mouse(x: int, y: int, btn: int) {
+    if (x != cur_x || y != cur_y) {
+        dmg_add_cur(cur_x - 14, cur_y - 14, 36, 40);
+        cur_x = x; cur_y = y;
+        dmg_add_cur(cur_x - 14, cur_y - 14, 36, 40);
+        cur_kind = cursor_kind_at(x, y);
+        var th = -1;
+        if (in_dock(x, y) && !menu_open) { th = win_button_at(x, y); }
+        if (th != tab_hover) { tab_hover = th; taskbar_dmg(); }
+        else if (th >= 0) { taskbar_dmg(); }
+        var wh = -1;
+        if (!menu_open && !ctx_open) { wh = wbtn_at(x, y); }
+        if (wh != wbtn_hover) {
+            if (wbtn_hover >= 0) { dmg_add(wins[wbtn_hover / 4].x, wins[wbtn_hover / 4].y, wins[wbtn_hover / 4].w, TB); }
+            wbtn_hover = wh;
+            if (wh >= 0) { dmg_add(wins[wh / 4].x, wins[wh / 4].y, wins[wh / 4].w, TB); }
+        }
+    }
+    let left = btn & 1;
+    let was = last_btn & 1;
+    let right = btn & 2;
+    let wasr = last_btn & 2;
+    last_btn = btn;
+    if (right != 0 && wasr == 0 && drag_win < 0 && capture_win < 0) { handle_rpress(x, y); }
+    if (drag_win >= 0) {
+        if (left != 0) {
+            var nx = x - drag_dx;
+            var ny = y - drag_dy;
+            if (ny < TOPBAR_H) { ny = TOPBAR_H; }
+            if (ny > fb_h - TASKBAR_H - TB) { ny = fb_h - TASKBAR_H - TB; }
+            if (nx < 0 - wins[drag_win].w + 60) { nx = 0 - wins[drag_win].w + 60; }
+            if (nx > fb_w - 60) { nx = fb_w - 60; }
+            if (nx != wins[drag_win].x || ny != wins[drag_win].y) {
+                win_rect_dmg(drag_win);
+                wins[drag_win].x = nx; wins[drag_win].y = ny;
+                win_rect_dmg(drag_win);
+            }
+        } else { drag_win = -1; }
+        return;
+    }
+    if (capture_win >= 0) {
+        let w = capture_win;
+        if (wins[w].used != 0) {
+            if (left != 0) { app_mouse(wins[w].kind, x - wins[w].x - 2, y - wins[w].y - TB, 2, wins[w].w - 4, wins[w].h - TB - 2); }
+            else { app_mouse(wins[w].kind, x - wins[w].x - 2, y - wins[w].y - TB, 3, wins[w].w - 4, wins[w].h - TB - 2); capture_win = -1; }
+        } else { capture_win = -1; }
+        return;
+    }
+    if (left != 0 && was == 0) { handle_press(x, y); return; }
+    if (menu_open) {
+        let it = menu_item_at(x, y);
+        if (it != menu_hover && (it != -1 || menu_hover == -3 || menu_hover == -4 || (x >= menu_x() && x < menu_x() + MENU_W))) { menu_hover = it; menu_dmg(); }
+    }
+    if (ctx_open) {
+        let ci = ctx_item_at(x, y);
+        if (ci != ctx_hover) { ctx_hover = ci; ctx_dmg(); }
+    }
+    if (left == 0 && !menu_open && !ctx_open) {                      // hover over the browser: link addresses in the status bar
+        let hw = win_at(x, y);
+        if (hw >= 0 && wins[hw].kind == APP_WEB && y >= wins[hw].y + TB) { app_mouse(APP_WEB, x - wins[hw].x - 2, y - wins[hw].y - TB, 5, wins[hw].w - 4, wins[hw].h - TB - 2); }
+    }
+}
+
+/// window-control hover code under (x, y): window*4 + 1 minimise, +2 close, -1 none
+fn wbtn_at(x: int, y: int) -> int {
+    let hit = win_at(x, y);
+    if (hit < 0) { return -1; }
+    let wx = wins[hit].x; let wy = wins[hit].y; let ww = wins[hit].w;
+    if (y < wy + 4 || y >= wy + 22) { return -1; }
+    if (x >= wx + ww - 26 && x < wx + ww - 6) { return hit * 4 + 2; }
+    if (x >= wx + ww - 50 && x < wx + ww - 30) { return hit * 4 + 1; }
+    return -1;
+}
+
+fn handle_key(k: int) {
+    if (ctx_open) { ctx_hide(); if (k == 27) { return; } }
+    if (menu_open) { menu_key(k); return; }
+    if (focus >= 0 && wins[focus].used != 0) { app_key(wins[focus].kind, k); }
+}
+
+// ================================================================= frame loop
+fn ui_init() {
+    cur_x = fb_w / 2; cur_y = fb_h / 2;
+    var i = 0;
+    while (i < MAXWIN) { wins[i].used = 0; wins[i].anim = 0; i++; }
+    nz = 0; focus = -1;
+    update_clock();
+    theme_wall();
+    dmg_add(0, 0, fb_w, fb_h);
+    ui_ready = true;
+}
+
+/// one pass: input, timers, repaint.  Call this in a loop (the kernel sleeps with hlt between passes).
+fn ui_frame() {
+    var k = kb_get();
+    while (k >= 0) { handle_key(k); k = kb_get(); }
+    var ev: int[3];
+    while (mouse_pop(&ev[0])) { handle_mouse(ev[0], ev[1], ev[2]); }
+    if (mouse_wheel != 0) {
+        let ww = win_at(mouse_x, mouse_y);
+        if (ww >= 0 && wins[ww].kind == APP_NOTES && !menu_open) { app_mouse(APP_NOTES, mouse_x - wins[ww].x - 2, mouse_y - wins[ww].y - TB, 6, wins[ww].w - 4, wins[ww].h - TB - 2); }
+        mouse_wheel = 0;
+    }
+    net_poll();
+    let sec = ticks / 100;
+    if (sec != last_sec) {
+        last_sec = sec; update_clock(); clock_poll();
+        topbar_dmg();
+        if (menu_open) { menu_dmg(); }
+    }
+    clock_sound();
+    if (toast_active()) { toast_dmg(); }
+    if (menu_open && (ticks / 50) != last_caret) { last_caret = ticks / 50; menu_dmg(); }
+    var w = 0;
+    while (w < MAXWIN) {
+        if (wins[w].used != 0 && wins[w].anim > 0) {
+            win_rect_dmg(w);
+            if (ticks - wins[w].anim >= FADE_T) { wins[w].anim = 0; }
+        }
+        if (wins[w].used != 0 && app_tick(wins[w].kind)) { ui_inval_all(wins[w].kind); }
+        w++;
+    }
+    repaint();
+    frames++;
+    thr_yield();                                                 // let the worker threads run (autosave, ...)
+}

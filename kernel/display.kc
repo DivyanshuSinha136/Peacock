@@ -1,0 +1,129 @@
+// display.kc -- runtime screen-resolution switching through the Bochs/QEMU VBE "DISPI" registers (no BIOS needed).
+// Author: Divyanshu Sinha (MIT License)
+//
+// QEMU `-vga std` (and Bochs / VirtualBox VBoxVGA) expose index port 0x1CE / data port 0x1CF.  The boot stage picks the best
+// mode the firmware lists; after boot the Appearance app can change it live.  Real hardware without DISPI keeps the boot mode.
+
+const DISPI_IDX = 0x1CE; const DISPI_DAT = 0x1CF;
+const DI_ID = 0; const DI_XRES = 1; const DI_YRES = 2; const DI_BPP = 3; const DI_ENABLE = 4; const DI_VIRTW = 6; const DI_VRAM64 = 0xA;
+const DISP_N = 5;
+
+var disp_known = false;
+var disp_has = false;
+var disp_vram = 0;
+
+// dispi_w / dispi_r (the two port accesses) live in hw.kc; the host test harness stubs them in hal_host.kc
+
+/// true when a Bochs-style display adapter is present
+fn disp_probe() -> bool {
+    if (disp_known) { return disp_has; }
+    disp_known = true;
+    let id = dispi_r(DI_ID);
+    disp_has = id >= 0xB0C0 && id <= 0xB0CF;
+    if (disp_has) {
+        disp_vram = dispi_r(DI_VRAM64) * 65536;
+        if (disp_vram == 0) { disp_vram = 16 * 1048576; }
+    }
+    return disp_has;
+}
+
+fn disp_w(n: int) -> int {
+    if (n == 0) { return 1024; } if (n == 1) { return 1280; } if (n == 2) { return 1600; } if (n == 3) { return 1920; }
+    return 2560;
+}
+fn disp_h(n: int) -> int {
+    if (n == 0) { return 768; } if (n == 1) { return 800; } if (n == 2) { return 900; } if (n == 3) { return 1080; }
+    return 1440;
+}
+/// the 64-bit back buffer (8 bytes / pixel) and the wallpaper (4) of the new size must fit next to the ones in use
+fn disp_heap_ok(w: int, h: int) -> bool { var st: int[4]; heap_stats(&st[0]); return st[1] >= w * h * 12 + 1048576; }
+fn disp_fits(w: int, h: int) -> bool { return w >= 640 && h >= 480 && w <= 4096 && h <= 2400 && w * h * 4 <= disp_vram && disp_heap_ok(w, h); }
+fn disp_cur() -> int {
+    var n = 0;
+    while (n < DISP_N) { if (disp_w(n) == fb_w && disp_h(n) == fb_h) { return n; } n++; }
+    return -1;
+}
+
+fn disp_save() {
+    var b: u8[16];
+    var len = 0;
+    var tmp: u8[8];
+    var v = fb_w; var k = 0;
+    while (v > 0) { tmp[k] = (48 + v % 10) as u8; v = v / 10; k++; }
+    while (k > 0) { k--; b[len] = tmp[k]; len++; }
+    b[len] = 'x'; len++;
+    v = fb_h; k = 0;
+    while (v > 0) { tmp[k] = (48 + v % 10) as u8; v = v / 10; k++; }
+    while (k > 0) { k--; b[len] = tmp[k]; len++; }
+    b[len] = 10; len++;
+    var n = fs_resolve("/etc/display");
+    if (n < 0) { n = fs_create("/etc/display", K_FILE); }
+    if (n >= 0) { fs_write(n, &b[0], len, false); }
+    fs_save();
+}
+
+/// switch the screen to w x h (32 bpp); false and nothing changed when unsupported or out of memory
+fn disp_set(w: int, h: int) -> bool {
+    if (!disp_probe() || !disp_fits(w, h)) { return false; }
+    if (w == fb_w && h == fb_h && fb_bpp == 32) { return true; }
+    let nbb = kmalloc(w * h * 8) as *u64;
+    let nwall = kmalloc(w * h * 4) as *u32;
+    if (nbb == (0 as *u64) || nwall == (0 as *u32)) {
+        if (nbb != (0 as *u64)) { kfree(nbb as *u8); }
+        if (nwall != (0 as *u32)) { kfree(nwall as *u8); }
+        return false;
+    }
+    let ow = fb_w; let oh = fb_h;
+    dispi_w(DI_ENABLE, 0);
+    dispi_w(DI_XRES, w); dispi_w(DI_YRES, h); dispi_w(DI_BPP, 32); dispi_w(DI_VIRTW, w);
+    dispi_w(DI_ENABLE, 0x41);
+    if (dispi_r(DI_XRES) != w || dispi_r(DI_YRES) != h) {          // the adapter refused: go back
+        dispi_w(DI_ENABLE, 0);
+        dispi_w(DI_XRES, ow); dispi_w(DI_YRES, oh); dispi_w(DI_BPP, 32); dispi_w(DI_VIRTW, ow);
+        dispi_w(DI_ENABLE, 0x41);
+        kfree(nbb as *u8); kfree(nwall as *u8);
+        return false;
+    }
+    let obb = bb; let owall = wall;
+    bb = nbb; wall = nwall;
+    fb_w = w; fb_h = h; fb_pitch = w * 4; fb_bpp = 32;
+    kfree(obb as *u8); kfree(owall as *u8);
+    fade_buf = 0 as *u64;
+    clip_reset();
+    mouse_set_bounds(w, h);
+    var i = 0;
+    while (i < MAXWIN) {
+        if (wins[i].used != 0) {
+            if (wins[i].x + wins[i].w > w) { wins[i].x = imax(0, w - wins[i].w); }
+            if (wins[i].y < TOPBAR_H) { wins[i].y = TOPBAR_H; }
+            if (wins[i].y + wins[i].h > h - TASKBAR_H) { wins[i].y = imax(0, h - TASKBAR_H - wins[i].h); }
+        }
+        i++;
+    }
+    theme_wall();
+    dmg_add(0, 0, fb_w, fb_h);
+    ser_puts("[peacock] display "); ser_putdec(w); ser_puts("x"); ser_putdec(h); ser_puts("\n");
+    return true;
+}
+
+/// restore the saved resolution at boot (only meaningful with a Bochs-style adapter)
+fn disp_load_pref() {
+    if (!disp_probe()) { return; }
+    let n = fs_resolve("/etc/display");
+    if (n < 0 || fs_nodes[n].size < 3) {                 // nothing saved: move up to full HD when the card has the memory for it and the boot mode is smaller
+        if (fb_w < 1920 && disp_fits(1920, 1080)) { disp_set(1920, 1080); }
+        return;
+    }
+    var w = 0; var h = 0; var i = 0;
+    let d = fs_nodes[n].data;
+    while (i < fs_nodes[n].size && d[i] >= '0' && d[i] <= '9') { w = w * 10 + (d[i] as int) - 48; i++; }
+    if (i >= fs_nodes[n].size || d[i] != 'x') { return; }
+    i++;
+    while (i < fs_nodes[n].size && d[i] >= '0' && d[i] <= '9') { h = h * 10 + (d[i] as int) - 48; i++; }
+    disp_set(w, h);
+}
+
+fn disp_label(n: int) -> *u8 {
+    if (n == 0) { return "1024x768"; } if (n == 1) { return "1280x800"; } if (n == 2) { return "1600x900"; } if (n == 3) { return "1920x1080"; }
+    return "2560x1440";
+}

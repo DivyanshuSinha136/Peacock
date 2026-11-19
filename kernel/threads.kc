@@ -1,0 +1,482 @@
+// threads.kc -- kernel threads: context switch, scheduler, sleep, mutexes, semaphores, message queues.  Author: Divyanshu Sinha (MIT License)
+//
+// Threads are cooperative: a thread runs until it yields, sleeps, blocks or exits (the desktop loop yields once per frame, long
+// operations such as saving the disk yield between chunks).  Each thread has its own 32 KiB stack; the stack is pre-filled with a
+// pattern so the scheduler can detect an overflow (bottom 64 bytes changed) and `ps` can show the high-water mark.  The context
+// switch is 15 bytes of machine code (saves rbp, rbx, r12-r15, swaps stacks) called through callp(), because kcc has no inline asm.
+//
+// Scheduling: the READY thread with the highest priority (0 low .. 3 high) wins; equal priorities take turns; a thread that is
+// passed over gains "age" (+1 priority step per 4 passes) so low-priority threads cannot starve.  Thread 0 is the kernel / desktop
+// thread (the boot stack).  Blocking primitives (sleep, mutex, semaphore, queue) take timeouts; a thread that dies releases the
+// mutexes it holds and wakes whoever joins it.
+
+const THR_MAX = 16;
+const THR_STACK = 32768;
+const THR_SLICE_WARN = 20;                // a slice longer than 200 ms counts as an overrun (the desktop would stutter)
+const THR_ZOMBIE_T = 500;                 // an unjoined dead thread's slot is recycled after 5 s
+
+const TS_FREE = 0; const TS_READY = 1; const TS_RUN = 2; const TS_SLEEP = 3; const TS_BLOCK = 4; const TS_DEAD = 5;
+const TF_SYSTEM = 1;                      // cannot be killed
+
+const W_JOIN = 1000; const W_MTX = 2000; const W_SEM = 3000; const W_QRX = 4000; const W_QTX = 5000;
+
+struct Thr {
+    id: int,
+    state: int,
+    prio: int,
+    flags: int,
+    stack: int,
+    fn_addr: int,
+    arg: int,
+    wake: int,                 // wake-up tick (sleep, or timeout of a blocking call; 0 = none)
+    waiting: int,              // what a BLOCKed thread waits for (W_* + object); cleared by whoever wakes it
+    age: int,
+    cpu: int,                  // ticks of CPU used
+    cpu_snap: int,
+    cpu_pct: int,              // CPU share over the last second
+    switches: int,
+    overruns: int,
+    maxslice: int,
+    born: int,
+    died: int,
+    exit_code: int,
+    name: u8[16]
+}
+
+var thr: Thr[16];
+var thr_sps: int[16];                     // saved stack pointers
+var thr_cur = 0;
+var thr_on = false;
+var thr_code: *u8;
+var thr_next_id = 1;
+var thr_last_t = 0; var thr_slice_t = 0;
+var thr_idle = false; var thr_idle_acc = 0; var thr_idle_snap = 0; var thr_idle_pct = 0;
+var thr_win_t = 0;
+var thr_total_sw = 0; var thr_total_ov = 0;
+var thr_log_overflow = 0;
+
+fn hal_idle_wait() { hal_idle(); }
+
+// ---------------------------------------------------------------- setup
+fn thr_init() {
+    if (thr_on) { return; }
+    thr_code = kmalloc(64);
+    if (thr_code == (0 as *u8)) { return; }
+    let c = thr_code;
+    var p = 0;
+    // ctx_switch(old_sp: *int [rdi], new_sp [rsi])
+    c[p] = 0x55; p++;                                                                   // push rbp
+    c[p] = 0x53; p++;                                                                   // push rbx
+    c[p] = 0x41; c[p + 1] = 0x54; p = p + 2;                                            // push r12
+    c[p] = 0x41; c[p + 1] = 0x55; p = p + 2;                                            // push r13
+    c[p] = 0x41; c[p + 1] = 0x56; p = p + 2;                                            // push r14
+    c[p] = 0x41; c[p + 1] = 0x57; p = p + 2;                                            // push r15
+    c[p] = 0x48; c[p + 1] = 0x89; c[p + 2] = 0x27; p = p + 3;                           // mov [rdi], rsp
+    c[p] = 0x48; c[p + 1] = 0x89; c[p + 2] = 0xF4; p = p + 3;                           // mov rsp, rsi
+    c[p] = 0x41; c[p + 1] = 0x5F; p = p + 2;                                            // pop r15
+    c[p] = 0x41; c[p + 1] = 0x5E; p = p + 2;                                            // pop r14
+    c[p] = 0x41; c[p + 1] = 0x5D; p = p + 2;                                            // pop r13
+    c[p] = 0x41; c[p + 1] = 0x5C; p = p + 2;                                            // pop r12
+    c[p] = 0x5B; p++;                                                                   // pop rbx
+    c[p] = 0x5D; p++;                                                                   // pop rbp
+    c[p] = 0xC3; p++;                                                                   // ret
+    hal_make_exec(thr_code as int, 64);
+    var i = 0;
+    while (i < THR_MAX) { thr[i].state = TS_FREE; i++; }
+    thr[0].id = 0; thr[0].state = TS_RUN; thr[0].prio = 2; thr[0].flags = TF_SYSTEM; thr[0].born = ticks;
+    kstrncpy(&thr[0].name[0], "kernel", 16);
+    thr_cur = 0; thr_last_t = ticks; thr_slice_t = ticks; thr_win_t = ticks;
+    thr_on = true;
+}
+
+fn thr_slot(id: int) -> int {
+    var i = 0;
+    while (i < THR_MAX) { if (thr[i].state != TS_FREE && thr[i].id == id) { return i; } i++; }
+    return -1;
+}
+fn thr_self() -> int { if (!thr_on) { return 0; } return thr[thr_cur].id; }
+fn thr_count() -> int { var n = 0; var i = 0; while (i < THR_MAX) { if (thr[i].state != TS_FREE) { n++; } i++; } return n; }
+/// slot of the n-th thread (in slot order), -1 when out of range
+fn thr_nth(n: int) -> int {
+    var c = 0; var i = 0;
+    while (i < THR_MAX) { if (thr[i].state != TS_FREE) { if (c == n) { return i; } c++; } i++; }
+    return -1;
+}
+fn thr_state_name(s: int) -> *u8 {
+    if (s == TS_READY) { return "ready"; } if (s == TS_RUN) { return "running"; } if (s == TS_SLEEP) { return "sleeping"; }
+    if (s == TS_BLOCK) { return "blocked"; } if (s == TS_DEAD) { return "exited"; }
+    return "free";
+}
+
+// ---------------------------------------------------------------- stacks
+const THR_PAT = 0xA5;
+fn thr_canary_ok(i: int) -> bool {
+    if (thr[i].stack == 0) { return true; }
+    let p = thr[i].stack as *u8;
+    var k = 0;
+    while (k < 64) { if (p[k] != THR_PAT) { return false; } k++; }
+    return true;
+}
+/// bytes of the stack that have been touched (high-water mark)
+fn thr_stack_used(i: int) -> int {
+    if (thr[i].stack == 0) { return 0; }
+    let p = thr[i].stack as *u8;
+    var k = 0;
+    while (k < THR_STACK && p[k] == THR_PAT) { k++; }
+    return THR_STACK - k;
+}
+
+// ---------------------------------------------------------------- accounting
+fn thr_acct() {
+    let d = ticks - thr_last_t;
+    thr_last_t = ticks;
+    if (d <= 0) { return; }
+    if (thr_idle) { thr_idle_acc = thr_idle_acc + d; } else { thr[thr_cur].cpu = thr[thr_cur].cpu + d; }
+}
+/// the desktop loop is about to halt the CPU (and is done with it)
+fn thr_idle_enter() { if (!thr_on) { return; } thr_acct(); thr_idle = true; }
+fn thr_idle_leave() { if (!thr_on) { return; } thr_acct(); thr_idle = false; }
+fn thr_second() {
+    let win = ticks - thr_win_t;
+    if (win < 100) { return; }
+    var i = 0;
+    while (i < THR_MAX) {
+        if (thr[i].state != TS_FREE) { thr[i].cpu_pct = (thr[i].cpu - thr[i].cpu_snap) * 100 / win; thr[i].cpu_snap = thr[i].cpu; }
+        i++;
+    }
+    thr_idle_pct = (thr_idle_acc - thr_idle_snap) * 100 / win; thr_idle_snap = thr_idle_acc;
+    thr_win_t = ticks;
+}
+
+// ---------------------------------------------------------------- release helpers
+fn thr_wake_all(code: int) {
+    var i = 0;
+    while (i < THR_MAX) {
+        if (thr[i].state == TS_BLOCK && thr[i].waiting == code) { thr[i].state = TS_READY; thr[i].waiting = 0; thr[i].wake = 0; }
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------- mutexes
+const MTX_MAX = 16;
+var mtx_owner: int[16]; var mtx_depth: int[16]; var mtx_used: int[16];
+var mtx_name: u8[256];                     // 16 names of 16 bytes
+fn mtx_new(name: *u8) -> int {
+    var i = 0;
+    while (i < MTX_MAX) {
+        if (mtx_used[i] == 0) { mtx_used[i] = 1; mtx_owner[i] = -1; mtx_depth[i] = 0; kstrncpy(&mtx_name[i * 16], name, 16); return i; }
+        i++;
+    }
+    return -1;
+}
+fn mtx_release_dead(id: int) {
+    var m = 0;
+    while (m < MTX_MAX) {
+        if (mtx_used[m] != 0 && mtx_owner[m] == id) { mtx_owner[m] = -1; mtx_depth[m] = 0; thr_wake_all(W_MTX + m); }
+        m++;
+    }
+}
+
+// ---------------------------------------------------------------- scheduler
+fn thr_wake_sleepers() {
+    var i = 0;
+    while (i < THR_MAX) {
+        let s = thr[i].state;
+        if ((s == TS_SLEEP || s == TS_BLOCK) && thr[i].wake > 0 && ticks >= thr[i].wake) { thr[i].state = TS_READY; thr[i].wake = 0; }
+        i++;
+    }
+}
+
+/// free the stacks of dead threads and recycle zombie slots
+fn thr_reap() {
+    var i = 0;
+    while (i < THR_MAX) {
+        if (thr[i].state == TS_DEAD && i != thr_cur) {
+            if (thr[i].stack != 0) { kfree(thr[i].stack as *u8); thr[i].stack = 0; }
+            if (ticks - thr[i].died > THR_ZOMBIE_T) { thr[i].state = TS_FREE; }
+        }
+        i++;
+    }
+}
+
+fn thr_pick() -> int {
+    var best = -1; var bscore = -1;
+    var k = 1;
+    while (k <= THR_MAX) {
+        let i = (thr_cur + k) % THR_MAX;                  // round robin starting after the current thread (itself last)
+        if (thr[i].state == TS_READY || thr[i].state == TS_RUN) {
+            let sc = thr[i].prio * 8 + thr[i].age / 4;
+            if (sc > bscore) { bscore = sc; best = i; }
+        }
+        k++;
+    }
+    if (best >= 0) {
+        var j = 0;
+        while (j < THR_MAX) { if (j != best && thr[j].state == TS_READY) { thr[j].age++; } j++; }
+        thr[best].age = 0;
+    }
+    return best;
+}
+
+fn thr_kill_overflowed(i: int) {
+    thr_log_overflow++;
+    klog("thread stack overflow - thread stopped");
+    thr[i].state = TS_DEAD; thr[i].exit_code = -2; thr[i].died = ticks;
+    mtx_release_dead(thr[i].id); thr_wake_all(W_JOIN + thr[i].id);
+}
+
+fn thr_switch_to(n: int) {
+    let old = thr_cur;
+    thr_acct();
+    let slice = ticks - thr_slice_t;
+    if (slice > thr[old].maxslice) { thr[old].maxslice = slice; }
+    if (slice > THR_SLICE_WARN) { thr[old].overruns++; thr_total_ov++; }
+    if (!thr_canary_ok(old)) { thr_kill_overflowed(old); }
+    if (thr[old].state == TS_RUN) { thr[old].state = TS_READY; }
+    thr[n].state = TS_RUN; thr[n].switches++;
+    thr_total_sw++;
+    thr_cur = n;
+    thr_slice_t = ticks;
+    callp(thr_code as int, (&thr_sps[old]) as int, thr_sps[n]);
+    // resumed here, as thread `old`
+    thr_slice_t = ticks; thr_last_t = ticks;
+}
+
+/// run another thread; returns when this one is scheduled again (the caller has already set its state)
+fn thr_schedule() {
+    while (true) {
+        thr_wake_sleepers();
+        let n = thr_pick();
+        if (n >= 0) {
+            if (n != thr_cur) { thr_switch_to(n); } else { thr[n].state = TS_RUN; thr_slice_t = ticks; }
+            thr_reap();
+            return;
+        }
+        thr_acct();
+        thr_idle = true; hal_idle_wait(); thr_idle = false; thr_acct();        // everything sleeps or waits: halt until an interrupt
+    }
+}
+
+fn thr_yield() {
+    if (!thr_on) { return; }
+    if (ticks / 100 != thr_win_t / 100) { thr_second(); }
+    thr_schedule();
+}
+
+fn thr_sleep(ms: int) {
+    if (!thr_on) { pit_sleep_ms(ms); return; }
+    var t = (ms + 9) / 10;
+    if (t < 1) { t = 1; }
+    thr[thr_cur].wake = ticks + t;
+    thr[thr_cur].state = TS_SLEEP;
+    thr_schedule();
+}
+
+/// block the current thread on `code` for at most timeout_ms (0 = no limit); false when it timed out
+fn thr_block(code: int, timeout_ms: int) -> bool {
+    if (!thr_on) { return false; }
+    thr[thr_cur].state = TS_BLOCK; thr[thr_cur].waiting = code;
+    if (timeout_ms > 0) { thr[thr_cur].wake = ticks + imax(1, (timeout_ms + 9) / 10); } else { thr[thr_cur].wake = 0; }
+    thr_schedule();
+    let ok = thr[thr_cur].waiting == 0;
+    thr[thr_cur].waiting = 0;
+    return ok;
+}
+
+// ---------------------------------------------------------------- thread life cycle
+/// first code a new thread runs (entered by the `ret` of the context switch)
+fn thr_entry() {
+    let i = thr_cur;
+    let rc = callp(thr[i].fn_addr, thr[i].arg);
+    thr_exit(rc);
+}
+
+/// start a thread running fn_addr(arg) (use fnaddr(name)); returns its id or -1
+fn thr_create(name: *u8, fn_addr: int, arg: int, prio: int, flags: int) -> int {
+    thr_init();
+    if (!thr_on) { return -1; }
+    thr_reap();
+    var s = -1; var i = 1;
+    while (i < THR_MAX) { if (thr[i].state == TS_FREE) { s = i; break; } i++; }
+    if (s < 0) {                                           // no free slot: recycle the oldest unjoined (zombie) thread
+        i = 1;
+        while (i < THR_MAX) { if (thr[i].state == TS_DEAD && i != thr_cur && (s < 0 || thr[i].died < thr[s].died)) { s = i; } i++; }
+        if (s < 0) { return -1; }
+        if (thr[s].stack != 0) { kfree(thr[s].stack as *u8); thr[s].stack = 0; }
+    }
+    let stk = kmalloc(THR_STACK);
+    if (stk == (0 as *u8)) { return -1; }
+    kmemset(stk, THR_PAT, THR_STACK);
+    let top = (stk as int) + THR_STACK;
+    wr64(top - 8, 0);                                      // fake return address of thr_entry
+    wr64(top - 16, fnaddr(thr_entry));                     // where the first switch "returns" to
+    var r = 0;
+    while (r < 6) { wr64(top - 24 - r * 8, 0); r++; }      // rbp rbx r12 r13 r14 r15
+    thr_sps[s] = top - 64;
+    thr[s].id = thr_next_id; thr_next_id++;
+    thr[s].state = TS_READY; thr[s].prio = imax(0, imin(3, prio)); thr[s].flags = flags;
+    thr[s].stack = stk as int; thr[s].fn_addr = fn_addr; thr[s].arg = arg;
+    thr[s].wake = 0; thr[s].waiting = 0; thr[s].age = 0;
+    thr[s].cpu = 0; thr[s].cpu_snap = 0; thr[s].cpu_pct = 0; thr[s].switches = 0; thr[s].overruns = 0; thr[s].maxslice = 0;
+    thr[s].born = ticks; thr[s].died = 0; thr[s].exit_code = 0;
+    kstrncpy(&thr[s].name[0], name, 16);
+    return thr[s].id;
+}
+
+fn thr_exit(code: int) {
+    if (!thr_on || thr_cur == 0) { return; }
+    let i = thr_cur;
+    thr[i].exit_code = code; thr[i].died = ticks; thr[i].state = TS_DEAD;
+    mtx_release_dead(thr[i].id);
+    thr_wake_all(W_JOIN + thr[i].id);
+    thr_schedule();                                        // never returns: a DEAD thread is not picked again
+}
+
+/// stop another thread (or end the current one). false for system threads and unknown ids.
+fn thr_kill(id: int) -> bool {
+    let i = thr_slot(id);
+    if (i < 0 || i == 0 || (thr[i].flags & TF_SYSTEM) != 0 || thr[i].state == TS_DEAD) { return false; }
+    if (i == thr_cur) { thr_exit(-1); return true; }
+    thr[i].state = TS_DEAD; thr[i].exit_code = -1; thr[i].died = ticks; thr[i].waiting = 0; thr[i].wake = 0;
+    mtx_release_dead(id);
+    thr_wake_all(W_JOIN + id);
+    thr_reap();
+    return true;
+}
+
+/// wait for a thread to end and return its exit code (-1 when the id is unknown); timeout_ms 0 = wait forever
+fn thr_join(id: int, timeout_ms: int) -> int {
+    var i = thr_slot(id);
+    if (i < 0) { return -1; }
+    while (thr[i].state != TS_DEAD) {
+        if (!thr_block(W_JOIN + id, timeout_ms)) { return -1; }
+        i = thr_slot(id);
+        if (i < 0) { return -1; }
+    }
+    let rc = thr[i].exit_code;
+    thr[i].state = TS_FREE;
+    if (thr[i].stack != 0) { kfree(thr[i].stack as *u8); thr[i].stack = 0; }
+    return rc;
+}
+
+fn thr_set_prio(id: int, prio: int) {
+    let i = thr_slot(id);
+    if (i >= 0) { thr[i].prio = imax(0, imin(3, prio)); }
+}
+
+// ---------------------------------------------------------------- mutex operations
+fn mtx_lock(m: int) {
+    if (m < 0 || m >= MTX_MAX) { return; }
+    let me = thr_self();
+    while (mtx_owner[m] != -1 && mtx_owner[m] != me) { thr_block(W_MTX + m, 0); }
+    mtx_owner[m] = me; mtx_depth[m]++;
+}
+fn mtx_trylock(m: int) -> bool {
+    if (m < 0 || m >= MTX_MAX) { return false; }
+    let me = thr_self();
+    if (mtx_owner[m] != -1 && mtx_owner[m] != me) { return false; }
+    mtx_owner[m] = me; mtx_depth[m]++;
+    return true;
+}
+fn mtx_unlock(m: int) -> bool {
+    if (m < 0 || m >= MTX_MAX || mtx_owner[m] != thr_self()) { return false; }
+    mtx_depth[m]--;
+    if (mtx_depth[m] <= 0) { mtx_depth[m] = 0; mtx_owner[m] = -1; thr_wake_all(W_MTX + m); }
+    return true;
+}
+
+// ---------------------------------------------------------------- semaphores
+const SEM_MAX = 16;
+var sem_count: int[16]; var sem_used: int[16];
+fn sem_new(initial: int) -> int {
+    var i = 0;
+    while (i < SEM_MAX) { if (sem_used[i] == 0) { sem_used[i] = 1; sem_count[i] = initial; return i; } i++; }
+    return -1;
+}
+fn sem_post(s: int) { if (s < 0 || s >= SEM_MAX) { return; } sem_count[s]++; thr_wake_all(W_SEM + s); }
+/// take one unit; waits at most timeout_ms (0 = forever); false on timeout
+fn sem_wait(s: int, timeout_ms: int) -> bool {
+    if (s < 0 || s >= SEM_MAX) { return false; }
+    let deadline = ticks + (timeout_ms + 9) / 10;
+    while (sem_count[s] <= 0) {
+        var left = 0;
+        if (timeout_ms > 0) { left = (deadline - ticks) * 10; if (left <= 0) { return false; } }
+        thr_block(W_SEM + s, left);
+        if (!thr_on) { return false; }
+    }
+    sem_count[s]--;
+    return true;
+}
+
+// ---------------------------------------------------------------- message queues (ring of 32 ints)
+const Q_MAX = 8; const Q_LEN = 32;
+var q_buf: int[256]; var q_head: int[8]; var q_n: int[8]; var q_used: int[8];
+fn q_new() -> int {
+    var i = 0;
+    while (i < Q_MAX) { if (q_used[i] == 0) { q_used[i] = 1; q_head[i] = 0; q_n[i] = 0; return i; } i++; }
+    return -1;
+}
+fn q_send(q: int, v: int, timeout_ms: int) -> bool {
+    if (q < 0 || q >= Q_MAX) { return false; }
+    let deadline = ticks + (timeout_ms + 9) / 10;
+    while (q_n[q] >= Q_LEN) {
+        var left = 0;
+        if (timeout_ms > 0) { left = (deadline - ticks) * 10; if (left <= 0) { return false; } }
+        thr_block(W_QTX + q, left);
+        if (!thr_on) { return false; }
+    }
+    q_buf[q * Q_LEN + (q_head[q] + q_n[q]) % Q_LEN] = v;
+    q_n[q]++;
+    thr_wake_all(W_QRX + q);
+    return true;
+}
+/// receive into out[0]; false on timeout
+fn q_recv(q: int, out: *int, timeout_ms: int) -> bool {
+    if (q < 0 || q >= Q_MAX) { return false; }
+    let deadline = ticks + (timeout_ms + 9) / 10;
+    while (q_n[q] <= 0) {
+        var left = 0;
+        if (timeout_ms > 0) { left = (deadline - ticks) * 10; if (left <= 0) { return false; } }
+        thr_block(W_QRX + q, left);
+        if (!thr_on) { return false; }
+    }
+    out[0] = q_buf[q * Q_LEN + q_head[q]];
+    q_head[q] = (q_head[q] + 1) % Q_LEN; q_n[q]--;
+    thr_wake_all(W_QTX + q);
+    return true;
+}
+
+// ---------------------------------------------------------------- system threads
+var fs_lock = -1;
+var sys_autosave_id = -1;
+
+/// background saver: every quarter second it asks the file system whether a save is due
+fn sys_autosave_main(arg: int) -> int {
+    while (true) { thr_sleep(250); fs_autosave(); }
+    return 0;
+}
+
+fn threads_start() {
+    thr_init();
+    if (!thr_on) { return; }
+    if (fs_lock < 0) { fs_lock = mtx_new("fs"); }
+    sys_autosave_id = thr_create("autosave", fnaddr(sys_autosave_main), 0, 2, TF_SYSTEM);
+}
+
+// ---------------------------------------------------------------- demo workers (spawn in the terminal)
+var demo_count = 0;
+fn demo_counter(arg: int) -> int {
+    var n = 0;
+    while (n < arg) { n++; demo_count++; thr_sleep(200); }
+    return n;
+}
+fn demo_spin(arg: int) -> int {                    // a CPU hog that is nice enough to yield
+    var n = 0; var x = 1;
+    while (n < arg) { var k = 0; while (k < 2000) { x = x * 31 + k; k++; } n++; thr_yield(); }
+    return x & 255;
+}
+fn demo_hog(arg: int) -> int {                     // never yields: shows up as an overrun
+    let t0 = ticks;
+    while (ticks - t0 < arg / 10) { var k = 0; while (k < 100) { k++; } }
+    return 0;
+}

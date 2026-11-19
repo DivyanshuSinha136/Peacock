@@ -1,0 +1,45 @@
+// panic.kc -- the kernel panic screen: serial dump plus a red framebuffer screen.  Author: Divyanshu Sinha (MIT License)
+
+fn ser_reg(name: *u8, v: int) { ser_puts(name); ser_puts("="); ser_puthex(v); ser_puts("  "); }
+
+fn draw_hex(x: int, y: int, v: int, fg: int) -> int {
+    var buf: u8[20];
+    var i = 0;
+    while (i < 16) {
+        let d = (v >> (60 - i * 4)) & 15;
+        if (d < 10) { buf[i] = ('0' + d) as u8; } else { buf[i] = ('A' + d - 10) as u8; }
+        i++;
+    }
+    buf[16] = 0;
+    return draw_text(x, y, &buf[0], fg);
+}
+
+fn panic_row(y: int, n1: *u8, v1: int, n2: *u8, v2: int, n3: *u8, v3: int) {
+    draw_text(40, y, n1, 0xFFD27F); draw_hex(80, y, v1, 0xFFFFFF);
+    draw_text(250, y, n2, 0xFFD27F); draw_hex(290, y, v2, 0xFFFFFF);
+    draw_text(460, y, n3, 0xFFD27F); draw_hex(500, y, v3, 0xFFFFFF);
+}
+
+fn panic_screen(frame: *u64, vec: int) {
+    cli();
+    ser_puts("\n*** PEACOCK KERNEL PANIC ***\n");
+    ser_puts(exc_name(vec)); ser_puts(" vector "); ser_putdec(vec); ser_puts(" error "); ser_puthex(frame[16] as int); ser_puts("\n");
+    ser_reg("rip", frame[17] as int); ser_reg("rsp", frame[20] as int); ser_reg("cr2", read_cr2()); ser_puts("\n");
+    ser_reg("rax", frame[14] as int); ser_reg("rbx", frame[11] as int); ser_reg("rcx", frame[13] as int); ser_reg("rdx", frame[12] as int); ser_puts("\n");
+    if (fb_addr != 0 && bb != (0 as *u64)) {
+        clip_reset();
+        fill(0, 0, fb_w, fb_h, 0x5A0F1B);
+        fill(0, 0, fb_w, 40, 0x2A0610);
+        draw_text_sc(20, 4, "Peacock kernel panic", 0xFFFFFF, 2);
+        draw_text(40, 70, exc_name(vec), 0xFFFFFF);
+        draw_text(40, 94, "error code", 0xFFD27F); draw_hex(130, 94, frame[16] as int, 0xFFFFFF);
+        panic_row(130, "rip", frame[17] as int, "cs ", frame[18] as int, "rflags", frame[19] as int);
+        panic_row(154, "rsp", frame[20] as int, "ss ", frame[21] as int, "cr2   ", read_cr2());
+        panic_row(178, "rax", frame[14] as int, "rcx", frame[13] as int, "rdx   ", frame[12] as int);
+        panic_row(202, "rbx", frame[11] as int, "rbp", frame[10] as int, "rsi   ", frame[9] as int);
+        panic_row(226, "rdi", frame[8] as int, "r8 ", frame[7] as int, "r9    ", frame[6] as int);
+        draw_text(40, 270, "System halted. Power-cycle or reset the machine.", 0xFFFFFF);
+        flush_rect(0, 0, fb_w, fb_h);
+    }
+    while (true) { hlt(); }
+}

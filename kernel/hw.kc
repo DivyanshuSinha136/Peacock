@@ -1,0 +1,330 @@
+// hw.kc -- CPU tables and hardware drivers: GDT/TSS, IDT, exceptions, PIC, PIT timer, PS/2 keyboard + mouse, RTC, speaker, power.
+// Author: Divyanshu Sinha (MIT License)
+// (GDT/IDT/PIC/PIT/keyboard/RTC are the proven KCOS drivers; the mouse driver, power control and the panic hook are new.)
+
+// ================================================================= GDT + TSS
+// Same selector layout as the boot stage, so CS/SS need no reload:  0x08 code32, 0x10 data, 0x18 code64, 0x20 TSS
+var gdt: u64[6];
+var gdtr: u8[10];
+var tss: u8[104];
+var ist1_stack: u8[8192];
+
+fn gdt_init() {
+    gdt[0] = 0 as u64;
+    gdt[1] = 0x00CF9A000000FFFF as u64;
+    gdt[2] = 0x00CF92000000FFFF as u64;
+    gdt[3] = 0x00209A0000000000 as u64;
+    let tb = &tss[0] as int;
+    let limit = 103;
+    let lo = (limit & 0xFFFF) | ((tb & 0xFFFFFF) << 16) | (0x89 << 40) | (((limit >> 16) & 0xF) << 48) | (((tb >> 24) & 0xFF) << 56);
+    gdt[4] = lo as u64;
+    gdt[5] = (tb >> 32) as u64;
+    *((tb + 4) as *u64) = ((&ist1_stack[0] as int) + 8192) as u64;      // rsp0
+    *((tb + 36) as *u64) = ((&ist1_stack[0] as int) + 8192) as u64;     // ist1 (double fault)
+    *((tb + 102) as *u16) = 104 as u16;                                 // no I/O permission bitmap
+    *(&gdtr[0] as *u16) = (6 * 8 - 1) as u16;
+    *((&gdtr[0] as int + 2) as *u64) = (&gdt[0] as int) as u64;
+    lgdt(&gdtr[0]);
+    ltr(0x20);
+}
+
+// ================================================================= IDT
+var idt: u8[4096];
+var idtr: u8[10];
+
+fn idt_gate(n: int, handler: int, ist: int) {
+    let p = (&idt[0] as int) + n * 16;
+    *(p as *u16) = (handler & 0xFFFF) as u16;
+    *((p + 2) as *u16) = 0x18 as u16;                    // kernel 64-bit code
+    *((p + 4) as *u8) = ist as u8;
+    *((p + 5) as *u8) = 0x8E as u8;                      // present, ring 0, interrupt gate
+    *((p + 6) as *u16) = ((handler >> 16) & 0xFFFF) as u16;
+    *((p + 8) as *u32) = ((handler >> 32) & 0xFFFFFFFF) as u32;
+    *((p + 12) as *u32) = 0 as u32;
+}
+
+fn idt_init() {
+    var n = 0;
+    while (n < 256) { idt_gate(n, isr_stub(n), n == 8 ? 1 : 0); n++; }
+    *(&idtr[0] as *u16) = (4096 - 1) as u16;
+    *((&idtr[0] as int + 2) as *u64) = (&idt[0] as int) as u64;
+    lidt(&idtr[0]);
+}
+
+// ================================================================= PIC
+fn io_wait() { outb(0x80, 0); }
+
+fn pic_init() {
+    outb(0x20, 0x11); io_wait(); outb(0xA0, 0x11); io_wait();
+    outb(0x21, 0x20); io_wait(); outb(0xA1, 0x28); io_wait();      // vectors 0x20.. and 0x28..
+    outb(0x21, 0x04); io_wait(); outb(0xA1, 0x02); io_wait();
+    outb(0x21, 0x01); io_wait(); outb(0xA1, 0x01); io_wait();
+    outb(0x21, 0xF8);                                              // unmask IRQ0 (timer), IRQ1 (keyboard), IRQ2 (cascade)
+    outb(0xA1, 0xEF);                                              // unmask IRQ12 (PS/2 mouse)
+}
+
+fn pic_eoi(irq: int) {
+    if (irq >= 8) { outb(0xA0, 0x20); }
+    outb(0x20, 0x20);
+}
+
+// ================================================================= PIT (100 Hz)
+const PIT_HZ = 100;
+var ticks = 0;
+
+fn pit_init() {
+    let div = 1193182 / PIT_HZ;
+    outb(0x43, 0x36);
+    outb(0x40, div & 0xFF);
+    outb(0x40, (div >> 8) & 0xFF);
+}
+
+fn pit_sleep_ms(ms: int) {
+    var n = ms / 10;
+    if (n < 1) { n = 1; }
+    let target = ticks + n;
+    while (ticks < target) { hlt(); }
+}
+
+// ================================================================= PC speaker
+fn speaker_on(freq: int) {
+    if (freq < 20) { return; }
+    let div = 1193182 / freq;
+    outb(0x43, 0xB6);
+    outb(0x42, div & 0xFF);
+    outb(0x42, (div >> 8) & 0xFF);
+    outb(0x61, inb(0x61) | 3);
+}
+fn speaker_off() { outb(0x61, inb(0x61) & 0xFC); }
+
+// ================================================================= PS/2 keyboard (scan code set 1, US layout)
+var kb_map: u8[128];
+var kb_smap: u8[128];
+var kb_shift = false;
+var kb_caps = false;
+var kb_ctrl = false;
+var kb_alt = false;
+var kb_e0 = false;
+
+fn kb_fill(code: int, keys: *u8, shifted: bool) {
+    var i = 0;
+    while (keys[i] != 0) {
+        if (shifted) { kb_smap[code + i] = keys[i]; } else { kb_map[code + i] = keys[i]; }
+        i++;
+    }
+}
+
+fn kb_init() {
+    kmemset(&kb_map[0], 0, 128);
+    kmemset(&kb_smap[0], 0, 128);
+    kb_fill(0x02, "1234567890-=", false);   kb_fill(0x02, "!@#$%^&*()_+", true);
+    kb_fill(0x10, "qwertyuiop[]", false);   kb_fill(0x10, "QWERTYUIOP{}", true);
+    kb_fill(0x1E, "asdfghjkl;'`", false);   kb_fill(0x1E, "ASDFGHJKL:\"~", true);
+    kb_fill(0x2B, "\\zxcvbnm,./", false);   kb_fill(0x2B, "|ZXCVBNM<>?", true);
+    kb_map[0x01] = 27; kb_smap[0x01] = 27;
+    kb_map[0x0E] = 8;  kb_smap[0x0E] = 8;
+    kb_map[0x0F] = 9;  kb_smap[0x0F] = 9;
+    kb_map[0x1C] = 10; kb_smap[0x1C] = 10;
+    kb_map[0x39] = ' '; kb_smap[0x39] = ' ';
+    while ((inb(0x64) & 1) != 0) { inb(0x60); }       // drain
+}
+
+fn kbd_irq() {
+    let sc = inb(0x60);
+    if (sc == 0xE0) { kb_e0 = true; return; }
+    let release = (sc & 0x80) != 0;
+    let code = sc & 0x7F;
+    if (kb_e0) {
+        kb_e0 = false;
+        if (code == 0x1D) { kb_ctrl = !release; return; }
+        if (code == 0x38) { kb_alt = !release; return; }
+        if (release) { return; }
+        if (code == 0x48) { kb_push(KEY_UP); }
+        else if (code == 0x50) { kb_push(KEY_DOWN); }
+        else if (code == 0x4B) { kb_push(KEY_LEFT); }
+        else if (code == 0x4D) { kb_push(KEY_RIGHT); }
+        else if (code == 0x47) { kb_push(KEY_HOME); }
+        else if (code == 0x4F) { kb_push(KEY_END); }
+        else if (code == 0x53) { kb_push(KEY_DEL); }
+        else if (code == 0x49) { kb_push(KEY_PGUP); }
+        else if (code == 0x51) { kb_push(KEY_PGDN); }
+        return;
+    }
+    if (code == 0x2A || code == 0x36) { kb_shift = !release; return; }
+    if (code == 0x1D) { kb_ctrl = !release; return; }
+    if (code == 0x38) { kb_alt = !release; return; }
+    if (release) { return; }
+    if (code == 0x3A) { kb_caps = !kb_caps; return; }
+    var ch = kb_map[code] as int;
+    if (ch == 0) { return; }
+    if (ch >= 'a' && ch <= 'z') {
+        if (kb_shift != kb_caps) { ch = ch - 32; }
+        if (kb_ctrl) { ch = ch & 0x1F; }
+    } else if (kb_shift) { ch = kb_smap[code] as int; }
+    kb_push(ch);
+}
+
+// ================================================================= CMOS real-time clock
+fn cmos(reg: int) -> int { outb(0x70, reg); return inb(0x71); }
+
+/// out[0..5] = year month day hour minute second
+fn rtc_read(out: *int) {
+    while ((cmos(0x0A) & 0x80) != 0) { }
+    var sec = cmos(0x00); var min = cmos(0x02); var hour = cmos(0x04);
+    var day = cmos(0x07); var mon = cmos(0x08); var year = cmos(0x09);
+    let regb = cmos(0x0B);
+    if ((regb & 4) == 0) {                                   // BCD
+        sec = (sec & 15) + (sec >> 4) * 10; min = (min & 15) + (min >> 4) * 10;
+        hour = ((hour & 0x7F) & 15) + (((hour & 0x7F) >> 4) * 10) | (hour & 0x80);
+        day = (day & 15) + (day >> 4) * 10; mon = (mon & 15) + (mon >> 4) * 10; year = (year & 15) + (year >> 4) * 10;
+    }
+    if ((regb & 2) == 0 && (hour & 0x80) != 0) { hour = ((hour & 0x7F) + 12) % 24; }
+    out[0] = 2000 + year; out[1] = mon; out[2] = day; out[3] = hour; out[4] = min; out[5] = sec;
+}
+
+fn exc_name(v: int) -> *u8 {
+    if (v == 0) { return "#DE divide error"; }
+    if (v == 1) { return "#DB debug"; }
+    if (v == 2) { return "NMI"; }
+    if (v == 3) { return "#BP breakpoint"; }
+    if (v == 4) { return "#OF overflow"; }
+    if (v == 5) { return "#BR bound range"; }
+    if (v == 6) { return "#UD invalid opcode"; }
+    if (v == 7) { return "#NM device not available"; }
+    if (v == 8) { return "#DF double fault"; }
+    if (v == 10) { return "#TS invalid TSS"; }
+    if (v == 11) { return "#NP segment not present"; }
+    if (v == 12) { return "#SS stack fault"; }
+    if (v == 13) { return "#GP general protection"; }
+    if (v == 14) { return "#PF page fault"; }
+    if (v == 16) { return "#MF x87 FP"; }
+    if (v == 17) { return "#AC alignment check"; }
+    if (v == 18) { return "#MC machine check"; }
+    if (v == 19) { return "#XM SIMD FP"; }
+    return "reserved exception";
+}
+
+// ================================================================= PS/2 mouse (IRQ12), 3-byte packets
+var ms_cycle = 0;
+var ms_b0 = 0;
+var ms_b1 = 0;
+var ms_b2 = 0;
+var ms_id = 0;                                    // 3 = IntelliMouse (4-byte packets with a wheel)
+var mouse_ok = false;
+
+fn kbc_wait_in() -> bool {        // wait until the controller can take a byte
+    var spin = 0;
+    while (spin < 100000) { if ((inb(0x64) & 2) == 0) { return true; } spin++; }
+    return false;
+}
+fn kbc_wait_out() -> bool {       // wait until a byte is waiting
+    var spin = 0;
+    while (spin < 100000) { if ((inb(0x64) & 1) != 0) { return true; } spin++; }
+    return false;
+}
+fn kbc_cmd(c: int) { kbc_wait_in(); outb(0x64, c); }
+fn mouse_cmd(c: int) -> int {     // send a byte to the mouse, return its answer (0xFA = ack)
+    kbc_cmd(0xD4);
+    kbc_wait_in(); outb(0x60, c);
+    if (kbc_wait_out()) { return inb(0x60); }
+    return -1;
+}
+
+fn mouse_init() {
+    kbc_cmd(0xA8);                                    // enable the auxiliary (mouse) port
+    kbc_cmd(0x20);                                    // read the controller configuration byte
+    var cfg = 0x47;
+    if (kbc_wait_out()) { cfg = inb(0x60); }
+    cfg = (cfg | 2) & ~0x20;                          // IRQ12 on, mouse clock on
+    kbc_cmd(0x60);
+    kbc_wait_in(); outb(0x60, cfg);
+    mouse_cmd(0xF6);                                  // defaults
+    mouse_cmd(0xF3); mouse_cmd(200); mouse_cmd(0xF3); mouse_cmd(100); mouse_cmd(0xF3); mouse_cmd(80);   // magic sequence: ask for the wheel
+    mouse_cmd(0xF2);
+    ms_id = 0;
+    if (kbc_wait_out()) { ms_id = inb(0x60) & 0xFF; }
+    let ack = mouse_cmd(0xF4);                        // enable data reporting
+    mouse_ok = (ack == 0xFA);
+    ms_cycle = 0;
+    while ((inb(0x64) & 1) != 0) { inb(0x60); }       // drain
+}
+
+fn mouse_irq() {
+    let b = inb(0x60);
+    if (ms_cycle == 0) {
+        if ((b & 8) == 0) { return; }                 // out of sync: wait for a first byte (bit 3 is always set)
+        ms_b0 = b; ms_cycle = 1; return;
+    }
+    if (ms_cycle == 1) { ms_b1 = b; ms_cycle = 2; return; }
+    var dx = ms_b1;
+    var dy = b;
+    if (ms_id == 3) {
+        if (ms_cycle == 2) { ms_b2 = b; ms_cycle = 3; return; }
+        dy = ms_b2;
+        var z = b & 15;
+        if (z >= 8) { z = z - 16; }
+        mouse_wheel = mouse_wheel + z;
+    }
+    ms_cycle = 0;
+    if ((ms_b0 & 0x10) != 0) { dx = dx - 256; }
+    if ((ms_b0 & 0x20) != 0) { dy = dy - 256; }
+    if ((ms_b0 & 0xC0) != 0) { dx = 0; dy = 0; }      // overflow: ignore the movement
+    mouse_push(dx, -dy, ms_b0 & 7);
+}
+
+// ================================================================= power
+fn hal_reboot() {
+    cli();
+    var spin = 0;
+    while (spin < 100000 && (inb(0x64) & 2) != 0) { spin++; }
+    outb(0x64, 0xFE);                         // keyboard controller reset line
+    int3();                                   // fallback: with a broken IDT this triple-faults
+    while (true) { hlt(); }
+}
+
+fn hal_poweroff() {
+    outw(0x604, 0x2000);                      // QEMU (ACPI PM1a)
+    outw(0xB004, 0x2000);                     // Bochs / old QEMU
+    outw(0x4004, 0x3400);                     // VirtualBox
+    cli();
+    while (true) { hlt(); }
+}
+
+/// idle until the next interrupt (used by the scheduler when every thread sleeps)
+fn hal_idle() { sti(); hlt(); }
+/// make a buffer executable (identity-mapped, no NX in this kernel: nothing to do)
+fn hal_make_exec(addr: int, n: int) { }
+
+// ================================================================= interrupt dispatch
+fn kc_interrupt(frame: *u64) {
+    let vec = frame[15] as int;
+    if (vec < 32) { panic_screen(frame, vec); return; }
+    if (vec < 48) {
+        let irq = vec - 32;
+        if (irq == 0) { ticks++; }
+        else if (irq == 1) { kbd_irq(); }
+        else if (irq == 12) { mouse_irq(); }
+        pic_eoi(irq);
+        return;
+    }
+}
+
+/// PCI configuration mechanism #1 (the host tests replace these with a simulated bus)
+fn pci_cfg_r32(bus: int, dev: int, func: int, off: int) -> int {
+    outl(0xCF8, 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (off & 0xFC));
+    return inl(0xCFC) & 0xFFFFFFFF;
+}
+fn pci_cfg_w32(bus: int, dev: int, func: int, off: int, v: int) {
+    outl(0xCF8, 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (off & 0xFC));
+    outl(0xCFC, v);
+}
+/// raw port access for the power-management code (acpi.kc); stubbed by the host tests
+fn hw_out8(p: int, v: int) { outb(p, v); }
+fn hw_out16(p: int, v: int) { outw(p, v); }
+fn hw_out32(p: int, v: int) { outl(p, v); }
+fn hw_in8(p: int) -> int { return inb(p) & 0xFF; }
+fn hw_in16(p: int) -> int { return inw(p) & 0xFFFF; }
+
+/// Bochs/QEMU VBE (DISPI) register access: index port 0x1CE, data port 0x1CF
+fn dispi_w(i: int, v: int) { outw(0x1CE, i); outw(0x1CF, v); }
+fn dispi_r(i: int) -> int { outw(0x1CE, i); return inw(0x1CF) & 0xFFFF; }

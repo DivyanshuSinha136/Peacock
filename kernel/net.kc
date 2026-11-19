@@ -1,0 +1,669 @@
+// net.kc -- the network stack: Ethernet, ARP, IPv4, ICMP echo, UDP, DHCP, DNS and a one-connection TCP client with an
+// HTTP/1.0 fetch engine.  Author: Divyanshu Sinha (MIT License)
+//
+// Everything is polled: ui_frame() calls net_poll() once per frame, there is no blocking anywhere.  One HTTP fetch runs at a
+// time (the Browser and the terminal's wget share it); `ping` and `nslookup` use their own small state.
+// IPv4 addresses are plain ints (a<<24 | b<<16 | c<<8 | d).  No TLS: https:// cannot be fetched.
+// Needs the four functions of nic.kc, `ticks` (100 Hz), kmalloc/kzalloc/kfree, kstr.kc.
+
+// ================================================================= state
+var net_ready = false;               // a NIC was found
+var net_up = false;                  // DHCP (or the fallback) gave us an address
+var net_note: u8[72];                // short human-readable status
+var my_mac: u8[6];
+var my_ip = 0; var net_mask = 0; var gw_ip = 0; var dns_ip = 0;
+var rxb: *u8; var txb: *u8; var arpb: *u8;
+var arp_ip: int[8]; var arp_mac: u8[48]; var arp_n = 0;
+var ip_id = 1;
+var net_rx_count = 0; var net_tx_count = 0;
+
+fn be16(p: *u8, o: int) -> int { return ((p[o] as int) << 8) | (p[o + 1] as int); }
+fn be32(p: *u8, o: int) -> int { return (be16(p, o) << 16) | be16(p, o + 2); }
+fn pb16(p: *u8, o: int, v: int) { p[o] = (v >> 8) as u8; p[o + 1] = (v & 255) as u8; }
+fn pb32(p: *u8, o: int, v: int) { pb16(p, o, (v >> 16) & 0xFFFF); pb16(p, o + 2, v & 0xFFFF); }
+
+fn csum(p: *u8, off: int, len: int, init: int) -> int {
+    var sum = init;
+    var i = 0;
+    while (i + 1 < len) { sum = sum + be16(p, off + i); i = i + 2; }
+    if (i < len) { sum = sum + ((p[off + i] as int) << 8); }
+    while ((sum >> 16) != 0) { sum = (sum & 0xFFFF) + (sum >> 16); }
+    return (~sum) & 0xFFFF;
+}
+
+fn net_say(s: *u8) { kstrncpy(&net_note[0], s, 72); }
+
+/// "a.b.c.d" -> ip, or -1 when s is not a dotted quad
+fn ip_parse(s: *u8) -> int {
+    var v = 0; var parts = 0; var cur = 0; var digits = 0; var i = 0;
+    while (true) {
+        let c = s[i] as int;
+        if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); digits++; if (cur > 255 || digits > 3) { return -1; } }
+        else if (c == '.' || c == 0) {
+            if (digits == 0) { return -1; }
+            v = (v << 8) | cur; parts++; cur = 0; digits = 0;
+            if (c == 0) { break; }
+        } else { return -1; }
+        i++;
+    }
+    if (parts != 4) { return -1; }
+    return v;
+}
+/// ip -> "a.b.c.d" (out >= 16 bytes)
+fn ip_str(ip: int, out: *u8) {
+    var o = 0;
+    var k = 3;
+    while (k >= 0) {
+        var t: u8[8];
+        o = o + itoa((ip >> (k * 8)) & 255, &t[0]);
+        var j = 0;
+        while (t[j] != 0) { out[o - kstrlen(&t[0]) + j] = t[j]; j++; }
+        if (k > 0) { out[o] = '.'; o++; }
+        k--;
+    }
+    out[o] = 0;
+}
+
+// ================================================================= ARP
+fn arp_find(ip: int) -> int {
+    var i = 0;
+    while (i < 8) { if (arp_ip[i] == ip && ip != 0) { return i; } i++; }
+    return -1;
+}
+fn arp_learn(ip: int, mac: *u8) {
+    if (ip == 0) { return; }
+    var i = arp_find(ip);
+    if (i < 0) { i = arp_n; arp_n = (arp_n + 1) & 7; arp_ip[i] = ip; }
+    kmemcpy(&arp_mac[i * 6], mac, 6);
+}
+fn arp_request(ip: int) {
+    kmemset(arpb, 0, 64);
+    var i = 0;
+    while (i < 6) { arpb[i] = 255; arpb[6 + i] = my_mac[i]; i++; }
+    pb16(arpb, 12, 0x0806); pb16(arpb, 14, 1); pb16(arpb, 16, 0x0800);
+    arpb[18] = 6; arpb[19] = 4; pb16(arpb, 20, 1);
+    kmemcpy(arpb + 22, &my_mac[0], 6); pb32(arpb, 28, my_ip);
+    pb32(arpb, 38, ip);
+    nic_send(arpb, 42);
+}
+fn arp_rx(n: int) {
+    if (n < 42 || be16(rxb, 14) != 1 || be16(rxb, 16) != 0x0800) { return; }
+    let op = be16(rxb, 20);
+    let sip = be32(rxb, 28);
+    let tip = be32(rxb, 38);
+    arp_learn(sip, rxb + 22);
+    if (op == 1 && tip == my_ip && my_ip != 0) {
+        kmemset(arpb, 0, 64);
+        kmemcpy(arpb, rxb + 22, 6); kmemcpy(arpb + 6, &my_mac[0], 6);
+        pb16(arpb, 12, 0x0806); pb16(arpb, 14, 1); pb16(arpb, 16, 0x0800);
+        arpb[18] = 6; arpb[19] = 4; pb16(arpb, 20, 2);
+        kmemcpy(arpb + 22, &my_mac[0], 6); pb32(arpb, 28, my_ip);
+        kmemcpy(arpb + 32, rxb + 22, 6); pb32(arpb, 38, sip);
+        nic_send(arpb, 42);
+    }
+}
+
+// ================================================================= IPv4 out
+/// payload is already at txb + 34.  false when the next hop's MAC is not known yet (an ARP request is sent; retry later)
+fn net_send_ip(dst: int, proto: int, plen: int) -> bool {
+    var i = 0;
+    if (dst == 0xFFFFFFFF) { while (i < 6) { txb[i] = 255; i++; } }
+    else {
+        var nh = dst;
+        if (net_mask != 0 && (dst & net_mask) != (my_ip & net_mask)) { nh = gw_ip; }
+        let k = arp_find(nh);
+        if (k < 0) { arp_request(nh); return false; }
+        kmemcpy(txb, &arp_mac[k * 6], 6);
+    }
+    kmemcpy(txb + 6, &my_mac[0], 6);
+    pb16(txb, 12, 0x0800);
+    txb[14] = 0x45; txb[15] = 0;
+    pb16(txb, 16, 20 + plen); pb16(txb, 18, ip_id); ip_id++;
+    pb16(txb, 20, 0x4000);
+    txb[22] = 64; txb[23] = proto as u8; pb16(txb, 24, 0);
+    pb32(txb, 26, my_ip); pb32(txb, 30, dst);
+    pb16(txb, 24, csum(txb, 14, 20, 0));
+    nic_send(txb, 34 + plen);
+    net_tx_count++;
+    return true;
+}
+
+fn net_send_udp(dst: int, sport: int, dport: int, len: int) -> bool {     // data at txb + 42
+    pb16(txb, 34, sport); pb16(txb, 36, dport); pb16(txb, 38, 8 + len); pb16(txb, 40, 0);
+    return net_send_ip(dst, 17, 8 + len);
+}
+
+// ================================================================= DHCP
+var dh_state = 0;                    // 0 off, 1 discover sent, 2 request sent, 3 bound
+var dh_xid = 0x50454143; var dh_t = 0; var dh_tries = 0;
+var dh_offer = 0; var dh_server = 0;
+
+fn dhcp_send(mtype: int) {
+    kmemset(txb + 42, 0, 300);
+    let b = txb + 42;
+    b[0] = 1; b[1] = 1; b[2] = 6; b[3] = 0;
+    pb32(b, 4, dh_xid); pb16(b, 8, 0); pb16(b, 10, 0x8000);
+    kmemcpy(b + 28, &my_mac[0], 6);
+    b[236] = 99; b[237] = 130; b[238] = 83; b[239] = 99;
+    var o = 240;
+    b[o] = 53; b[o + 1] = 1; b[o + 2] = mtype as u8; o = o + 3;
+    if (mtype == 3) {
+        b[o] = 50; b[o + 1] = 4; pb32(b, o + 2, dh_offer); o = o + 6;
+        b[o] = 54; b[o + 1] = 4; pb32(b, o + 2, dh_server); o = o + 6;
+    }
+    b[o] = 55; b[o + 1] = 3; b[o + 2] = 1; b[o + 3] = 3; b[o + 4] = 6; o = o + 5;
+    b[o] = 255; o++;
+    net_send_udp(0xFFFFFFFF, 68, 67, o);
+    dh_t = ticks;
+}
+
+fn net_configure(ip: int, mask: int, gw: int, dns: int, why: *u8) {
+    my_ip = ip; net_mask = mask; gw_ip = gw; dns_ip = dns;
+    net_up = true; dh_state = 3;
+    net_say(why);
+    if (gw != 0) { arp_request(gw); }
+}
+
+fn dhcp_start() {
+    dh_state = 1; dh_tries = 1; dh_xid = dh_xid + 1;
+    my_ip = 0; net_mask = 0; gw_ip = 0; dns_ip = 0; net_up = false;
+    net_say("requesting an address (DHCP) ...");
+    dhcp_send(1);
+}
+
+fn dhcp_rx(p: *u8, len: int) {
+    if (len < 241 || p[0] != 2 || be32(p, 4) != dh_xid) { return; }
+    let yi = be32(p, 16);
+    var mtype = 0; var mask = 0xFFFFFF00; var gw = 0; var dns = 0; var srv = 0;
+    var o = 240;
+    while (o + 1 < len && p[o] != 255) {
+        let code = p[o] as int;
+        if (code == 0) { o++; continue; }
+        let l = p[o + 1] as int;
+        if (code == 53) { mtype = p[o + 2] as int; }
+        else if (code == 1) { mask = be32(p, o + 2); }
+        else if (code == 3) { gw = be32(p, o + 2); }
+        else if (code == 6) { dns = be32(p, o + 2); }
+        else if (code == 54) { srv = be32(p, o + 2); }
+        o = o + 2 + l;
+    }
+    if (mtype == 2 && dh_state == 1) { dh_offer = yi; dh_server = srv; dh_state = 2; dh_tries = 1; dhcp_send(3); }
+    else if (mtype == 5 && dh_state == 2) {
+        if (dns == 0) { dns = gw; }
+        net_configure(yi, mask, gw, dns, "connected (DHCP)");
+    }
+    else if (mtype == 6) { dhcp_start(); }
+}
+
+fn dhcp_tick() {
+    if (dh_state == 1 || dh_state == 2) {
+        if (ticks - dh_t > 200) {
+            if (dh_tries >= 4) {
+                net_configure(0x0A00020F, 0xFFFFFF00, 0x0A000202, 0x0A000203, "no DHCP answer - using the QEMU defaults 10.0.2.15");
+                return;
+            }
+            dh_tries++;
+            if (dh_state == 1) { dhcp_send(1); } else { dhcp_send(3); }
+        }
+    }
+}
+
+// ================================================================= DNS
+var dns_busy = false; var dns_done = false; var dns_ok = false; var dns_result = 0;
+var dns_name: u8[72]; var dns_id = 0x2468; var dns_t = 0; var dns_tries = 0;
+const DNS_PORT = 40053;
+
+fn dns_send() {
+    let b = txb + 42;
+    kmemset(b, 0, 12);
+    pb16(b, 0, dns_id); pb16(b, 2, 0x0100); pb16(b, 4, 1);
+    var o = 12;
+    var i = 0;
+    while (dns_name[i] != 0) {
+        var j = i;
+        while (dns_name[j] != 0 && dns_name[j] != '.') { j++; }
+        b[o] = (j - i) as u8; o++;
+        while (i < j) { b[o] = dns_name[i]; o++; i++; }
+        if (dns_name[i] == '.') { i++; }
+    }
+    b[o] = 0; o++;
+    pb16(b, o, 1); pb16(b, o + 2, 1); o = o + 4;
+    net_send_udp(dns_ip, DNS_PORT, 53, o);
+    dns_t = ticks;
+}
+/// start a lookup (numeric addresses finish at once).  Poll dns_done / dns_ok / dns_result.
+fn dns_start(name: *u8) {
+    dns_busy = true; dns_done = false; dns_ok = false; dns_tries = 1; dns_id++;
+    kstrncpy(&dns_name[0], name, 72);
+    let ip = ip_parse(name);
+    if (ip >= 0) { dns_result = ip; dns_ok = true; dns_done = true; dns_busy = false; return; }
+    if (!net_up || dns_ip == 0) { dns_done = true; dns_busy = false; return; }
+    dns_send();
+}
+fn dns_skip_name(p: *u8, o: int, len: int) -> int {
+    var i = o;
+    while (i < len) {
+        let c = p[i] as int;
+        if (c == 0) { return i + 1; }
+        if ((c & 0xC0) == 0xC0) { return i + 2; }
+        i = i + 1 + c;
+    }
+    return len;
+}
+fn dns_rx(p: *u8, len: int) {
+    if (!dns_busy || len < 12 || be16(p, 0) != dns_id) { return; }
+    if ((be16(p, 2) & 0x8000) == 0) { return; }
+    if ((be16(p, 2) & 15) != 0) { dns_done = true; dns_busy = false; return; }       // NXDOMAIN etc.
+    let qd = be16(p, 4); let an = be16(p, 6);
+    var o = 12;
+    var q = 0;
+    while (q < qd) { o = dns_skip_name(p, o, len) + 4; q++; }
+    var a = 0;
+    while (a < an && o + 10 <= len) {
+        o = dns_skip_name(p, o, len);
+        let t = be16(p, o); let cl = be16(p, o + 2); let rl = be16(p, o + 8);
+        o = o + 10;
+        if (t == 1 && cl == 1 && rl == 4 && o + 4 <= len) { dns_result = be32(p, o); dns_ok = true; dns_done = true; dns_busy = false; return; }
+        o = o + rl;
+        a++;
+    }
+    dns_done = true; dns_busy = false;                                                // answered, but no A record
+}
+fn dns_tick() {
+    if (dns_busy && ticks - dns_t > 150) {
+        if (dns_tries >= 4) { dns_done = true; dns_busy = false; return; }
+        dns_tries++; dns_send();
+    }
+}
+
+// ================================================================= ICMP echo (ping)
+var ping_wait = false; var ping_got = false; var ping_t = 0; var ping_rtt = 0; var ping_seq = 0;
+fn ping_send(dst: int) -> bool {
+    let b = txb + 34;
+    kmemset(b, 0, 40);
+    b[0] = 8; b[1] = 0; pb16(b, 4, 0x5043); pb16(b, 6, ping_seq);
+    var i = 8;
+    while (i < 40) { b[i] = (i + 0x30) as u8; i++; }
+    pb16(b, 2, csum(txb, 34, 40, 0));
+    if (!net_send_ip(dst, 1, 40)) { return false; }
+    ping_wait = true; ping_got = false; ping_t = ticks;
+    return true;
+}
+fn icmp_rx(src: int, ip: int, n: int) {                         // ip = offset of the ICMP message in rxb, n = its length
+    let t = rxb[ip] as int;
+    if (t == 8 && n >= 8 && n <= 1400) {
+        kmemcpy(txb + 34, rxb + ip, n);
+        txb[34] = 0; pb16(txb, 36, 0);
+        pb16(txb, 36, csum(txb, 34, n, 0));
+        net_send_ip(src, 1, n);
+    } else if (t == 0 && n >= 8 && be16(rxb, ip + 4) == 0x5043 && be16(rxb, ip + 6) == ping_seq) {
+        ping_got = true; ping_wait = false; ping_rtt = (ticks - ping_t) * 10;
+    }
+}
+
+// ================================================================= TCP (a single client connection)
+const TS_CLOSED = 0; const TS_SYN = 1; const TS_EST = 2; const TS_DONE = 3;
+var tc_state = 0; var tc_lport = 49152; var tc_rip = 0; var tc_rport = 80;
+var tc_seq = 0; var tc_una = 0; var tc_ack = 0; var tc_iss = 1000;
+var tc_t = 0; var tc_tries = 0; var tc_last_rx = 0;
+var tc_fail = false; var tc_err: u8[64];
+var tc_req: *u8; var tc_req_len = 0; var tc_req_sent = false;
+var rb_buf: *u8; var rb_len = 0; var rb_cap = 0; var rb_trunc = false;
+const RB_MAX = 4194304;
+
+fn sdiff(a: int, b: int) -> int {
+    var d = (a - b) & 0xFFFFFFFF;
+    if (d >= 0x80000000) { d = d - 0x100000000; }
+    return d;
+}
+
+fn tcp_send(flags: int, data: *u8, dlen: int, seq: int) -> bool {
+    let b = txb + 34;
+    var hl = 20;
+    if ((flags & 2) != 0) { hl = 24; }
+    pb16(b, 0, tc_lport); pb16(b, 2, tc_rport);
+    pb32(b, 4, seq); pb32(b, 8, tc_ack);
+    b[12] = ((hl / 4) << 4) as u8; b[13] = flags as u8;
+    pb16(b, 14, 16384); pb16(b, 16, 0); pb16(b, 18, 0);
+    if (hl == 24) { b[20] = 2; b[21] = 4; pb16(b, 22, 1460); }
+    if (dlen > 0) { kmemcpy(b + hl, data, dlen); }
+    let tl = hl + dlen;
+    var pseudo = (my_ip >> 16) + (my_ip & 0xFFFF) + (tc_rip >> 16) + (tc_rip & 0xFFFF) + 6 + tl;
+    pb16(b, 16, csum(txb, 34, tl, pseudo));
+    return net_send_ip(tc_rip, 6, tl);
+}
+
+fn rb_free() { if (rb_buf != (0 as *u8)) { kfree(rb_buf); } rb_buf = 0 as *u8; rb_len = 0; rb_cap = 0; rb_trunc = false; }
+fn rb_append(p: *u8, n: int) {
+    if (rb_len + n + 1 > rb_cap) {
+        var nc = rb_cap * 2;
+        if (nc < 32768) { nc = 32768; }
+        while (nc < rb_len + n + 1) { nc = nc * 2; }
+        if (nc > RB_MAX + 4096) { rb_trunc = true; return; }
+        let nb = kmalloc(nc);
+        if (nb == (0 as *u8)) { rb_trunc = true; return; }
+        if (rb_len > 0) { kmemcpy(nb, rb_buf, rb_len); }
+        if (rb_buf != (0 as *u8)) { kfree(rb_buf); }
+        rb_buf = nb; rb_cap = nc;
+    }
+    kmemcpy(rb_buf + rb_len, p, n);
+    rb_len = rb_len + n;
+    rb_buf[rb_len] = 0;
+}
+
+fn tcp_reset_state() { tc_state = TS_CLOSED; tc_req = 0 as *u8; tc_req_len = 0; tc_req_sent = false; }
+fn tcp_fail(msg: *u8) { tc_fail = true; kstrncpy(&tc_err[0], msg, 64); tc_state = TS_CLOSED; }
+
+/// close the connection: tell the peer with RST (we never wait for a graceful close)
+fn tcp_abort() {
+    if (tc_state == TS_SYN || tc_state == TS_EST) { tcp_send(0x14, 0 as *u8, 0, tc_seq); }
+    tc_state = TS_CLOSED;
+}
+
+fn tcp_connect(ip: int, port: int) {
+    tcp_reset_state();
+    rb_free();
+    tc_fail = false; tc_err[0] = 0;
+    tc_rip = ip; tc_rport = port;
+    tc_lport = 49152 + ((tc_lport + 7) & 0x3FFF) % 16000;
+    tc_iss = (tc_iss + ticks * 64 + 12345) & 0x7FFFFFFF;
+    tc_seq = tc_iss; tc_una = tc_iss; tc_ack = 0;
+    tc_state = TS_SYN; tc_tries = 0; tc_t = ticks; tc_last_rx = ticks;
+    if (tcp_send(0x02, 0 as *u8, 0, tc_iss)) { }
+}
+
+/// queue the request bytes (copied) and send them
+fn tcp_send_request(data: *u8, n: int) {
+    if (tc_req != (0 as *u8)) { kfree(tc_req); }
+    tc_req = kmalloc(n + 1);
+    if (tc_req == (0 as *u8)) { tcp_fail("out of memory"); return; }
+    kmemcpy(tc_req, data, n);
+    tc_req_len = n; tc_req_sent = true; tc_tries = 0; tc_t = ticks;
+    tcp_send(0x18, tc_req, n, tc_seq);
+    tc_seq = (tc_seq + n) & 0xFFFFFFFF;
+}
+
+var hdr_end = -1;                    // offset of the first body byte once the response headers are complete
+var hdr_clen = -1;                   // Content-Length, or -1
+var hdr_scan = 0;
+
+fn http_lower(c: int) -> int { if (c >= 'A' && c <= 'Z') { return c + 32; } return c; }
+fn http_find_end() {
+    while (hdr_end < 0 && hdr_scan + 3 < rb_len) {
+        if (rb_buf[hdr_scan] == 13 && rb_buf[hdr_scan + 1] == 10 && rb_buf[hdr_scan + 2] == 13 && rb_buf[hdr_scan + 3] == 10) { hdr_end = hdr_scan + 4; }
+        hdr_scan++;
+    }
+    if (hdr_end >= 0 && hdr_clen < 0) {
+        // Content-Length: scan the header lines
+        var i = 0;
+        while (i < hdr_end) {
+            var e = i;
+            while (e < hdr_end && rb_buf[e] != 10) { e++; }
+            if (e - i > 16 && kmatch_ci(rb_buf + i, "content-length:")) { hdr_clen = katoi_n(rb_buf + i + 15, e - i - 15); }
+            i = e + 1;
+        }
+    }
+}
+fn katoi_n(p: *u8, n: int) -> int {
+    var v = 0; var i = 0;
+    while (i < n && (p[i] == ' ')) { i++; }
+    while (i < n && p[i] >= '0' && p[i] <= '9') { v = v * 10 + ((p[i] as int) - '0'); i++; }
+    return v;
+}
+
+fn tcp_finish() {
+    if (tc_state == TS_EST) { tcp_send(0x11, 0 as *u8, 0, tc_seq); tc_seq = (tc_seq + 1) & 0xFFFFFFFF; }
+    tc_state = TS_DONE;
+}
+
+fn tcp_rx(ipoff: int, tl: int, src: int) {
+    if (tc_state == TS_CLOSED || tc_state == TS_DONE || src != tc_rip) { return; }
+    let p = rxb + ipoff;
+    if (be16(p, 0) != tc_rport || be16(p, 2) != tc_lport || tl < 20) { return; }
+    let seq = be32(p, 4); let ack = be32(p, 8);
+    let hl = ((p[12] as int) >> 4) * 4;
+    let f = p[13] as int;
+    if (hl < 20 || hl > tl) { return; }
+    let dlen = tl - hl;
+    tc_last_rx = ticks;
+    if ((f & 4) != 0) {
+        if (tc_state == TS_SYN) { tcp_fail("connection refused"); } else { tcp_fail("connection reset by the server"); }
+        return;
+    }
+    if (tc_state == TS_SYN) {
+        if ((f & 0x12) == 0x12 && ack == ((tc_iss + 1) & 0xFFFFFFFF)) {
+            tc_ack = (seq + 1) & 0xFFFFFFFF; tc_una = ack; tc_seq = ack;
+            tc_state = TS_EST; tc_tries = 0;
+            tcp_send(0x10, 0 as *u8, 0, tc_seq);
+        }
+        return;
+    }
+    // established
+    if ((f & 0x10) != 0 && sdiff(ack, tc_una) > 0 && sdiff(ack, tc_seq) <= 0) { tc_una = ack; }
+    var need_ack = false;
+    if (dlen > 0) {
+        let d = sdiff(tc_ack, seq);                 // > 0: the segment starts before what we expect (retransmission / overlap)
+        if (d == 0) { rb_append(p + hl, dlen); tc_ack = (tc_ack + dlen) & 0xFFFFFFFF; }
+        else if (d > 0 && d < dlen) { rb_append(p + hl + d, dlen - d); tc_ack = (tc_ack + dlen - d) & 0xFFFFFFFF; }
+        need_ack = true;
+    }
+    if ((f & 1) != 0 && sdiff((seq + dlen) & 0xFFFFFFFF, tc_ack) == 0) {
+        tc_ack = (tc_ack + 1) & 0xFFFFFFFF;
+        tcp_send(0x10, 0 as *u8, 0, tc_seq);
+        tcp_finish();
+        return;
+    }
+    if (need_ack) { tcp_send(0x10, 0 as *u8, 0, tc_seq); }
+    // headers complete and Content-Length satisfied: we are done without waiting for the close
+    http_find_end();
+    if (hdr_end >= 0 && hdr_clen >= 0 && rb_len - hdr_end >= hdr_clen) { tcp_finish(); }
+}
+
+fn tcp_tick() {
+    if (tc_state == TS_SYN) {
+        if (ticks - tc_t > 100 * (1 << tc_tries)) {
+            if (tc_tries >= 4) { tcp_fail("connection timed out"); return; }
+            tc_tries++; tc_t = ticks;
+            tcp_send(0x02, 0 as *u8, 0, tc_iss);
+        }
+    } else if (tc_state == TS_EST) {
+        if (tc_req_sent && tc_una != tc_seq && tc_una == ((tc_seq - tc_req_len) & 0xFFFFFFFF)) {      // request not acknowledged yet
+            if (ticks - tc_t > 100 * (tc_tries + 1)) {
+                if (tc_tries >= 5) { tcp_fail("the server did not acknowledge the request"); return; }
+                tc_tries++; tc_t = ticks;
+                tcp_send(0x18, tc_req, tc_req_len, tc_una);
+            }
+        }
+        if (ticks - tc_last_rx > 1500) {                                    // 15 s of silence
+            if (rb_len > 0) { tcp_finish(); } else { tcp_fail("the server did not answer"); }
+        }
+    }
+}
+
+// ================================================================= HTTP fetch engine
+const F_IDLE = 0; const F_DNS = 1; const F_CONN = 2; const F_LOAD = 3; const F_DONE = 4; const F_ERR = 5;
+var fx_state = 0;
+var fx_host: u8[72]; var fx_path: u8[300]; var fx_port = 80;
+var fx_msg: u8[72];
+var resp_code = 0; var resp_off = 0; var resp_len = 0;
+var resp_loc: u8[300]; var resp_type: u8[64];
+var resp_name: u8[64]; var resp_enc = 0;           // Content-Disposition file name; Content-Encoding (0 identity, 1 compressed)
+
+fn f_set_err(m: *u8) { kstrncpy(&fx_msg[0], m, 72); fx_state = F_ERR; }
+
+fn fetch_busy() -> bool { return fx_state >= F_DNS && fx_state <= F_LOAD; }
+
+fn fetch_start(host: *u8, port: int, path: *u8) -> bool {
+    if (fetch_busy()) { return false; }
+    if (!net_ready) { f_set_err("no network card found (QEMU: -nic user,model=rtl8139)"); return true; }
+    if (!net_up) { f_set_err("the network is not up yet (no address)"); return true; }
+    kstrncpy(&fx_host[0], host, 72); kstrncpy(&fx_path[0], path, 300); fx_port = port;
+    fx_msg[0] = 0; resp_code = 0; resp_off = 0; resp_len = 0; resp_loc[0] = 0; resp_type[0] = 0; resp_name[0] = 0; resp_enc = 0;
+    hdr_end = -1; hdr_clen = -1; hdr_scan = 0;
+    rb_free();
+    fx_state = F_DNS;
+    dns_start(&fx_host[0]);
+    kstrncpy(&fx_msg[0], "looking up host ...", 72);
+    return true;
+}
+
+fn fetch_cancel() {
+    if (fetch_busy()) { tcp_abort(); dns_busy = false; kstrncpy(&fx_msg[0], "cancelled", 72); fx_state = F_ERR; }
+}
+fn fetch_release() { rb_free(); fx_state = F_IDLE; }
+
+fn http_request_text(out: *u8) -> int {
+    var o = 0;
+    o = o + kputs_at(out + o, "GET ");
+    o = o + kputs_at(out + o, &fx_path[0]);
+    o = o + kputs_at(out + o, " HTTP/1.0\r\nHost: ");
+    o = o + kputs_at(out + o, &fx_host[0]);
+    o = o + kputs_at(out + o, "\r\nUser-Agent: Peacock/1.4 (KingCobra)\r\nAccept: text/html, text/plain, */*\r\nAccept-Encoding: identity\r\nAccept-Language: en\r\nConnection: close\r\n\r\n");
+    out[o] = 0;
+    return o;
+}
+fn kputs_at(out: *u8, s: *u8) -> int { var i = 0; while (s[i] != 0) { out[i] = s[i]; i++; } return i; }
+
+/// parse the status line and the interesting headers; decode a chunked body in place
+fn http_parse() {
+    resp_code = 0; resp_off = 0; resp_len = 0; resp_loc[0] = 0; resp_type[0] = 0; resp_name[0] = 0; resp_enc = 0;
+    if (rb_len < 12 || rb_buf == (0 as *u8)) { return; }
+    http_find_end();
+    if (!kstarts(rb_buf, "HTTP/")) {                      // not HTTP at all: show it raw
+        resp_code = 200; resp_off = 0; resp_len = rb_len; return;
+    }
+    resp_code = katoi_n(rb_buf + 9, 3);
+    var chunked = false;
+    var i = 0;
+    var he = hdr_end;
+    if (he < 0) { he = rb_len; }
+    while (i < he) {
+        var e = i;
+        while (e < he && rb_buf[e] != 10) { e++; }
+        var ll = e - i;
+        if (ll > 0 && rb_buf[e - 1] == 13) { ll--; }
+        if (ll > 9 && kmatch_ci(rb_buf + i, "location:")) { var k = 9; while (k < ll && rb_buf[i + k] == ' ') { k++; } var m = 0; while (k < ll && m < 299) { resp_loc[m] = rb_buf[i + k]; m++; k++; } resp_loc[m] = 0; }
+        else if (ll > 13 && kmatch_ci(rb_buf + i, "content-type:")) { var k2 = 13; while (k2 < ll && rb_buf[i + k2] == ' ') { k2++; } var m2 = 0; while (k2 < ll && m2 < 63) { resp_type[m2] = rb_buf[i + k2]; m2++; k2++; } resp_type[m2] = 0; }
+        else if (ll > 17 && kmatch_ci(rb_buf + i, "content-encoding:")) { var k4 = 17; while (k4 < ll && rb_buf[i + k4] == ' ') { k4++; } if (!kmatch_ci(rb_buf + i + k4, "identity")) { resp_enc = 1; } }
+        else if (ll > 20 && kmatch_ci(rb_buf + i, "content-disposition:")) {
+            var k5 = 20; var fnd = -1;
+            while (k5 + 9 < ll) { if (kmatch_ci(rb_buf + i + k5, "filename=")) { fnd = k5 + 9; break; } k5++; }
+            if (fnd >= 0) {
+                if (rb_buf[i + fnd] == '"') { fnd++; }
+                var m3 = 0;
+                while (fnd < ll && rb_buf[i + fnd] != '"' && rb_buf[i + fnd] != ';' && rb_buf[i + fnd] != '/' && m3 < 62) { resp_name[m3] = rb_buf[i + fnd]; m3++; fnd++; }
+                resp_name[m3] = 0;
+            }
+        }
+        else if (ll > 18 && kmatch_ci(rb_buf + i, "transfer-encoding:")) { var k3 = 18; while (k3 < ll && rb_buf[i + k3] == ' ') { k3++; } if (kmatch_ci(rb_buf + i + k3, "chunked")) { chunked = true; } }
+        i = e + 1;
+    }
+    if (hdr_end < 0) { resp_off = rb_len; resp_len = 0; return; }
+    resp_off = hdr_end; resp_len = rb_len - hdr_end;
+    if (chunked) {
+        // decode: hex size CRLF data CRLF ... 0 CRLF
+        var src = resp_off; var dst = resp_off;
+        while (src < rb_len) {
+            var sz = 0;
+            while (src < rb_len && rb_buf[src] != 13 && rb_buf[src] != 10 && rb_buf[src] != ';') { sz = sz * 16 + khexval(rb_buf[src] as int); src++; }
+            while (src < rb_len && rb_buf[src] != 10) { src++; }
+            src++;
+            if (sz == 0 || src >= rb_len) { break; }
+            var take = sz;
+            if (src + take > rb_len) { take = rb_len - src; }
+            kmemmove(rb_buf + dst, rb_buf + src, take);
+            dst = dst + take; src = src + take + 2;
+        }
+        resp_len = dst - resp_off;
+        rb_buf[dst] = 0;
+    } else if (hdr_clen >= 0 && hdr_clen < resp_len) { resp_len = hdr_clen; }
+}
+/// case-insensitive prefix test against a lower-case literal
+fn kmatch_ci(s: *u8, lit: *u8) -> bool {
+    var i = 0;
+    while (lit[i] != 0) { if (http_lower(s[i] as int) != (lit[i] as int)) { return false; } i++; }
+    return true;
+}
+
+fn fetch_poll() {
+    if (fx_state == F_DNS) {
+        if (dns_done) {
+            if (!dns_ok) { f_set_err("cannot resolve the host name"); return; }
+            fx_state = F_CONN;
+            kstrncpy(&fx_msg[0], "connecting ...", 72);
+            tcp_connect(dns_result, fx_port);
+        }
+    } else if (fx_state == F_CONN) {
+        if (tc_fail) { f_set_err(&tc_err[0]); return; }
+        if (tc_state == TS_EST) {
+            var req: u8[600];
+            let n = http_request_text(&req[0]);
+            tcp_send_request(&req[0], n);
+            fx_state = F_LOAD;
+            kstrncpy(&fx_msg[0], "waiting for the server ...", 72);
+        }
+    } else if (fx_state == F_LOAD) {
+        if (tc_fail) {
+            if (rb_len > 0) { http_parse(); fx_state = F_DONE; kstrncpy(&fx_msg[0], "done (connection reset)", 72); } else { f_set_err(&tc_err[0]); }
+            return;
+        }
+        if (tc_state == TS_DONE) { http_parse(); fx_state = F_DONE; kstrncpy(&fx_msg[0], "done", 72); }
+        else if (rb_len > 0) { kstrncpy(&fx_msg[0], "receiving ...", 72); }
+    }
+}
+
+// ================================================================= frame loop
+fn udp_rx(src: int, off: int, n: int) {
+    if (n < 8) { return; }
+    let sp = be16(rxb, off); let dp = be16(rxb, off + 2);
+    let ulen = be16(rxb, off + 4) - 8;
+    if (ulen < 0 || ulen > n - 8) { return; }
+    if (dp == 68) { dhcp_rx(rxb + off + 8, ulen); }
+    else if (dp == DNS_PORT && sp == 53) { dns_rx(rxb + off + 8, ulen); }
+}
+
+fn net_rx(n: int) {
+    if (n < 14) { return; }
+    net_rx_count++;
+    let et = be16(rxb, 12);
+    if (et == 0x0806) { arp_rx(n); return; }
+    if (et != 0x0800 || n < 34) { return; }
+    let vhl = rxb[14] as int;
+    if ((vhl >> 4) != 4) { return; }
+    let ihl = (vhl & 15) * 4;
+    let tot = be16(rxb, 16);
+    if (ihl < 20 || tot < ihl || 14 + tot > n) { return; }
+    if ((be16(rxb, 20) & 0x3FFF) != 0) { return; }           // fragments are not supported
+    let dst = be32(rxb, 30); let src = be32(rxb, 26);
+    if (dst != my_ip && dst != 0xFFFFFFFF && my_ip != 0) { return; }
+    let proto = rxb[23] as int;
+    let off = 14 + ihl;
+    let pl = tot - ihl;
+    if (src != 0 && net_mask != 0 && (src & net_mask) == (my_ip & net_mask)) { arp_learn(src, rxb + 6); }
+    if (proto == 1) { icmp_rx(src, off, pl); }
+    else if (proto == 17) { udp_rx(src, off, pl); }
+    else if (proto == 6) { tcp_rx(off, pl, src); }
+}
+
+fn net_poll() {
+    if (!net_ready) { return; }
+    var k = 0;
+    while (k < 12) {
+        let n = nic_recv(rxb);
+        if (n <= 0) { break; }
+        net_rx(n);
+        k++;
+    }
+    dhcp_tick(); dns_tick(); tcp_tick(); fetch_poll();
+    if (ping_wait && ticks - ping_t > 300) { ping_wait = false; }
+}
+
+fn net_init() {
+    net_ready = false; net_up = false;
+    if (!nic_init()) { net_say("no supported network card (QEMU: -nic user,model=rtl8139)"); return; }
+    rxb = kzalloc(2048); txb = kzalloc(2048); arpb = kzalloc(128);
+    if (rxb == (0 as *u8) || txb == (0 as *u8) || arpb == (0 as *u8)) { net_say("out of memory"); return; }
+    nic_mac(&my_mac[0]);
+    net_ready = true;
+    dhcp_start();
+}

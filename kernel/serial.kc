@@ -1,0 +1,46 @@
+// serial.kc -- COM1 (115200 8N1) used for the boot log and for tests.  Author: Divyanshu Sinha (MIT License)
+const COM1 = 0x3F8;
+var ser_ready = false;
+
+fn ser_init() {
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x80);
+    outb(COM1 + 0, 0x01);
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);
+    outb(COM1 + 2, 0xC7);
+    outb(COM1 + 4, 0x0B);
+    ser_ready = true;
+}
+
+fn ser_putc(c: int) {
+    if (!ser_ready) { return; }
+    var spin = 0;
+    while ((inb(COM1 + 5) & 0x20) == 0 && spin < 200000) { spin++; }
+    outb(COM1, c);
+}
+
+fn ser_puts(s: *u8) { var i = 0; while (s[i] != 0) { if (s[i] == 10) { ser_putc(13); } ser_putc(s[i]); i++; } }
+
+fn ser_putdec(v: int) {
+    if (v < 0) { ser_putc('-'); v = -v; }
+    var digits: u8[24];
+    var n = 0;
+    if (v == 0) { digits[0] = '0'; n = 1; }
+    while (v > 0) { digits[n] = ('0' + v % 10) as u8; n++; v = v / 10; }
+    while (n > 0) { n--; ser_putc(digits[n]); }
+}
+
+fn ser_puthex(v: int) {
+    ser_puts("0x");
+    var started = false;
+    var sh = 60;
+    while (sh >= 0) {
+        let d = (v >> sh) & 15;
+        if (d != 0 || started || sh == 0) { started = true; if (d < 10) { ser_putc('0' + d); } else { ser_putc('a' + d - 10); } }
+        sh = sh - 4;
+    }
+}
+
+/// boot/status log line (also read by tests/qemu_test.py)
+fn klog(s: *u8) { ser_puts("[peacock] "); ser_puts(s); ser_puts("\n"); }
