@@ -1,0 +1,330 @@
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fail = 0;
+fn check(ok: bool, what: *u8) { if (!ok) { println("BLD FAIL:", what); fail++; } }
+fn bc(rx: int, ry: int) { let i = win_of_kind(APP_BLD); click(wins[i].x + 2 + rx, wins[i].y + TB + ry); run_frames(1); }
+fn rc(rx: int, ry: int) { let i = win_of_kind(APP_RUN); click(wins[i].x + 2 + rx, wins[i].y + TB + ry); run_frames(1); }
+fn typ(s: *u8) { type_str(s); run_frames(1); }
+fn run_app(name: *u8) { var p: u8[64]; kstrncpy(&p[0], "/apps/", 64); kstrncpy(&p[6], name, 40); kstrncpy(&p[kstrlen(&p[0])], ".pea", 5); check(run_load(&p[0]), "run_load"); run_frames(2); }
+fn sh(cmd: *u8) { kstrncpy(&tin[0], cmd, 120); tin_len = kstrlen(&tin[0]); t_exec(); }
+fn rtext(i: int) -> *u8 { return &rwd[i].text[0]; }
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init(); threads_start();
+    run_frames(2);
+
+    // ---- samples are seeded once, deleting one sticks
+    check(fs_resolve("/apps/counter.pea") >= 0 && fs_resolve("/apps/stopwatch.pea") >= 0 && fs_resolve("/apps/countdown.pea") >= 0
+          && fs_resolve("/apps/dice.pea") >= 0 && fs_resolve("/apps/tipcalc.pea") >= 0, "all samples present");
+    fs_remove(fs_resolve("/apps/dice.pea")); bld_seed_apps();
+    check(fs_resolve("/apps/dice.pea") < 0, "a deleted sample is not re-seeded");
+    fs_put_file("/apps/dice.pea", "APP|dice|260|190|15527924\nW|1|20|12|220|20|1778739|0|-1|0|Roll the dice|\nW|5|20|44|100|70|16777215|0|-1|0||\nW|1|20|60|100|40|15158332|0|-1|2|?|\nW|2|140|44|100|32|2060267|17|2|0|Roll d6|6|0|-1|0|\nW|2|140|84|100|32|9323693|17|2|0|Roll d20|20|0|-1|0|\nW|8|20|130|32|32|15965202|17|2|0||6|0|-1|20|\n");
+
+    // ---- file format: old 11/12-field widgets load with defaults, new fields round-trip
+    var hdr: int[6]; var tt: u8[32];
+    let old = "APP|old|200|100|15527924\nW|2|10|10|80|28|2060267|2|1|0|Go|5\nW|1|10|50|80|20|1778739|0|-1|0|0|\n";
+    run_alloc();
+    check(wd_parse(old as *u8, kstrlen(old), rwd, &hdr[0], &tt[0]) == 2, "old file parses");
+    check(rwd[0].act == 2 && rwd[0].act2 == 0 && rwd[0].target2 == -1 && rwd[0].val == 0 && rwd[0].arg2[0] == 0, "old widgets get default new fields");
+    var out: u8[600];
+    rwd[0].act2 = 16; rwd[0].target2 = 1; rwd[0].val = 7; kstrncpy(&rwd[0].arg2[0], "42", 32);
+    let ln = wd_ser(&out[0], rwd, 2, "old", 200, 100, 15527924);
+    var tmp: *Wd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd;
+    check(wd_parse(&out[0], ln, tmp, &hdr[0], &tt[0]) == 2 && tmp[0].act2 == 16 && tmp[0].target2 == 1 && tmp[0].val == 7 && kstreq(&tmp[0].arg2[0], "42") && kstreq(&tmp[0].arg[0], "5"), "serialise / parse round trip");
+    check(tmp[0].kind == 2 && tmp[1].kind == 1 && kstreq(&tmp[1].text[0], "0"), "plain fields round trip");
+
+    // ---- the binary executable format
+    check(pea_is_binary(fs_nodes[fs_resolve("/apps/stopwatch.pea")].data, fs_nodes[fs_resolve("/apps/stopwatch.pea")].size), "samples are installed as binaries");
+    check((fs_nodes[fs_resolve("/apps/stopwatch.pea")].attr & FA_EXEC) != 0, "and marked executable");
+    var ebuf: *u8 = kzalloc(pea_size(WD_MAX) + 16);
+    let elen = pea_encode(ebuf, tmp, 2, "Bin test", 200, 100, 15527924, 3, 1);
+    check(elen == pea_size(2) && ebuf[0] == 0x7F && ebuf[1] == 'P' && ebuf[2] == 'E' && ebuf[3] == 'A', "magic");
+    var hh: int[6]; var t2: u8[32]; var dec: *Wd = kzalloc(WD_MAX * sizeof(Wd)) as *Wd;
+    check(pea_decode(ebuf, elen, dec, &hh[0], &t2[0]) == 2, "decode");
+    check(kstreq(&t2[0], "Bin test") && hh[0] == 200 && hh[1] == 100 && hh[2] == 15527924 && hh[3] == 3 && hh[5] == 1, "program header round trips");
+    check(dec[0].act == 2 && dec[0].act2 == 16 && dec[0].target2 == 1 && dec[0].val == 7 && kstreq(&dec[0].arg2[0], "42") && kstreq(&dec[1].text[0], "0"), "widgets round trip");
+    check(wd_parse(ebuf, elen, dec, &hh[0], &t2[0]) == 2, "wd_parse takes binaries too");
+    // damage: every kind of corruption is refused with its own error
+    var bad: *u8 = kzalloc(elen + 16);
+    kmemcpy(bad, ebuf, elen); bad[1] = 'X';                       check(pea_decode(bad, elen, dec, &hh[0], &t2[0]) == PE_MAGIC, "bad magic");
+    kmemcpy(bad, ebuf, elen); bad[5] = 9;                         check(pea_decode(bad, elen, dec, &hh[0], &t2[0]) == PE_VERSION, "bad version");
+    kmemcpy(bad, ebuf, elen); bad[28] = bad[28] ^ 1;              check(pea_decode(bad, elen, dec, &hh[0], &t2[0]) == PE_HDRCRC, "header damage");
+    kmemcpy(bad, ebuf, elen); bad[PEA_HDR + 60] = bad[PEA_HDR + 60] ^ 1;   // inside the section table
+    check(pea_decode(bad, elen, dec, &hh[0], &t2[0]) < 0, "section table damage");
+    kmemcpy(bad, ebuf, elen); bad[PEA_HDR + 48 + 64 + 30] = bad[PEA_HDR + 48 + 64 + 30] ^ 0x10;    // inside a widget
+    check(pea_decode(bad, elen, dec, &hh[0], &t2[0]) == PE_SECCRC, "widget data damage");
+    check(pea_decode(ebuf, 40, dec, &hh[0], &t2[0]) == PE_SHORT, "truncated");
+    check(pea_decode(ebuf, elen - 20, dec, &hh[0], &t2[0]) < 0, "truncated body");
+    // semantically bad but with valid checksums (a hostile or buggy compiler): rejected by validation
+    tmp[0].target = 5;
+    let blen = pea_encode(bad, tmp, 2, "x", 200, 100, 0, 0, -1);
+    check(pea_decode(bad, blen, dec, &hh[0], &t2[0]) == PE_WIDGET, "target out of range is rejected");
+    tmp[0].target = 1; tmp[0].kind = 77;
+    let klen = pea_encode(bad, tmp, 2, "x", 200, 100, 0, 0, -1);
+    check(pea_decode(bad, klen, dec, &hh[0], &t2[0]) == PE_WIDGET, "unknown widget kind is rejected");
+    tmp[0].kind = 2;
+    // compile a text source into a node, then run it
+    let cn = fs_create("/apps/compiled.pea", K_FILE);
+    let src2 = "APP|compiled|200|100|15527924\nW|2|10|10|80|28|2060267|1|1|0|Go|Done\nW|1|10|50|80|20|1778739|0|-1|0|wait|\n";
+    check(pea_compile(src2 as *u8, kstrlen(src2), cn) == 0 && pea_runnable(cn) && (fs_nodes[cn].attr & FA_EXEC) != 0, "peac compiles a source");
+    run_app("compiled"); rc(20, 20); check(kstreq(rtext(1), "Done"), "the compiled program runs");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    // a text-format .pea from an older Builder still runs and is migrated
+    fs_put_file("/apps/legacy.pea", "APP|legacy|200|100|15527924\nW|1|10|10|80|20|1778739|0|-1|0|old|\n");
+    check(!pea_runnable(fs_resolve("/apps/legacy.pea")), "legacy text file is not a binary");
+    run_app("legacy"); check(rn == 1, "legacy text files still run");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    pea_migrate();
+    check(pea_runnable(fs_resolve("/apps/legacy.pea")) && (fs_nodes[fs_resolve("/apps/legacy.pea")].attr & FA_EXEC) != 0, "migration turns it into a binary");
+    // a damaged binary does not run, and says why
+    let dn = fs_create("/apps/broken.pea", K_FILE); fs_write(dn, bad, 100, false);
+    check(!run_load("/apps/broken.pea") && pea_last_err < 0, "a damaged program is refused");
+    println("refused with:", pea_err_str(pea_last_err));
+
+    // ---- designing with the mouse: tool box, tabs, pick mode
+    app_open(APP_BLD); run_frames(2);
+    check(bn == 0, "new design is empty");
+    bc(12, bd_tool_y(WK_LABEL) + 4); bc(CX + 20, CY + 20);                 // label
+    check(bn == 1 && bwd[0].kind == WK_LABEL, "label placed");
+    bc(12, bd_tool_y(WK_SLIDER) + 4); bc(CX + 20, CY + 60);                // slider
+    bc(12, bd_tool_y(WK_ICON) + 4); bc(CX + 220, CY + 60);                 // icon
+    bc(12, bd_tool_y(WK_TIMER) + 4); bc(CX + 20, CY + 120);                // timer
+    check(bn == 4 && bwd[1].kind == WK_SLIDER && bwd[2].kind == WK_ICON && bwd[3].kind == WK_TIMER, "slider, icon, timer placed");
+    check(bd_sel == 3 && bd_tab == 0, "the timer is selected, Look tab");
+    // timer: every 3 seconds (+ twice), starts paused
+    bc(BPP + BPW - 26 + 4, 110 + 4); bc(BPP + BPW - 26 + 4, 110 + 4);
+    check(bwd[3].val == 3, "timer interval stepper");
+    bc(BPP + 10, 282 + 4);
+    check((bwd[3].hid & 1) != 0, "timer starts paused");
+    // Action tab: pick "Add number" (2 clicks on >), target = the label, amount 5
+    bc(pb(1) + 10, P_TAB + 4); check(bd_tab == 1, "Action tab");
+    bc(BPP + BPW - 26 + 4, 110 + 4); bc(BPP + BPW - 26 + 4, 110 + 4);
+    check(bwd[3].act == 2, "action = Add number");
+    bc(BPP + 10, 160 + 4); check(bd_pick == 1, "pick mode (target)");
+    bc(CX + 30, CY + 25);
+    check(bwd[3].target == 0 && bd_pick == 0, "target picked from the canvas");
+    bc(BPP + 10, 210 + 4); typ("5");
+    check(kstreq(&bwd[3].arg[0], "5"), "argument typed");
+    // Then tab: copy the label text into the icon? use "Set text" on the slider: Then = Set text "10"
+    bc(pb(2) + 10, P_TAB + 4); check(bd_tab == 2, "Then tab");
+    bc(BPP + BPW - 26 + 4, 110 + 4);
+    check(bwd[3].act2 == 1 && bwd[3].act == 2, "second action independent of the first");
+    bc(BPP + 10, 160 + 4); bc(CX + 30, CY + 65);
+    check(bwd[3].target2 == 1, "second target picked");
+    bc(BPP + 10, 210 + 4); typ("10");
+    check(kstreq(&bwd[3].arg2[0], "10") && kstreq(&bwd[3].arg[0], "5"), "slots keep separate arguments");
+    // icon picker
+    bd_sel = 2; bd_tab = 0; run_frames(1);
+    bc(BPP + BPW - 26 + 4, 110 + 4); check(bwd[2].val == 1, "icon picker >");
+    bc(BPP + 4, 110 + 4); bc(BPP + 4, 110 + 4); check(bwd[2].val == ICO_N - 1, "icon picker wraps");
+    // align
+    bd_sel = 0; bc(BPP + 36 * 1 + 4, 246 + 4);
+    check(bwd[0].x == (b_w - bwd[0].w) / 2, "align centre");
+    bc(BPP + 36 * 5 + 4, 246 + 4);
+    check(bwd[0].y == b_h - bwd[0].h, "align bottom");
+    dump_ppm("/tmp/bld_design2.ppm");
+
+    // ---- lint
+    var why: u8[64];
+    check(bd_lint(&why[0]) == 0, "design is clean");
+    bwd[3].target = -1;
+    check(bd_lint(&why[0]) == 1, "missing target found"); println("lint says:", &why[0]);
+    bwd[3].target = 0;
+    bwd[2].act = 14; bwd[2].arg[0] = 0;
+    check(bd_lint(&why[0]) == 1, "switch-app without an app found");
+    kstrncpy(&bwd[2].arg[0], "nosuchapp", 32);
+    check(bd_lint(&why[0]) == 1, "unknown app found");
+    kstrncpy(&bwd[2].arg[0], "counter", 32);
+    check(bd_lint(&why[0]) == 0, "clean again");
+    bwd[2].act = 0;
+    bwd[2].act2 = 1; check(bd_lint(&why[0]) >= 1, "Then without a first action found"); bwd[2].act2 = 0;
+
+    // ---- delete / reorder renumber references, undo restores them
+    bd_delete(0);
+    check(bn == 3 && bwd[2].target == -1 && bwd[2].target2 == 0, "deleting widget 0 clears and renumbers references");
+    bd_undo();
+    check(bn == 4 && bwd[3].target == 0 && bwd[3].target2 == 1, "undo restores");
+    bd_sel = 0; bd_reorder(true);
+    check(bd_sel == 3 && bwd[0].kind == WK_SLIDER, "bring to front");
+    check(bwd[2].target == 3 && bwd[2].target2 == 0, "references follow the reorder");
+    bd_undo();
+
+    // ---- save, reload
+    kstrncpy(&b_name[0], "t1", 32); kstrncpy(&b_title[0], "Test one", 32);
+    check(bd_save(), "save");
+    let n1 = fs_resolve("/apps/t1.pea");
+    check(n1 >= 0, "file exists");
+    bd_new(); check(bn == 0, "new clears");
+    bd_load(n1);
+    check(pea_runnable(n1) && (fs_nodes[n1].attr & FA_EXEC) != 0, "the Builder saves a binary executable");
+    check(bn == 4 && bwd[3].act == 2 && bwd[3].act2 == 1 && kstreq(&b_title[0], "Test one") && kstreq(&b_name[0], "t1"), "design reloads, incl. title");
+    // an app with a warning saves but says so
+    bwd[3].target = -1; bd_save(); check(bd_warn == 1 && bd_msg[0] == 's', "save reports the warning"); println("status:", &bd_msg[0]);
+    bd_new();
+    bc(8, 10); run_frames(1);
+
+    // ---- the runner: stopwatch (timer, start / stop)
+    win_close(win_of_kind(APP_BLD)); run_frames(1);
+    run_app("stopwatch");
+    check(rn == 5 && rwd[2].kind == WK_TIMER && (rwd[2].hid & 1) != 0, "stopwatch loads with a paused timer");
+    run_frames(150); check(kstreq(rtext(1), "0"), "paused timer does not run");
+    rc(40, 120);                                                      // Start / Stop
+    check((rwd[2].hid & 1) == 0, "start resumes the timer");
+    run_frames(45);                                                   // 4.5 s
+    var v = katoi(rtext(1)); println("stopwatch after 4.5 s:", v);
+    check(v >= 3 && v <= 5, "stopwatch counts seconds");
+    rc(40, 120); let frozen = katoi(rtext(1)); run_frames(60); check(katoi(rtext(1)) == frozen, "stop pauses it");
+    rc(150, 120); check(kstreq(rtext(1), "0"), "reset");
+    dump_ppm("/tmp/bld_stopwatch.ppm");
+
+    // ---- countdown: condition gate (if > 0 then subtract) stops at 0
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("countdown");
+    rc(40, 120); run_frames(150);
+    println("countdown after 15 s:", rtext(1));
+    check(kstreq(rtext(1), "0"), "countdown stops at 0, never negative");
+    rc(150, 120); check(kstreq(rtext(1), "10"), "reset to 10");
+
+    // ---- dice: random numbers in range, icon button too
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("dice");
+    var lo = 99; var hi = 0; var q = 0;
+    while (q < 40) { rc(190, 60); let r = katoi(rtext(2)); if (r < lo) { lo = r; } if (r > hi) { hi = r; } q++; }
+    println("d6 range seen:", lo, hi);
+    check(lo >= 1 && hi <= 6 && lo != hi, "d6 within 1..6 and varying");
+    hi = 0; q = 0;
+    while (q < 60) { rc(190, 100); let r = katoi(rtext(2)); if (r > hi) { hi = r; } if (r < 1 || r > 20) { check(false, "d20 in range"); } q++; }
+    check(hi > 6, "d20 goes beyond 6");
+    rc(36, 146); check(katoi(rtext(2)) >= 1 && katoi(rtext(2)) <= 6, "the icon is a button too");
+
+    // ---- tip calculator: two-step calculation, slider, Tab, Enter
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("tipcalc");
+    rc(110 + 7 + (170 - 14) * 30 / 100 + 1, 100);                     // click the slider near 30 %
+    println("tip at slider", rtext(4), "% of 80 =", rtext(7));
+    check(katoi(rtext(4)) >= 28 && katoi(rtext(4)) <= 32, "slider click sets a value");
+    check(katoi(rtext(7)) == 80 * katoi(rtext(4)) / 100, "slider runs both calculation steps");
+    rc(110 + 7 + (170 - 14) * 50 / 100, 100);
+    check(katoi(rtext(4)) >= 48 && katoi(rtext(4)) <= 52 && katoi(rtext(7)) == 80 * katoi(rtext(4)) / 100, "slider at 50 %");
+    // dragging: press, move, release
+    let rw = win_of_kind(APP_RUN);
+    mouse_to(wins[rw].x + 2 + 112, wins[rw].y + TB + 100, 1); run_frames(1);
+    mouse_to(wins[rw].x + 2 + 250, wins[rw].y + TB + 100, 1); run_frames(1);
+    mouse_to(wins[rw].x + 2 + 250, wins[rw].y + TB + 100, 0); run_frames(1);
+    println("after drag:", rtext(4));
+    check(katoi(rtext(4)) >= 85, "dragging the slider");
+    rc(130, 58);                                                      // focus the bill box
+    kb_push(8); kb_push(8); typ("200"); kb_push(10); run_frames(1);
+    check(katoi(rtext(7)) == 200 * katoi(rtext(4)) / 100, "Enter in the bill box recalculates");
+    kb_push(9); run_frames(1);                                        // Tab: no second text box, focus stays on a text box
+    check(r_focus == 2, "Tab keeps focus on the only text box");
+    rc(40, 200); check(katoi(rtext(7)) == 200 * katoi(rtext(4)) / 100, "Calculate button");
+    dump_ppm("/tmp/bld_tip.ppm");
+
+    // ---- the classic samples still behave
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("counter");
+    rc(30, 120); rc(30, 120); rc(30, 120); rc(110, 120);
+    check(kstreq(rtext(2), "2"), "counter +1 +1 +1 -1 = 2");
+    rc(190, 120); check(kstreq(rtext(2), "0"), "counter reset");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("adder");
+    rc(40, 58); typ(""); rc(40, 105);
+    check(kstreq(rtext(5), "42"), "adder 12 + 30");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("keypad");
+    rc(40, 88); rc(104, 88); rc(168, 132); rc(40, 220);
+    check(kstreq(rtext(1), "1260"), "keypad digits");
+    rc(170, 220); check(rtext(1)[0] == 0, "keypad C");
+
+    // ---- switch app action replaces the running app
+    fs_put_file("/apps/hop.pea", "APP|hop|220|120|15527924\nW|2|20|20|120|32|2060267|14|-1|0|Go|counter|0|-1|0|\n");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("hop");
+    rc(30, 30);
+    check(rn == 6 && kstreq(&r_title[0], "counter"), "Switch to app loads the other app");
+    // message + beep do not crash
+    fs_put_file("/apps/msg.pea", "APP|msg|220|120|15527924\nW|2|20|20|120|32|2060267|13|-1|0|Say|Hello from an app|0|-1|0|\n");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    run_app("msg"); rc(30, 30); run_frames(2);
+    check(toast_active(), "Show message pops a notification");
+
+    // ---- 3D view widget
+    if (win_of_kind(APP_RUN) >= 0) { win_close(win_of_kind(APP_RUN)); run_frames(1); }
+    run_app("spinner3d");
+    check(rn == 6 && rwd[1].kind == WK_VIEW3D, "3d sample loaded");
+    check(v3_model(rwd[1].val) == 5 && v3_spin(rwd[1].val) == 2, "3d widget packs model and spin");
+    let yaw0 = r_yaw[1]; run_frames(12);
+    check(r_yaw[1] != yaw0, "3d widget spins in the runner");
+    rc(300, 75);
+    check(rwd[1].color == pal10[4], "button recolours the 3d view");
+    let yaw1 = r_yaw[1];
+    let ri = win_of_kind(APP_RUN);
+    mouse_to(wins[ri].x + 2 + 100, wins[ri].y + TB + 150, 0); mouse_to(wins[ri].x + 2 + 100, wins[ri].y + TB + 150, 1);
+    mouse_to(wins[ri].x + 2 + 140, wins[ri].y + TB + 150, 1); run_frames(1); mouse_to(wins[ri].x + 2 + 140, wins[ri].y + TB + 150, 0); run_frames(1);
+    check(r_yaw[1] != yaw1, "dragging rotates the 3d view");
+    dump_ppm("/tmp/bld3d.ppm");
+    // ---- shell: peac / attr +x / ./name.pea / permission denied
+    if (win_of_kind(APP_RUN) >= 0) { win_close(win_of_kind(APP_RUN)); run_frames(1); }
+    sh("depth flat"); check(ui_depth == 0, "depth flat"); sh("depth 3d"); check(ui_depth == 2, "depth 3d");
+    fs_put_file("/home/hello.src", "APP|Hello|240|120|15527924\nW|1|20|20|200|20|1778739|0|-1|0|Hi there||0|-1|0|\n");
+    sh("peac /home/hello.src /home/hello.pea");
+    let hn = fs_resolve("/home/hello.pea");
+    check(hn >= 0 && pea_is_binary(fs_nodes[hn].data, fs_nodes[hn].size), "peac makes a binary");
+    check((fs_nodes[hn].attr & FA_EXEC) != 0, "peac sets +x");
+    sh("attr -x /home/hello.pea"); sh("cd /home"); sh("./hello.pea"); run_frames(2);
+    check(win_of_kind(APP_RUN) < 0, "permission denied without +x");
+    sh("attr +x /home/hello.pea"); sh("./hello.pea"); run_frames(2);
+    check(win_of_kind(APP_RUN) >= 0, "runs with +x");
+    win_close(win_of_kind(APP_RUN)); run_frames(1);
+    sh("hello.src"); run_frames(2);
+    check(win_of_kind(APP_RUN) < 0, "text source is not executable");
+    // corrupt a byte: the loader refuses
+    fs_nodes[hn].data[100] = fs_nodes[hn].data[100] ^ 0x55;
+    sh("./hello.pea"); run_frames(2);
+    check(win_of_kind(APP_RUN) < 0, "corrupt binary refused");
+    if (fail > 0) { println("builder tests failed:", fail); return 1; }
+    println("builder ok");
+    return 0;
+}

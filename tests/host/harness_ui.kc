@@ -1,0 +1,153 @@
+// harness_ui.kc -- host test of the modern chrome: start menu search/grid, context menu, toast, fade-in, tray.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn rclick(x: int, y: int) { mouse_to(x, y, 0); mouse_to(x, y, 2); mouse_to(x, y, 0); }
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    run_frames(2);
+    dump_ppm("ui_desktop.ppm");
+    // --- start menu: open, all 14 apps listed, search narrows, Enter launches the first match
+    click(dock_x() + 8 + START_W / 2, dock_y() + DOCK_H / 2); run_frames(2);
+    println("menu open:", menu_open, "apps listed:", menu_n);
+    if (!menu_open || menu_n != NMENU) { println("UI FAIL menu"); return 1; }
+    dump_ppm("ui_menu.ppm");
+    type_str("cal"); run_frames(2);
+    println("search 'cal' ->", menu_n, "matches, first =", app_name(menu_list[0] + 1));
+    if (menu_n != 2) { println("UI FAIL search count"); return 1; }
+    dump_ppm("ui_menu_search.ppm");
+    kb_push(10); run_frames(2);
+    println("after Enter: menu", menu_open, "windows", nz, "kind", wins[zorder[nz - 1]].kind);
+    if (menu_open || nz != 1) { println("UI FAIL enter launches"); return 1; }
+    // --- fade-in: right after opening the window is blended with what is behind it
+    dump_ppm("ui_fade.ppm");
+    run_frames(4);
+    println("fade done:", wins[zorder[0]].anim == 0);
+    // --- menu tile click: open it again, click the 'Notes' tile (2nd tile)
+    click(dock_x() + 8 + START_W / 2, dock_y() + DOCK_H / 2); run_frames(1);
+    click(menu_x() + SM_PAD + SM_CW + 20, menu_y() + SM_GRID + 20); run_frames(2);
+    println("tile click opened window kind", wins[zorder[nz - 1]].kind);
+    if (wins[zorder[nz - 1]].kind != APP_NOTES) { println("UI FAIL tile click"); return 1; }
+    // --- Esc closes the menu
+    click(dock_x() + 8 + START_W / 2, dock_y() + DOCK_H / 2); run_frames(1); kb_push(27); run_frames(1);
+    if (menu_open) { println("UI FAIL esc"); return 1; }
+    // --- right click on the desktop: context menu, 'Next wallpaper' changes the theme and shows a toast
+    rclick(1100, 300); run_frames(2);
+    println("context menu open:", ctx_open);
+    if (!ctx_open) { println("UI FAIL ctx"); return 1; }
+    mouse_to(ctx_x + 30, ctx_y + 6 + 3 * CTX_ITEM + 10, 0); run_frames(1);
+    dump_ppm("ui_ctx.ppm");
+    let before = th_cur;
+    click(ctx_x + 30, ctx_y + 6 + 3 * CTX_ITEM + 10); run_frames(3);
+    println("theme", before + 1, "->", th_cur + 1, "toast active:", toast_active(), "text:");
+    println(&toast_txt[0]);
+    if (th_cur == before || !toast_active() || ctx_open) { println("UI FAIL next wallpaper"); return 1; }
+    dump_ppm("ui_toast.ppm");
+    // --- window button hover
+    let wi = zorder[nz - 1];
+    mouse_to(wins[wi].x + wins[wi].w - 16, wins[wi].y + 13, 0); run_frames(1);
+    println("close-button hover code:", wbtn_hover, "expect", wi * 4 + 2);
+    if (wbtn_hover != wi * 4 + 2) { println("UI FAIL hover"); return 1; }
+    dump_ppm("ui_hover.ppm");
+    // --- Seelen-style chrome: floating dock with pinned apps, top bar with tray
+    while (nz > 0) { win_close(zorder[nz - 1]); }
+    run_frames(2);
+    if (dock_n() != NPIN) { println("UI FAIL dock items"); return 1; }
+    if (dock_x() < 4 || dock_x() + dock_w() > 1280 || dock_y() + DOCK_H > 800) { println("UI FAIL dock geometry"); return 1; }
+    click(tab_x(1) + 20, dock_y() + 20); run_frames(2);                     // pinned Files
+    if (win_of_kind(APP_FILES) < 0) { println("UI FAIL pinned click"); return 1; }
+    mouse_to(tab_x(0) + 20, dock_y() + 20, 0); run_frames(2);
+    if (tab_hover != 0) { println("UI FAIL dock hover"); return 1; }
+    dump_ppm("ui_dock_hover.ppm");
+    click(tab_x(1) + 20, dock_y() + 20); run_frames(2);                     // focused -> minimise
+    if (wins[win_of_kind(APP_FILES)].minimized == 0) { println("UI FAIL minimise via dock"); return 1; }
+    click(tab_x(1) + 20, dock_y() + 20); run_frames(2);                     // restore
+    app_open(APP_CALC); app_open(APP_MINES); run_frames(2);
+    if (dock_n() != NPIN + 2) { println("UI FAIL extra dock items", dock_n()); return 1; }
+    rclick(tab_x(NPIN) + 20, dock_y() + 20); run_frames(2);                 // right-click closes that window
+    if (win_of_kind(APP_CALC) >= 0 || dock_n() != NPIN + 1) { println("UI FAIL dock right-click"); return 1; }
+    click(tb_clock_x() + 10, 12); run_frames(2);
+    if (win_of_kind(APP_CLOCK) < 0) { println("UI FAIL clock pill"); return 1; }
+    click(tb_date_x() + 10, 12); run_frames(2);
+    if (win_of_kind(APP_CAL) < 0) { println("UI FAIL date pill"); return 1; }
+    click(20, 12); run_frames(2);
+    if (!menu_open) { println("UI FAIL launcher pill"); return 1; }
+    kb_push(27); run_frames(1);
+    // --- desktop root window: five icons only; merged apps live in Settings
+    if (icon_at(icon_rect_x(4) + 10, icon_rect_y(4) + 10) != 4 || icon_at(icon_rect_x(5) + 10, icon_rect_y(5) + 10) != -1) { println("UI FAIL desktop icons"); return 1; }
+    if (desk_kind(4) != APP_SETTINGS || desk_kind(0) != APP_FILES) { println("UI FAIL desk_kind"); return 1; }
+    click(dock_x() + 8 + START_W / 2, dock_y() + DOCK_H / 2); run_frames(1);
+    menu_q[0] = 'i'; menu_q[1] = 'n'; menu_q[2] = 'f'; menu_q[3] = 'o'; menu_q[4] = 0; menu_filter();
+    if (menu_n != 0) { println("UI FAIL hidden app in launcher", menu_n); return 1; }
+    menu_q[0] = 's'; menu_q[1] = 'e'; menu_q[2] = 't'; menu_q[3] = 0; menu_filter();
+    if (menu_n != 1 || menu_list[0] + 1 != APP_SETTINGS) { println("UI FAIL settings in launcher"); return 1; }
+    kb_push(27); run_frames(1);
+    app_open(APP_INFO); run_frames(2);
+    if (win_of_kind(APP_INFO) >= 0 || win_of_kind(APP_SETTINGS) < 0 || set_page != SP_SYS) { println("UI FAIL info -> settings"); return 1; }
+    dump_ppm("ui_settings_sys.ppm");
+    app_open(APP_FONT); run_frames(2);
+    if (set_page != SP_FONTS) { println("UI FAIL fonts page"); return 1; }
+    let sw = win_of_kind(APP_SETTINGS);
+    click(wins[sw].x + 2 + 60, wins[sw].y + TB + 40 + SP_USB * 38 + 12); run_frames(2);
+    if (set_page != SP_USB) { println("UI FAIL sidebar click usb"); return 1; }
+    dump_ppm("ui_settings_usb.ppm");
+    click(tb_net_x() + 6, 12); run_frames(2);
+    if (set_page != SP_NET) { println("UI FAIL network pill"); return 1; }
+    dump_ppm("ui_settings_net.ppm");
+    pci_scan(); cpu_init();
+    click(wins[sw].x + 2 + 60, wins[sw].y + TB + 40 + SP_DEV * 38 + 12); run_frames(2);
+    if (set_page != SP_DEV) { println("UI FAIL sidebar click devices"); return 1; }
+    dump_ppm("ui_settings_devices.ppm");
+    click(wins[sw].x + 2 + 60, wins[sw].y + TB + 40 + SP_APPEAR * 38 + 12); run_frames(2);
+    if (set_page != SP_APPEAR) { println("UI FAIL sidebar click appearance"); return 1; }
+    dump_ppm("ui_settings_appearance.ppm");
+    win_close(sw); run_frames(1);
+    // windows cannot be dragged under the top bar
+    let wd = win_of_kind(APP_CAL);
+    mouse_to(wins[wd].x + 100, wins[wd].y + 10, 0); mouse_to(wins[wd].x + 100, wins[wd].y + 10, 1); mouse_to(wins[wd].x + 100, 2, 1); mouse_to(wins[wd].x + 100, 2, 0); run_frames(2);
+    if (wins[wd].y < TOPBAR_H) { println("UI FAIL window under the top bar"); return 1; }
+    dump_ppm("ui_seelen.ppm");
+    println("ui ok");
+    return 0;
+}

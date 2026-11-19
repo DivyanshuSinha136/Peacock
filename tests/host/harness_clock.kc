@@ -1,0 +1,79 @@
+// harness_apps.kc -- clock: tabs, alarm, timer, stopwatch, live icon.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    run_frames(2);
+    dump_ppm("clk_icon.ppm");
+    app_open(APP_CLOCK); run_frames(20);
+    dump_ppm("clk_0.ppm");
+    // alarm: set it to the current minute, it must fire
+    var t: int[6]; rtc_read(&t[0]);
+    kb_push('2'); run_frames(3);
+    al_h = t[3]; al_m = t[4]; al_on = true;
+    run_frames(120);
+    println("alarm ringing:", al_ring != 0, "tab", clk_tab);
+    if (al_ring == 0) { println("CLOCK FAIL alarm"); return 1; }
+    dump_ppm("clk_1.ppm");
+    clk_dismiss(); run_frames(2);
+    if (clk_ringing()) { println("CLOCK FAIL dismiss"); return 1; }
+    // timer
+    kb_push('3'); run_frames(3);
+    tm_set(150); tm_toggle(); run_frames(5);
+    dump_ppm("clk_2.ppm");
+    run_frames(30);
+    println("timer ringing:", tm_ring != 0, "left", tm_left());
+    if (tm_ring == 0) { println("CLOCK FAIL timer"); return 1; }
+    clk_dismiss(); tm_set(30000); run_frames(2);
+    // stopwatch + laps
+    kb_push('4'); run_frames(3);
+    sw_toggle(); run_frames(30); sw_lap_add(); run_frames(20); sw_lap_add(); run_frames(10);
+    println("laps:", sw_nl);
+    if (sw_nl != 2) { println("CLOCK FAIL laps"); return 1; }
+    dump_ppm("clk_3.ppm");
+    // tab click with the mouse
+    win_close(win_of_kind(APP_CLOCK)); run_frames(2);
+    println("clock ok");
+    return 0;
+}

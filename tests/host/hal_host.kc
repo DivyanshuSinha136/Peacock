@@ -1,0 +1,228 @@
+// hal_host.kc -- stand-ins for the hardware layer so the desktop can run as a normal Linux program (tests only).
+extern fn malloc(u64) -> *u8 from "libc.so.6";
+extern fn free(*u8) -> int from "libc.so.6";
+extern fn fopen(*u8, *u8) -> *u8 from "libc.so.6";
+extern fn fwrite(*u8, u64, u64, *u8) -> u64 from "libc.so.6";
+extern fn fclose(*u8) -> int from "libc.so.6";
+extern fn puts(*u8) -> int from "libc.so.6";
+extern fn fseek(*u8, int, int) -> int from "libc.so.6";
+extern fn fread(*u8, u64, u64, *u8) -> u64 from "libc.so.6";
+
+var ticks = 0;
+fn boot_ksectors() -> int { return 868; }
+fn store_lba() -> int { return (5 + boot_ksectors() + 1023) & ~1023; }
+fn bundle_lba() -> int { return store_lba() + 7680; }
+fn logo_lba() -> int { return store_lba() + 7168; }
+fn themes_lba() -> int { return bundle_lba() + 8192; }      // layout of the real image: store at LBA 1024, bundle at 8192
+var ram_usable = 134217728;
+var pm_free = 20000;
+var pm_frames = 32768;
+var disk_present = true;                       // the host "disk" is build/kingcobra.pkg, mapped at BUNDLE_LBA
+var disk_sectors = 30801;                       // exactly the size of the real image's last sector (the check must be >=)
+var disk_model: u8[44];
+fn rd64(a: int) -> int { return *(a as *u64) as int; }
+fn wr64(a: int, v: int) { *(a as *u64) = v as u64; }
+// The store area [store_lba, logo_lba) is a RAM disk so the real kcfs.kc runs in the host tests.
+var ram_store: *u8;
+var hal_wfail = -1;                             // >= 0: power cut after this many more sectors have been written
+var hal_wcount = 0;
+fn ram_store_init() { if (ram_store == (0 as *u8)) { ram_store = malloc((7168 * 512) as u64); kmemset(ram_store, 0, 7168 * 512); } }
+fn ata_write(lba: int, count: int, buf: *u8) -> bool {
+    ram_store_init();
+    if (lba < store_lba() || lba + count > logo_lba()) { return false; }
+    var i = 0;
+    while (i < count) {
+        if (hal_wfail == 0) { return false; }
+        if (hal_wfail > 0) { hal_wfail--; }
+        kmemcpy(ram_store + (lba - store_lba() + i) * 512, buf + i * 512, 512);
+        hal_wcount++;
+        i++;
+    }
+    return true;
+}
+fn ata_read(lba: int, count: int, buf: *u8) -> bool {
+    kmemset(buf, 0, count * 512);
+    if (lba >= store_lba() && lba + count <= logo_lba()) {
+        ram_store_init();
+        kmemcpy(buf, ram_store + (lba - store_lba()) * 512, count * 512);
+        return true;
+    }
+    if (lba >= themes_lba()) {
+        let ft = fopen("themes.raw", "rb");
+        if (ft == (0 as *u8)) { return false; }
+        fseek(ft, (lba - themes_lba()) * 512, 0);
+        fread(buf, 1 as u64, (count * 512) as u64, ft);
+        fclose(ft);
+        return true;
+    }
+    if (lba >= logo_lba() && lba < bundle_lba()) {
+        let fl = fopen("logo.raw", "rb");
+        if (fl == (0 as *u8)) { return false; }
+        fseek(fl, (lba - logo_lba()) * 512, 0);
+        fread(buf, 1 as u64, (count * 512) as u64, fl);
+        fclose(fl);
+        return true;
+    }
+    if (lba < bundle_lba()) { return true; }
+    let f = fopen("kingcobra.pkg", "rb");
+    if (f == (0 as *u8)) { return false; }
+    fseek(f, (lba - bundle_lba()) * 512, 0);
+    fread(buf, 1 as u64, (count * 512) as u64, f);
+    fclose(f);
+    return true;
+}
+
+fn kmalloc(n: int) -> *u8 { let p = malloc(n as u64); if (p != (0 as *u8)) { kmemset(p, 0, n); } return p; }
+fn kzalloc(n: int) -> *u8 { return kmalloc(n); }
+fn kfree(p: *u8) { if (p != (0 as *u8)) { free(p); } }
+fn heap_stats(out: *int) { out[0] = 123456; out[1] = 300000000; out[2] = 10; out[3] = 2; }
+fn rtc_read(out: *int) { out[0] = 2026; out[1] = 11; out[2] = 10; out[3] = 14; out[4] = 7; out[5] = (ticks / 100) % 60; }
+fn hal_reboot() { puts("[host] reboot"); }
+fn hal_poweroff() { puts("[host] poweroff"); }
+fn klog(s: *u8) { puts(s); }
+fn ser_puts(s: *u8) { puts(s); }
+fn ser_putdec(n: int) { println(n); }
+fn speaker_on(f: int) { }
+fn speaker_off() { }
+extern fn mprotect(int, u64, int) -> int from "libc.so.6";
+fn hal_make_exec(addr: int, n: int) { let a = addr & ~4095; mprotect(a, ((addr - a + n + 4095) & ~4095) as u64, 7); }
+fn hal_idle() { ticks = ticks + 1; }
+fn pit_sleep_ms(ms: int) { ticks = ticks + ms / 10; }
+
+/// write the back buffer as a binary PPM (P6)
+fn dump_ppm(path: *u8) {
+    let f = fopen(path, "wb");
+    var hdr: u8[32];
+    var n = 0;
+    hdr[0] = 'P'; hdr[1] = '6'; hdr[2] = 10; n = 3;
+    n = n + itoa(fb_w, &hdr[n]); hdr[n] = ' '; n++;
+    n = n + itoa(fb_h, &hdr[n]); hdr[n] = 10; n++;
+    hdr[n] = '2'; hdr[n + 1] = '5'; hdr[n + 2] = '5'; hdr[n + 3] = 10; n = n + 4;
+    fwrite(&hdr[0], 1 as u64, n as u64, f);
+    var row: u8[6144];
+    var y = 0;
+    while (y < fb_h) {
+        var x = 0;
+        while (x < fb_w) {
+            let c = px32(bb[y * fb_w + x] as int);
+            row[x * 3] = ((c >> 16) & 255) as u8; row[x * 3 + 1] = ((c >> 8) & 255) as u8; row[x * 3 + 2] = (c & 255) as u8;
+            x++;
+        }
+        fwrite(&row[0], 1 as u64, (fb_w * 3) as u64, f);
+        y++;
+    }
+    fclose(f);
+}
+
+// simulated input
+fn type_str(s: *u8) { var i = 0; while (s[i] != 0) { kb_push(s[i] as int); i++; } }
+fn mouse_to(x: int, y: int, btn: int) { mouse_push(x - mouse_x, y - mouse_y, btn); }
+fn click(x: int, y: int) { mouse_to(x, y, 0); mouse_to(x, y, 1); mouse_to(x, y, 0); }
+fn run_frames(n: int) { var i = 0; while (i < n) { ticks = ticks + 10; ui_frame(); i++; } }
+
+var dispi_regs: int[16];                               // a fake Bochs VBE adapter with 16 MiB of video memory
+fn dispi_w(i: int, v: int) { if (i >= 0 && i < 16) { dispi_regs[i] = v; } }
+fn dispi_r(i: int) -> int { if (i == 0) { return 0xB0C5; } if (i == 0xA) { return 256; } if (i >= 0 && i < 16) { return dispi_regs[i]; } return 0; }
+
+var kb_shift = false;
+var kb_ctrl = false;
+var kb_alt = false;
+var kb_caps = false;
+
+// ---------------------------------------------------------------- a simulated PCI bus (configuration mechanism #1) for pci.kc
+// 00:00.0 host bridge, 00:01.0 ISA bridge (multi-function) with 00:01.1 IDE and 00:01.2 UHCI, 00:02.0 Bochs VGA (64-bit prefetchable
+// BAR0), 00:03.0 PCI-PCI bridge to bus 1, 01:00.0 RTL8139 (I/O + memory BAR, PM + MSI capabilities, sleeping in D3).
+const PH_N = 7;
+var ph_cfg: int[448];                    // 64 dwords per function
+var ph_loc: int[7];
+var ph_mask: int[42];                    // BAR size masks (as read back after writing all-ones), type bits included
+var ph_probe: int[42];                   // the last write to the BAR was all-ones
+var ph_ready = false;
+var ph_acc = 0;                          // number of configuration accesses (to see that scans are bounded)
+fn ph_set(i: int, off: int, v: int) { ph_cfg[i * 64 + (off >> 2)] = v & 0xFFFFFFFF; }
+fn ph_def(i: int, bus: int, dev: int, fn_: int, vid: int, did: int, cls: int, hdr: int) {
+    ph_loc[i] = (bus << 8) | (dev << 3) | fn_;
+    ph_set(i, 0, vid | (did << 16));
+    ph_set(i, 4, 0);
+    ph_set(i, 8, (cls << 8) | 2);
+    ph_set(i, 0xC, hdr << 16);
+    ph_set(i, 0x3C, 0x0100);
+}
+fn ph_init() {
+    ph_ready = true;
+    var k = 0;
+    while (k < 448) { ph_cfg[k] = 0; k++; }
+    k = 0;
+    while (k < 42) { ph_mask[k] = 0; ph_probe[k] = 0; k++; }
+    ph_def(0, 0, 0, 0, 0x8086, 0x1237, 0x060000, 0x00);
+    ph_def(1, 0, 1, 0, 0x8086, 0x7000, 0x060100, 0x80);
+    ph_def(2, 0, 1, 1, 0x8086, 0x7010, 0x010180, 0x00);
+    ph_mask[2 * 6 + 4] = 0xFFFFFFF1; ph_set(2, 0x20, 0xC001);                                // I/O, 16 bytes
+    ph_mask[2 * 6 + 4] = 0xFFFFFFF1;
+    ph_def(3, 0, 1, 2, 0x8086, 0x7020, 0x0C0300, 0x00);
+    ph_mask[3 * 6 + 4] = 0xFFFFFFE1; ph_set(3, 0x20, 0xC021);                                // I/O, 32 bytes
+    ph_set(3, 0x3C, 0x050B);
+    ph_def(4, 0, 2, 0, 0x1234, 0x1111, 0x030000, 0x00);
+    ph_mask[4 * 6 + 0] = 0xFF00000C; ph_set(4, 0x10, 0xFD00000C);                            // 64-bit prefetchable memory, 16 MiB
+    ph_mask[4 * 6 + 1] = 0xFFFFFFFF; ph_set(4, 0x14, 0);
+    ph_mask[4 * 6 + 2] = 0xFFFFF000; ph_set(4, 0x18, 0xFEBF0000);                            // 32-bit memory, 4 KiB
+    ph_def(5, 0, 3, 0, 0x1B36, 0x0001, 0x060400, 0x01);
+    ph_set(5, 0x18, 0x00010100);                                                             // primary 0, secondary 1, subordinate 1
+    ph_def(6, 1, 0, 0, 0x10EC, 0x8139, 0x020000, 0x00);
+    ph_mask[6 * 6 + 0] = 0xFFFFFF01; ph_set(6, 0x10, 0xC101);                                // I/O, 256 bytes
+    ph_mask[6 * 6 + 1] = 0xFFFFFF00; ph_set(6, 0x14, 0xFEB00000);                            // memory, 256 bytes
+    ph_set(6, 4, 0x00100000);                                                                // status: capability list present
+    ph_set(6, 0x34, 0x50);
+    ph_set(6, 0x50, 0x00006001);                                                             // PM capability, next 0x60
+    ph_set(6, 0x54, 0x00000003);                                                             // PMCSR: D3hot
+    ph_set(6, 0x60, 0x00000005);                                                             // MSI capability, end of list
+    ph_set(6, 0x3C, 0x010B);
+}
+fn ph_find(bus: int, dev: int, fn_: int) -> int {
+    var i = 0;
+    while (i < PH_N) { if (ph_loc[i] == ((bus << 8) | (dev << 3) | fn_)) { return i; } i++; }
+    return -1;
+}
+fn pci_cfg_r32(bus: int, dev: int, func: int, off: int) -> int {
+    if (!ph_ready) { ph_init(); }
+    ph_acc++;
+    let i = ph_find(bus, dev, func);
+    if (i < 0) { return 0xFFFFFFFF; }
+    let o = off & 0xFC;
+    if (o >= 0x10 && o <= 0x24) {
+        let b = (o - 0x10) >> 2;
+        if (ph_probe[i * 6 + b] != 0) { return ph_mask[i * 6 + b]; }
+    }
+    return ph_cfg[i * 64 + (o >> 2)];
+}
+fn pci_cfg_w32(bus: int, dev: int, func: int, off: int, v: int) {
+    if (!ph_ready) { ph_init(); }
+    ph_acc++;
+    let i = ph_find(bus, dev, func);
+    if (i < 0) { return; }
+    let o = off & 0xFC;
+    if (o >= 0x10 && o <= 0x24) {
+        let b = (o - 0x10) >> 2;
+        if (ph_mask[i * 6 + b] == 0) { return; }
+        if ((v & 0xFFFFFFFF) == 0xFFFFFFFF) { ph_probe[i * 6 + b] = 1; return; }
+        ph_probe[i * 6 + b] = 0;
+    }
+    if (o == 4) { ph_cfg[i * 64 + 1] = (ph_cfg[i * 64 + 1] & 0xFFFF0000) | (v & 0x0007); return; }
+    ph_set(i, o, v);
+}
+
+// ---------------------------------------------------------------- raw port stubs for hwctl.kc: every write is recorded
+var hw_log_p: int[16]; var hw_log_v: int[16]; var hw_log_n = 0;
+var hw_in_val = 0;                        // value returned by hw_in16 / hw_in8
+fn hw_rec(p: int, v: int) { if (hw_log_n < 16) { hw_log_p[hw_log_n] = p; hw_log_v[hw_log_n] = v; hw_log_n++; } }
+fn hw_out8(p: int, v: int) { hw_rec(p, v); }
+fn hw_out16(p: int, v: int) { hw_rec(p, v); }
+fn hw_out32(p: int, v: int) { hw_rec(p, v); }
+fn hw_in8(p: int) -> int { return hw_in_val & 255; }
+fn hw_in16(p: int) -> int { return hw_in_val & 0xFFFF; }
+
+// a three-entry memory map for the `lsmem` command
+fn e820_count() -> int { return 3; }
+fn e820_base(i: int) -> int { if (i == 0) { return 0; } if (i == 1) { return 0x100000; } return 0xFFFC0000; }
+fn e820_len(i: int) -> int { if (i == 0) { return 0x9FC00; } if (i == 1) { return 0x7EF0000; } return 0x40000; }
+fn e820_type(i: int) -> int { if (i == 2) { return 2; } return 1; }

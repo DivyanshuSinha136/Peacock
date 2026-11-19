@@ -1,0 +1,40 @@
+// nic_host.kc -- a simulated NIC for the host tests: Ethernet frames travel through two FIFOs (2-byte big-endian length +
+// frame) to tests/gateway.py, which plays the router, DHCP/DNS server and a few web servers.
+extern fn open(*u8, int) -> int from "libc.so.6";
+extern fn read(int, *u8, u64) -> int from "libc.so.6";
+extern fn write(int, *u8, u64) -> int from "libc.so.6";
+extern fn usleep(int) -> int from "libc.so.6";
+
+var nh_in = -1; var nh_out = -1; var nh_buf: *u8; var nh_have = 0;
+var nic_ok = false;
+
+fn nic_init() -> bool {
+    nh_in = open("to_guest.fifo", 0x800);          // O_RDONLY | O_NONBLOCK
+    nh_out = open("from_guest.fifo", 1);           // O_WRONLY (blocks until the gateway is listening)
+    nh_buf = kzalloc(16384);
+    nh_have = 0;
+    nic_ok = nh_in >= 0 && nh_out >= 0;
+    return nic_ok;
+}
+fn nic_mac(out: *u8) {
+    out[0] = 0x52; out[1] = 0x54; out[2] = 0x00; out[3] = 0x12; out[4] = 0x34; out[5] = 0x56;
+}
+fn nic_send(buf: *u8, len: int) {
+    var tmp: u8[1600];
+    tmp[0] = (len >> 8) as u8; tmp[1] = (len & 255) as u8;
+    kmemcpy(&tmp[2], buf, len);
+    write(nh_out, &tmp[0], (len + 2) as u64);
+}
+fn nic_recv(buf: *u8) -> int {
+    if (nh_have < 2000) {
+        let n = read(nh_in, nh_buf + nh_have, 4096 as u64);
+        if (n > 0) { nh_have = nh_have + n; }
+    }
+    if (nh_have < 2) { return 0; }
+    let len = (((nh_buf[0] as int) << 8) | (nh_buf[1] as int));
+    if (nh_have < len + 2) { return 0; }
+    kmemcpy(buf, nh_buf + 2, len);
+    kmemmove(nh_buf, nh_buf + 2 + len, nh_have - 2 - len);
+    nh_have = nh_have - 2 - len;
+    return len;
+}

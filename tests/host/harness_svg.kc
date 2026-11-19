@@ -1,0 +1,70 @@
+// harness_apps.kc -- SVG renderer: every icon at several sizes.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    run_frames(2);
+    clip_reset();
+    fill(0, 0, 1280, 800, 0xD8DEEA);
+    var k = 0;
+    while (k <= 14) {
+        svg_draw(k, 20 + (k % 5) * 200, 20 + (k / 5) * 200, 192, 256, false);
+        k++;
+    }
+    var q = 0;
+    while (q < 10) { svg_draw(16 + q, 20 + q * 60, 640, 48, 256, false); q++; }
+    svg_draw(1, 700, 640, 18, 256, false); svg_draw(2, 730, 640, 16, 256, false);
+    dump_ppm("svg_sheet.ppm");
+    fill(0, 0, 1280, 800, 0xF3F5FA);
+    var g = 0;
+    while (g < 40) {
+        svg_tint(G_CLOSE + g, 20 + (g % 10) * 120, 20 + (g / 10) * 120, 96, 0x1B2433, 256);
+        svg_tint(G_CLOSE + g, 20 + (g % 10) * 120 + 100, 20 + (g / 10) * 120 + 70, 18, th_acc, 256);
+        g++;
+    }
+    dump_ppm("glyph_sheet.ppm");
+    if (svc_n < 10) { println("SVG FAIL cache", svc_n); return 1; }
+    println("svg ok, cached bitmaps:", svc_n);
+    return 0;
+}

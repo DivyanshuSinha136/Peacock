@@ -1,0 +1,84 @@
+// harness_apps.kc -- fonts: every face renders, widths differ, the choice persists.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    run_frames(2);
+    var wmin = 100000; var wmax = 0;
+    var c = 0;
+    while (c <= VF_N) {
+        font_apply(c, true);
+        let w = text_w("The quick brown fox");
+        println("font", c, font_name(c), "width", w);
+        if (w < wmin) { wmin = w; }
+        if (w > wmax) { wmax = w; }
+        c++;
+    }
+    if (wmax - wmin < 10) { println("FONT FAIL widths do not differ"); return 1; }
+    // open the Fonts app, click the 3rd face, check it applies
+    app_open(APP_FONT); run_frames(10);
+    let wi = win_of_kind(APP_SETTINGS);
+    click(wins[wi].x + SET_SB + 100, wins[wi].y + TB + FA_TOP + 6 + 2 * FA_RH + 20); run_frames(5);
+    println("after click: font", vf_cur, font_name(vf_cur));
+    if (vf_cur != 3) { println("FONT FAIL click"); return 1; }
+    dump_ppm("font_app.ppm");
+    // persistence
+    vf_cur = 0; font_load_pref();
+    println("restored:", vf_cur);
+    if (vf_cur != 3) { println("FONT FAIL persist"); return 1; }
+    // keyboard
+    kb_push(KEY_DOWN); run_frames(3);
+    if (vf_cur != 4) { println("FONT FAIL key"); return 1; }
+    // every printable char renders (non-empty coverage somewhere) in every face
+    fill(0, 0, 1280, 800, 0xFFFFFF);
+    var f = 1;
+    while (f <= VF_N) {
+        font_apply(f, false);
+        draw_text(10, 10 + f * 20, "ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789 !@#$%&*()[]{}<>?", 0x000000);
+        f++;
+    }
+    dump_ppm("font_specimen.ppm");
+    println("font ok");
+    return 0;
+}

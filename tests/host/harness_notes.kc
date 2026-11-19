@@ -1,0 +1,249 @@
+// harness_notes.kc -- host test of Notes 2 (kernel/notepad.kc): editing, selection, undo/redo, clipboard, find/replace, wrap, files, recovery.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fails = 0;
+fn chk(name: *u8, ok: bool) { if (ok) { println("  ok  ", name); } else { println("  FAIL", name); fails++; } }
+fn txt() -> *u8 { nbuf[nlen] = 0; return nbuf; }
+fn is_text(s: *u8) -> bool { nbuf[nlen] = 0; return kstreq(nbuf, s); }
+fn typ(s: *u8) { var i = 0; while (s[i] != 0) { if (s[i] == 10) { notes_key(10); } else { notes_key(s[i] as int); } i++; } }
+fn mods(sh: bool, ct: bool, al: bool) { kb_shift = sh; kb_ctrl = ct; kb_alt = al; }
+fn key(k: int) { mods(false, false, false); notes_key(k); }
+fn ckey(k: int) { mods(false, true, false); notes_key(k); mods(false, false, false); }
+fn skey(k: int) { mods(true, false, false); notes_key(k); mods(false, false, false); }
+fn fresh() { n_new_doc(); n_dirty = false; n_save_mark = 0; }
+
+fn main() -> int {
+    let fbmem = malloc((1920 * 1080 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    app_open(APP_NOTES); run_frames(2);
+    fresh();
+
+    println("-- typing, auto-indent, undo / redo");
+    typ("hello world");
+    chk("typed text", is_text("hello world"));
+    chk("dirty after typing", n_dirty);
+    ckey(26);
+    chk("one undo removes the whole typing run", nlen == 0);
+    chk("clean again after undoing everything", !n_dirty);
+    ckey(25);
+    chk("redo restores it", is_text("hello world") && n_dirty);
+    ckey(26); fresh();
+    typ("  indented"); key(10); typ("next");
+    chk("Enter keeps the indentation", is_text("  indented\n  next"));
+    ckey(26); ckey(26); ckey(26);
+    chk("undo of Enter and typing", nlen <= 10);
+    fresh();
+    typ("abc"); key(8); key(8);
+    chk("backspace x2", is_text("a"));
+    ckey(26);
+    chk("backspace run undone as one step", is_text("abc"));
+
+    println("-- selection, clipboard");
+    fresh(); typ("one two three");
+    skey(KEY_LEFT); skey(KEY_LEFT); skey(KEY_LEFT); skey(KEY_LEFT); skey(KEY_LEFT);
+    chk("shift+left x5 selects 'three'", n_has_sel() && n_sel_e() - n_sel_s() == 5);
+    ckey(24);
+    chk("cut", is_text("one two ") && clip_len == 5);
+    key(KEY_HOME);
+    ckey(22);
+    chk("paste at start", is_text("threeone two "));
+    ckey(1);
+    chk("select all", n_has_sel() && n_sel_s() == 0 && n_sel_e() == nlen);
+    typ("x");
+    chk("typing replaces the selection", is_text("x"));
+    ckey(26);
+    chk("undo restores the replaced text", is_text("threeone two "));
+
+    println("-- word movement, delete word, lines");
+    fresh(); typ("alpha beta gamma");
+    mods(false, true, false); notes_key(KEY_LEFT); mods(false, false, false);
+    chk("ctrl+left jumps a word", ncur == 11);
+    mods(false, true, false); notes_key(8); mods(false, false, false);
+    chk("ctrl+backspace deletes a word", is_text("alpha gamma"));
+    fresh(); typ("l1"); key(10); typ("l2"); key(10); typ("l3");
+    ckey(4);
+    chk("ctrl+d duplicates the line", is_text("l1\nl2\nl3\nl3"));
+    ckey(11);
+    chk("ctrl+k deletes the line", is_text("l1\nl2\nl3"));
+    key(KEY_UP);
+    mods(false, false, true); notes_key(KEY_UP); mods(false, false, false);
+    chk("alt+up moves the line up", is_text("l2\nl1\nl3"));
+    mods(false, false, true); notes_key(KEY_DOWN); mods(false, false, false);
+    chk("alt+down moves it back", is_text("l1\nl2\nl3"));
+    ckey(1); key(9);
+    chk("tab with a multi-line selection indents every line", is_text("    l1\n    l2\n    l3"));
+    ckey(1); skey(9);
+    chk("shift+tab unindents", is_text("l1\nl2\nl3"));
+    ckey(26); ckey(26);
+
+    println("-- find / replace / go to");
+    fresh(); typ("The cat sat. the CAT ran. concatenate");
+    ckey(6);
+    chk("find bar opens", n_mode == 1);
+    typ("cat");
+    chk("incremental find selects first match", n_has_sel() && n_sel_s() == 4);
+    n_fc_update();
+    chk("match count (case-insensitive) is 3", n_fc_n == 3 && n_fc_i == 1);
+    key(10);
+    chk("Enter goes to next match", n_sel_s() == 17);
+    n_case = true; n_gen++; n_fc_update();
+    chk("case-sensitive count is 2", n_fc_n == 2);
+    n_case = false;
+    key(27);
+    chk("Esc closes the bar", n_mode == 0);
+    key(27);
+    ckey(18);
+    n_f1[0] = 0;
+    typ("cat"); n_ff = 1; typ("dog");
+    chk("replace field", kstreq(&n_f2[0], "dog"));
+    n_replace_all();
+    chk("replace all", is_text("The dog sat. the dog ran. condogenate"));
+    key(27);
+    ckey(26);
+    chk("replace all is one undo step", is_text("The cat sat. the CAT ran. concatenate"));
+    key(27);
+    ckey(7); typ("1"); key(10);
+    chk("go to line", ncur == 0 && n_mode == 0);
+
+    println("-- word wrap and scrolling");
+    fresh();
+    var i = 0;
+    while (i < 40) { typ("word"); typ(" "); i++; }
+    n_geom(700, 400);
+    chk("long line wraps into several rows", n_line_rows(0) > 1);
+    n_wrap = false;
+    chk("no wrap: one row", n_line_rows(0) == 1);
+    n_wrap = true;
+    fresh();
+    i = 0;
+    while (i < 200) { typ("line"); key(10); i++; }
+    chk("200 lines indexed", nl_n == 201);
+    chk("caret scrolled into view", n_top > 100);
+    ckey(1); key(KEY_HOME);
+    mods(false, true, false); notes_key(KEY_HOME); mods(false, false, false);
+    chk("ctrl+home", ncur == 0 && n_top == 0);
+    key(KEY_PGDN);
+    chk("page down moves the caret", n_line_of(ncur) > 10);
+    n_scroll_rows(5);
+    chk("scroll", n_top > 0);
+
+    println("-- files: save, CRLF, read-only, binary");
+    fresh(); typ("saved text"); key(10); typ("second");
+    kstrncpy(&n_path[0], "/home/np_test.txt", 128);
+    chk("save", n_save() && !n_dirty);
+    var nn = fs_resolve("/home/np_test.txt");
+    chk("file content", nn >= 0 && fs_nodes[nn].size == 17);
+    let crlf = "a\r\nb\r\nc";
+    var cn = fs_create("/home/np_crlf.txt", K_FILE); fs_write(cn, crlf, 7, false);
+    n_open("/home/np_crlf.txt");
+    chk("CRLF detected and normalised in memory", n_crlf && nlen == 5 && nl_n == 3);
+    typ("!");
+    n_save();
+    chk("CRLF written back", fs_nodes[cn].size == 8 && fs_nodes[cn].data[2] == 13);
+    var bn = fs_create("/home/np_bin.dat", K_FILE); let bin = "ab\0cd"; fs_write(bn, bin, 5, false);
+    n_open("/home/np_bin.dat");
+    chk("binary file is read-only", n_bin && n_ro);
+    typ("z");
+    chk("read-only buffer refuses edits", nlen == 5);
+    var rn = fs_create("/home/np_ro.txt", K_FILE); fs_write(rn, "locked", 6, false); fs_nodes[rn].attr = fs_nodes[rn].attr | FA_RO;
+    n_open("/home/np_ro.txt");
+    chk("read-only attribute honoured", n_ro);
+    n_open("/home/np_test.txt");
+    chk("reopen keeps text", nlen == 17 && !n_dirty);
+
+    println("-- unsaved changes: confirm, close guard, recovery");
+    typ("X");
+    chk("modified", n_dirty);
+    chk("title shows * when modified", wins[win_of_kind(APP_NOTES)].title[kstrlen(&wins[win_of_kind(APP_NOTES)].title[0]) - 1] == '*');
+    chk("closing a modified Notes window is vetoed", !np_close_ok() && n_mode == 6);
+    key(27);
+    chk("Esc cancels", n_mode == 0 && n_dirty);
+    n_rec_write();
+    chk("recovery file written", fs_resolve("/home/.notes-recovery") >= 0);
+    ckey(14);
+    chk("New asks first", n_mode == 6);
+    key('n');
+    chk("discard -> new empty doc", nlen == 0 && !n_dirty && n_mode == 0);
+    chk("recovery cleared on discard", fs_resolve("/home/.notes-recovery") < 0);
+    n_open("/home/np_test.txt"); typ("Q"); n_rec_write();
+    win_close(win_of_kind(APP_NOTES));
+    kstrncpy(&n_path[0], "/home/other.txt", 128);
+    app_open(APP_NOTES); run_frames(2);
+    chk("crash recovery restores the text and path", n_dirty && nbuf[0] == 'Q' && kstreq(&n_path[0], "/home/np_test.txt"));
+    n_save();
+    chk("saving clears the recovery file", fs_resolve("/home/.notes-recovery") < 0);
+    ckey(19);
+
+    println("-- big buffer");
+    fresh();
+    var big = kmalloc(300000);
+    i = 0; while (i < 300000) { big[i] = (i % 61 == 60) ? 10 : (97 + i % 26); i++; }
+    n_insert_text(big, 300000);
+    chk("300 KB paste", nlen == 300000 && nl_n > 4000);
+    ckey(26);
+    chk("undo of the big paste", nlen == 0);
+    ckey(25);
+    chk("redo of the big paste", nlen == 300000);
+    kfree(big);
+
+    println("-- mouse");
+    fresh(); typ("click here please"); 
+    let wi = win_of_kind(APP_NOTES);
+    run_frames(2);
+    click(wins[wi].x + 2 + npg_x0 + 7 * 8 + 2, wins[wi].y + TB + NP_TB + 8);
+    run_frames(1);
+    chk("click places the caret", ncur == 7);
+    mouse_to(wins[wi].x + 2 + npg_x0 + 7 * 8 + 2, wins[wi].y + TB + NP_TB + 8, 1);
+    mouse_to(wins[wi].x + 2 + npg_x0 + 7 * 8 + 2, wins[wi].y + TB + NP_TB + 8, 0);
+    run_frames(1);
+    chk("double click selects the word", n_has_sel() && n_sel_e() - n_sel_s() == 4);
+    run_frames(2);
+    fresh(); typ("The quick brown fox"); ckey(1); ckey(3); key(KEY_END);
+    ckey(6); typ("quick"); run_frames(2);
+    dump_ppm("notes_find.ppm");
+    key(27);
+    ckey(1); run_frames(2);
+    dump_ppm("notes_sel.ppm");
+    println("notes tests done, failures:", fails);
+    return fails;
+}

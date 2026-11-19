@@ -1,0 +1,108 @@
+// mkimage.kc -- assemble a bootable Peacock disk image:  boot.bin (stage 1 + stage 2)  +  kernel.bin (flat binary)
+// Author: Divyanshu Sinha (MIT License)
+//
+//   kingcobra kcos/tools/mkimage.kc kcos/boot/boot.bin build/kernel.bin -o build/peacock.img [--min-size 1048576]
+//
+// The kernel's sector count is patched into stage 2 (u32 at image offset 2556); the image is padded to a whole number of sectors.
+import std.fbin;
+import std.io;
+import std.system;
+
+const SECTOR = 512;
+const BOOT_BYTES = 2560;                 // stage 1 (512) + stage 2 (4 * 512)
+const BUNDLE_GAP = 7680;                 // sectors between the KCFS store and the install bundle (kernel/disk.kc)
+const LOGO_GAP = 7168;                   // sectors after the store start where the boot logo lives
+const KCSUM_OFFSET = 2552;               // u32 kernel checksum (sum of all little-endian dwords, mod 2^32), checked by stage 2
+const KSEC_OFFSET = 2556;                // u32 kernel sector count: last 4 bytes of stage 2
+const MAX_BUNDLE = 4194304;              // 8192 sectors; the theme pictures follow it (THEMES_GAP)
+const THEMES_GAP = 8192;
+const MAX_KERNEL = 67108864;             // 64 MiB, loaded at KERNEL_BASE 0x200000 by ATA PIO
+
+fn die(msg: string) { println("mkimage: " + msg); system.exit(1); }
+
+fn main() {
+    let args = system.args();
+    var files = [];
+    var out = "";
+    var min_size = 8388608;
+    var bundle = "";
+    var logo = "";
+    var themes = "";
+    var i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        if (a == "-o" && i + 1 < len(args)) { out = args[i + 1]; i = i + 2; continue; }
+        if (a == "--bundle" && i + 1 < len(args)) { bundle = args[i + 1]; i = i + 2; continue; }
+        if (a == "--logo" && i + 1 < len(args)) { logo = args[i + 1]; i = i + 2; continue; }
+        if (a == "--themes" && i + 1 < len(args)) { themes = args[i + 1]; i = i + 2; continue; }
+        if (a == "--min-size" && i + 1 < len(args)) { min_size = int(args[i + 1]); i = i + 2; continue; }
+        files.push(a);
+        i = i + 1;
+    }
+    if (len(files) != 2 || out == "") { println("usage: mkimage boot.bin kernel.bin -o peacock.img [--bundle kingcobra.pkg] [--min-size BYTES]"); system.exit(2); }
+    if (!io.exists(files[0])) { die("cannot open " + files[0]); }
+    if (!io.exists(files[1])) { die("cannot open " + files[1]); }
+    let boot = fbin.load(files[0]);
+    let kern = fbin.load(files[1]);
+    if (fbin.size(boot) != BOOT_BYTES) { die("boot.bin must be " + str(BOOT_BYTES) + " bytes, it is " + str(fbin.size(boot))); }
+    let ksize = fbin.size(kern);
+    if (ksize > MAX_KERNEL) { die("kernel is " + str(ksize) + " bytes; the boot layout allows at most " + str(MAX_KERNEL) + " (64 MiB)"); }
+    let sectors = (ksize + SECTOR - 1) >> 9;
+    let store_lba = (5 + sectors + 1023) & ~1023;
+    let bundle_off = (store_lba + BUNDLE_GAP) * SECTOR;
+    let img = fbin.buffer();
+    fbin.write_bytes(img, fbin.to_bytes(boot, 0, BOOT_BYTES));
+    fbin.seek(img, KSEC_OFFSET);
+    fbin.write_u32(img, sectors);
+    let kb = fbin.to_bytes(kern, 0, ksize);
+    var csum = 0;
+    var ki = 0;
+    while (ki < ksize) {
+        var dw = 0; var kj = 0;
+        while (kj < 4) { if (ki + kj < ksize) { dw = dw | (kb[ki + kj] << (8 * kj)); } kj = kj + 1; }
+        csum = (csum + dw) & 0xFFFFFFFF;
+        ki = ki + 4;
+    }
+    fbin.seek(img, KCSUM_OFFSET);
+    fbin.write_u32(img, csum);
+    fbin.seek(img, 0, "end");
+    fbin.write_bytes(img, fbin.to_bytes(kern, 0, ksize));
+    let pad = sectors * SECTOR - ksize;
+    if (pad > 0) { fbin.fill(img, 0, pad); }
+    if (logo != "") {
+        if (!io.exists(logo)) { die("cannot open " + logo); }
+        let lg = fbin.load(logo);
+        let lsize = fbin.size(lg);
+        let logo_off = (store_lba + LOGO_GAP) * SECTOR;
+        fbin.seek(img, 0, "end");
+        if (fbin.size(img) < logo_off) { fbin.fill(img, 0, logo_off - fbin.size(img)); }
+        fbin.write_bytes(img, fbin.to_bytes(lg, 0, lsize));
+        println("mkimage: boot logo " + logo + " (" + str(lsize) + " bytes) at offset " + str(logo_off));
+    }
+    if (bundle != "") {
+        if (!io.exists(bundle)) { die("cannot open " + bundle); }
+        let b = fbin.load(bundle);
+        let bsize = fbin.size(b);
+        if (bsize > MAX_BUNDLE) { die("bundle is " + str(bsize) + " bytes; the limit is " + str(MAX_BUNDLE)); }
+        fbin.seek(img, 0, "end");
+        fbin.fill(img, 0, bundle_off - fbin.size(img));
+        fbin.write_bytes(img, fbin.to_bytes(b, 0, bsize));
+        println("mkimage: install bundle " + bundle + " (" + str(bsize) + " bytes) at offset " + str(bundle_off));
+    }
+    if (themes != "") {
+        if (!io.exists(themes)) { die("cannot open " + themes); }
+        let th = fbin.load(themes);
+        let tsize = fbin.size(th);
+        let th_off = (store_lba + BUNDLE_GAP + THEMES_GAP) * SECTOR;
+        fbin.seek(img, 0, "end");
+        if (fbin.size(img) < th_off) { fbin.fill(img, 0, th_off - fbin.size(img)); }
+        fbin.write_bytes(img, fbin.to_bytes(th, 0, tsize));
+        println("mkimage: desktop themes " + themes + " (" + str(tsize) + " bytes) at offset " + str(th_off));
+    }
+    let total = fbin.size(img);
+    if (total < min_size) { fbin.fill(img, 0, min_size - total); }
+    let rem = fbin.size(img) % 1048576;
+    if (rem != 0) { fbin.fill(img, 0, 1048576 - rem); }          // whole MiB: no off-by-one at the end of the disk
+    fbin.save(img, out);
+    println("mkimage: wrote " + out + " (" + str(fbin.size(img)) + " bytes; kernel " + str(ksize) + " bytes = " + str(sectors) + " sectors at LBA 5)");
+}

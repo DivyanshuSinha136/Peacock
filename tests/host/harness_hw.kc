@@ -1,0 +1,178 @@
+// harness_hw.kc -- host test of pci.kc (against the simulated bus in hal_host.kc) and hwctl.kc (ACPI, reset, CPU)
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fails = 0;
+fn chk(name: *u8, ok: bool) { if (ok) { println("  ok  ", name); } else { println("  FAIL", name); fails++; } }
+
+// ---- synthetic ACPI tables in ordinary memory (addresses are 64-bit on the host, so an XSDT is used)
+fn put8(a: int, v: int) { *(a as *u8) = v as u8; }
+fn put32(a: int, v: int) { *(a as *u32) = v as u32; }
+fn put64(a: int, v: int) { *(a as *u64) = v as u64; }
+fn fix_sum(a: int, n: int, at: int) { put8(a + at, 0); var s = 0; var i = 0; while (i < n) { s = s + (*((a + i) as *u8) as int); i++; } put8(a + at, (256 - (s & 255)) & 255); }
+fn hdr(a: int, s0: int, s1: int, s2: int, s3: int, len: int) { put8(a, s0); put8(a + 1, s1); put8(a + 2, s2); put8(a + 3, s3); put32(a + 4, len); put8(a + 8, 1); }
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 8) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+
+    println("-- PCI enumeration");
+    chk("scan finds 7 functions", pci_scan() == 7);
+    chk("two buses (host bridge + one behind the bridge)", pci_buses == 2);
+    chk("host bridge first", pd_vid[0] == 0x8086 && pd_did[0] == 0x1237 && (pd_cls[0] >> 8) == 0x0600);
+    chk("multi-function device: 00:01.0, .1, .2", pci_find(0x8086, 0x7000, 0) == 1 && pci_find(0x8086, 0x7010, 0) == 2 && pci_find(0x8086, 0x7020, 0) == 3);
+    chk("function numbers kept", pcid_fn(3) == 2 && pcid_dev(3) == 1 && pcid_bus(3) == 0);
+    chk("device behind the bridge found (01:00.0)", pci_find(0x10EC, 0x8139, 0) == 6 && pcid_bus(6) == 1);
+    chk("bridge secondary bus read", pd_sec[5] == 1 && (pd_hdr[5] & 0x7F) == 1);
+    chk("missing device", pci_find(0xDEAD, 0xBEEF, 0) < 0);
+    chk("class search with mask: any serial-bus controller", pci_find_class(0x0C0000, 0xFF0000, 0) == 3);
+    chk("class search with interface: UHCI", pci_find_class(0x0C0300, 0xFFFFFF, 0) == 3);
+    chk("class search continues after a hit", pci_find_class(0x060000, 0xFF0000, 1) == 1);
+    chk("bounded configuration traffic", ph_acc < 2500);
+
+    println("-- BARs");
+    chk("UHCI I/O BAR4 base and size", pd_bty[3 * 6 + 4] == 1 && pd_bar[3 * 6 + 4] == 0xC020 && pd_bsz[3 * 6 + 4] == 32);
+    chk("IDE I/O BAR4 size 16", pd_bsz[2 * 6 + 4] == 16 && pd_bar[2 * 6 + 4] == 0xC000);
+    chk("VGA 64-bit prefetchable BAR0: 16 MiB", pd_bty[4 * 6] == 7 && pd_bsz[4 * 6] == 16 * 1048576 && pd_bar[4 * 6] == 0xFD000000);
+    chk("the BAR after a 64-bit one is its upper half (skipped)", pd_bty[4 * 6 + 1] == 0);
+    chk("VGA 32-bit memory BAR2: 4 KiB", pd_bty[4 * 6 + 2] == 2 && pd_bsz[4 * 6 + 2] == 4096 && pd_bar[4 * 6 + 2] == 0xFEBF0000);
+    chk("RTL8139 I/O BAR0 256 bytes", pci_io_bar(6) == 0xC100 && pd_bsz[6 * 6] == 256);
+    chk("RTL8139 memory BAR1", pci_mem_bar(6) == 1 && pd_bar[6 * 6 + 1] == 0xFEB00000);
+    chk("BAR values survived the size probe", pcid_r32(3, 0x20) == 0xC021 && pcid_r32(4, 0x10) == 0xFD00000C);
+    chk("device without I/O BAR", pci_io_bar(4) < 0);
+
+    println("-- capabilities, power, enabling");
+    chk("capabilities: PM and MSI", pd_caps[6] == (PCAP_PM | PCAP_MSI) && pd_pm[6] == 0x50 && pd_msi[6] == 0x60);
+    chk("device without a list has none", pd_caps[3] == 0);
+    chk("interrupt line / pin", (pd_irq[3] & 255) == 0x0B && ((pd_irq[3] >> 8) & 255) == 5);
+    chk("starts asleep in D3", (pcid_r16(6, 0x54) & 3) == 3);
+    chk("pci_enable: I/O + bus master", pci_enable(6, PCI_CMD_IO | PCI_CMD_MASTER));
+    chk("command register set, nothing else", (pcid_r16(6, 4) & 7) == 5);
+    chk("device woken to D0", (pcid_r16(6, 0x54) & 3) == 0);
+    chk("status half untouched", (pcid_r32(6, 4) >> 16) == 0x10);
+    chk("pci_enable adds, never removes", pci_enable(6, PCI_CMD_MEM) && (pcid_r16(6, 4) & 7) == 7);
+    chk("bad index refused", !pci_enable(99, 1));
+    pci_write8(0, 1, 2, 0x3C, 0x0A);
+    chk("8-bit write touches one byte", pci_read8(0, 1, 2, 0x3C) == 0x0A && pci_read8(0, 1, 2, 0x3D) == 5);
+
+    println("-- names");
+    chk("vendor names", kstreq(pci_vendor_name(0x8086), "Intel") && kstreq(pci_vendor_name(0x10EC), "Realtek"));
+    chk("device names", kstreq(pci_dev_name(0x8086, 0x7020), "PIIX3 USB (UHCI)") && kstreq(pci_dev_name(0x1234, 0x1111), "Bochs VGA (std)"));
+    chk("class names", kstreq(pci_class_name(0x0C0300), "USB UHCI") && kstreq(pci_class_name(0x020000), "Ethernet") && kstreq(pci_class_name(0x060400), "PCI-PCI bridge"));
+    chk("unknown device has an empty name", pci_dev_name(0x1111, 0x2222)[0] == 0);
+
+    println("-- ACPI");
+    let mem = malloc(16384) as int;
+    let rsdp = mem; let xsdt = mem + 64; let fadt = mem + 256; let madt = mem + 640; let dsdt = mem + 1024;
+    kmemset((mem as *u8), 0, 16384);
+    // DSDT with ... Name (\_S5_, Package (4) { 5, 5, 0, 0 })
+    hdr(dsdt, 'D', 'S', 'D', 'T', 36 + 24);
+    var d = dsdt + 36;
+    put8(d, 0x10); put8(d + 1, 0x00);                                       // some other bytes first
+    d = d + 4;
+    put8(d, 0x08); put8(d + 1, '_'); put8(d + 2, 'S'); put8(d + 3, '5'); put8(d + 4, '_'); put8(d + 5, 0x12); put8(d + 6, 0x06); put8(d + 7, 0x04);
+    put8(d + 8, 0x0A); put8(d + 9, 0x05); put8(d + 10, 0x0A); put8(d + 11, 0x05); put8(d + 12, 0); put8(d + 13, 0);
+    fix_sum(dsdt, 36 + 24, 9);
+    // FADT
+    hdr(fadt, 'F', 'A', 'C', 'P', 244);
+    put32(fadt + 40, 0); put64(fadt + 140, dsdt);                      // X_DSDT (64-bit: host pointers do not fit 32 bits)
+    put32(fadt + 48, 0xB2); put8(fadt + 52, 0xF1); put8(fadt + 53, 0xF0); put32(fadt + 64, 0x604); put32(fadt + 68, 0);
+    *((fadt + 46) as *u16) = 9 as u16;
+    put32(fadt + 112, 1 << 10);                                            // RESET_REG_SUP
+    put8(fadt + 116, 1); put8(fadt + 117, 8); put64(fadt + 120, 0xCF9); put8(fadt + 128, 0x06);
+    fix_sum(fadt, 244, 9);
+    // MADT: 2 enabled CPUs, 1 disabled, 1 IO-APIC
+    hdr(madt, 'A', 'P', 'I', 'C', 44 + 8 * 3 + 12);
+    var m = madt + 44;
+    put8(m, 0); put8(m + 1, 8); put32(m + 4, 1); m = m + 8;
+    put8(m, 0); put8(m + 1, 8); put8(m + 2, 1); put32(m + 4, 1); m = m + 8;
+    put8(m, 0); put8(m + 1, 8); put8(m + 2, 2); put32(m + 4, 0); m = m + 8;
+    put8(m, 1); put8(m + 1, 12); m = m + 12;
+    fix_sum(madt, 44 + 8 * 3 + 12, 9);
+    // XSDT -> FADT, MADT
+    hdr(xsdt, 'X', 'S', 'D', 'T', 36 + 16);
+    put64(xsdt + 36, fadt); put64(xsdt + 44, madt);
+    fix_sum(xsdt, 36 + 16, 9);
+    // RSDP (revision 2)
+    kmemcpy((rsdp as *u8), "RSD PTR ", 8);
+    put8(rsdp + 9, 0); kmemcpy(((rsdp + 9) as *u8), "PCOCK ", 6);
+    put8(rsdp + 15, 2); put32(rsdp + 16, 0); put32(rsdp + 20, 36); put64(rsdp + 24, xsdt);
+    fix_sum(rsdp, 20, 8);
+    fix_sum(rsdp, 36, 32);
+    chk("valid RSDP parses", acpi_parse(rsdp));
+    chk("revision and OEM id", acpi_rev == 2 && acpi_oem[0] == 'P' && acpi_oem[5] == ' ');
+    chk("two tables listed", acpi_nt == 2 && at_sig[0] == sig4('F', 'A', 'C', 'P') && at_sig[1] == sig4('A', 'P', 'I', 'C'));
+    chk("FADT: PM1a and SMI command port", acpi_pm1a == 0x604 && acpi_smi == 0xB2 && acpi_en == 0xF1 && acpi_sci == 9);
+    chk("S5 sleep type read from the DSDT", acpi_slp_a == 5 && acpi_slp_b == 5);
+    chk("MADT: 2 enabled CPUs, 1 I/O APIC", acpi_ncpu == 2 && acpi_nioapic == 1);
+    chk("reset register found", acpi_rst_space == 1 && acpi_rst_addr == 0xCF9 && acpi_rst_val == 6);
+    hw_in_val = 1; hw_log_n = 0;                                           // SCI_EN already set: no SMI handshake
+    acpi_poweroff();
+    chk("poweroff writes SLP_TYP | SLP_EN to PM1a", hw_log_n == 1 && hw_log_p[0] == 0x604 && hw_log_v[0] == 0x3400);
+    hw_in_val = 0; hw_log_n = 0;
+    acpi_poweroff();
+    chk("SCI not enabled: ACPI_ENABLE to the SMI port first", hw_log_n >= 2 && hw_log_p[0] == 0xB2 && hw_log_v[0] == 0xF1 && hw_log_p[1] == 0x604);
+    hw_log_n = 0;
+    sys_reboot();
+    chk("reboot: ACPI reset register first, then 0xCF9", hw_log_p[0] == 0xCF9 && hw_log_v[0] == 6 && hw_log_p[1] == 0xCF9);
+    // damaged tables are refused
+    *((dsdt + 20) as *u8) = 99;
+    acpi_parse(rsdp);
+    chk("bad DSDT checksum: S5 ignored", acpi_slp_a < 0 && acpi_ok);
+    *((rsdp + 3) as *u8) = 'X';
+    chk("bad RSDP signature refused", !acpi_parse(rsdp) && !acpi_ok);
+    chk("null RSDP refused", !acpi_parse(0));
+    *((rsdp + 3) as *u8) = ' ';
+    fix_sum(rsdp, 20, 8);
+    *((xsdt + 40) as *u8) = 0x55;
+    chk("bad XSDT checksum refused", !acpi_parse(rsdp));
+    acpi_ok = false; hw_log_n = 0;
+    acpi_poweroff();
+    chk("no ACPI: acpi_poweroff does nothing", hw_log_n == 0);
+
+    println("-- CPU");
+    cpu_init();
+    chk("vendor string", cpu_vendor[0] != 0 && cpu_vendor[12] == 0);
+    chk("brand string", cpu_brand[0] != 0);
+    chk("x86-64: long mode and SSE2", (cpu_f81d & (1 << 29)) != 0 && (cpu_f1d & (1 << 26)) != 0);
+    var fb: u8[160];
+    cpu_features(&fb[0], 160);
+    chk("feature list names them", ci_contains(&fb[0], "sse2") && ci_contains(&fb[0], "lm"));
+    if (fails == 0) { println("HW TESTS PASSED"); } else { println("HW TESTS FAILED"); }
+    return fails;
+}

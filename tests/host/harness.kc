@@ -1,0 +1,127 @@
+// harness.kc -- host-side test of the Peacock desktop: drives the real UI code with synthetic input and dumps screenshots.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn main() -> int {
+    let fbmem = malloc((800 * 600 * 4) as u64);
+    gfx_init(800, 600, 3200, 32, fbmem as int);
+    mouse_set_bounds(800, 600);
+    fs_init(); fs_seed();
+    ui_init();
+    run_frames(2);
+    dump_ppm("/tmp/pk_01_desktop.ppm");
+    // open apps via double-clicks on the icons
+    click(40, 40); click(40, 40);
+    run_frames(2);
+    type_str("help\nneofetch\nls /home\necho hi peacock > /home/t.txt\ncat /home/t.txt\nmem\n");
+    run_frames(2);
+    dump_ppm("/tmp/pk_02_terminal.ppm");
+    // Notes
+    click(40, 40 + 84); click(40, 40 + 84);
+    run_frames(1);
+    type_str("Peacock notes\nline two");
+    run_frames(2);
+    dump_ppm("/tmp/pk_notes.ppm");
+    // Paint
+    click(40, 40 + 168); click(40, 40 + 168);
+    run_frames(1);
+    var pi = win_of_kind(APP_PAINT);
+    let px0 = wins[pi].x + 2 + 8; let py0 = wins[pi].y + TB + PTOP;
+    mouse_to(px0 + 20, py0 + 20, 0); mouse_to(px0 + 20, py0 + 20, 1);
+    mouse_to(px0 + 120, py0 + 90, 1); mouse_to(px0 + 220, py0 + 30, 1); mouse_to(px0 + 220, py0 + 30, 0);
+    run_frames(2);
+    dump_ppm("/tmp/pk_paint.ppm");
+    // Calculator: 12.5 * 4 =
+    click(40, 40 + 252); click(40, 40 + 252);
+    run_frames(1);
+    type_str("12.5*4\n");
+    run_frames(1);
+    dump_ppm("/tmp/pk_calc.ppm");
+    // System info
+    click(40, 40 + 336); click(40, 40 + 336);
+    run_frames(3);
+    dump_ppm("/tmp/pk_03_apps.ppm");
+    // drag the info window, open the start menu
+    var ii = win_of_kind(APP_INFO);
+    mouse_to(wins[ii].x + 100, wins[ii].y + 10, 0); mouse_to(wins[ii].x + 100, wins[ii].y + 10, 1);
+    mouse_to(wins[ii].x + 20, wins[ii].y + 70, 1); mouse_to(wins[ii].x + 20, wins[ii].y + 70, 0);
+    click(30, 600 - 18);
+    run_frames(2);
+    mouse_to(40, 600 - TASKBAR_H - 100, 0);
+    run_frames(1);
+    dump_ppm("/tmp/pk_04_menu.ppm");
+    // ---- Peacock 0.2 apps
+    // second icon column: Calendar is icon 7 -> column 1, row 1
+    click(102 + 20, 16 + 20); click(102 + 20, 16 + 20);
+    run_frames(1);
+    println("icon_at(122,36) =", icon_at(122, 36), "(6 = Calendar); app_open:", 0);
+    app_open(APP_CAL);
+    app_open(APP_FILES); run_frames(1);
+    files_key(KEY_DOWN); files_key(10); run_frames(1);
+    dump_ppm("/tmp/pk_files.ppm");
+    println("files dir:", f_dir, "count:", f_count());
+    f_up(); f_new(K_DIR); f_new(K_FILE); run_frames(1);
+    println("files after new:", f_count());
+    cal_key(KEY_RIGHT); run_frames(1);
+    dump_ppm("/tmp/pk_cal.ppm");
+    println("cal:", cal_y, cal_m, "dow of 2026-11-01:", day_of_week(2026, 11, 1));
+    app_open(APP_CLOCK); run_frames(2); clk_key(' '); run_frames(30); dump_ppm("/tmp/pk_clock.ppm");
+    println("stopwatch cs:", sw_elapsed());
+    app_open(APP_SNAKE); run_frames(1);
+    sn_key(KEY_UP); run_frames(40);
+    println("snake state:", sn_state, "len:", sn_len, "score:", sn_score);
+    dump_ppm("/tmp/pk_snake.ppm");
+    app_open(APP_MINES); run_frames(1);
+    var mi = win_of_kind(APP_MINES);
+    let mbx = wins[mi].x + 2 + m_bx(); let mby = wins[mi].y + TB + M_BY;
+    click(mbx + 4 * 20 + 10, mby + 4 * 20 + 10);
+    run_frames(1);
+    var hi = 0; while (hi < m_w * m_h && m_st[hi] != 0) { hi++; }
+    mouse_to(mbx + (hi % m_w) * 20 + 10, mby + (hi / m_w) * 20 + 10, 0); mouse_push(0, 0, 2); mouse_push(0, 0, 0);
+    run_frames(1);
+    println("mines state:", m_state, "opened:", m_opened, "flags:", m_flags);
+    dump_ppm("/tmp/pk_mines.ppm");
+    app_open(APP_MON); run_frames(120);
+    dump_ppm("/tmp/pk_monitor.ppm");
+    println("windows now:", nz);
+    dump_ppm("/tmp/pk_final.ppm");
+    println("windows:", nz, "focus:", focus, "frames:", frames);
+    println("calc shows:", c_cur, c_acc, c_have);
+    println("notes bytes:", nlen);
+    return 0;
+}

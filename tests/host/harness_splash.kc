@@ -1,0 +1,61 @@
+// harness_splash.kc -- host test of the boot splash: renders frames to PPM and checks the animation/progress logic.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+import "../../kernel/splash.kc";
+
+fn hlt() { ticks = ticks + 1; }          // the host "timer" advances one tick per hlt
+
+fn main() -> int {
+    let fbmem = malloc((800 * 600 * 4) as u64);
+    gfx_init(800, 600, 3200, 32, fbmem as int);
+    splash_begin();
+    dump_ppm("splash0.ppm");
+    splash(35, "Detecting disk");
+    println("shown after stage 35:", spl_shown);
+    dump_ppm("splash1.ppm");
+    splash(70, "Installing apps");
+    splash(92, "Preparing the desktop");
+    let t = ticks;
+    splash_end();
+    println("shown at end:", spl_shown, "ticks spent:", ticks - spl_t0, "min:", SPL_MIN_TICKS);
+    dump_ppm("splash2.ppm");
+    if (spl_shown != 100 || ticks - spl_t0 < SPL_MIN_TICKS) { println("SPLASH FAIL"); return 1; }
+    println("splash ok");
+    return 0;
+}

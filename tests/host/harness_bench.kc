@@ -1,0 +1,95 @@
+// harness_notes.kc -- host test of Notes 2 (kernel/notepad.kc): editing, selection, undo/redo, clipboard, find/replace, wrap, files, recovery.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+extern fn clock() -> int from "libc.so.6";
+fn ms() -> int { return clock() / 1000; }
+fn bench(name: *u8, n: int) {
+    let t0 = ms();
+    var i = 0;
+    while (i < n) { ticks = ticks + 1; ui_frame(); i++; }
+    let t1 = ms();
+    println(name, "ms per frame x100:", (t1 - t0) * 100 / n);
+}
+fn main() -> int {
+    let W = 1920; let H = 1080;
+    let fbmem = malloc((W * H * 4) as u64);
+    gfx_init(W, H, W * 4, 32, fbmem as int);
+    mouse_set_bounds(W, H);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    run_frames(3);
+    bench("idle desktop", 200);
+    var i = 0;
+    let t0 = ms();
+    while (i < 200) { mouse_to(300 + i * 5, 300 + (i % 20) * 10, 0); ticks = ticks + 1; ui_frame(); i++; }
+    println("mouse move on desktop x100:", (ms() - t0) * 100 / 200);
+    var k = 0;
+    while (k < 5) {
+        var kind = APP_TERM;
+        if (k == 1) { kind = APP_NOTES; } if (k == 2) { kind = APP_FILES; } if (k == 3) { kind = APP_SETTINGS; } if (k == 4) { kind = APP_WEB; }
+        app_open(kind); run_frames(3);
+        let w = win_of_kind(kind);
+        let cx = wins[w].x + 100; let cy = wins[w].y + 150;
+        i = 0;
+        let t2 = ms();
+        while (i < 100) { mouse_to(cx + i * 3, cy + (i % 20) * 4, 0); ticks = ticks + 1; ui_frame(); i++; }
+        println("kind", kind, "mouse over it x100:", (ms() - t2) * 100 / 100);
+        win_close(w); run_frames(2);
+        k++;
+    }
+    app_open(APP_TERM); run_frames(3);
+    let tw = win_of_kind(APP_TERM);
+    var t3 = ms();
+    i = 0;
+    while (i < 100) { kb_push('a' + i % 20); ticks = ticks + 1; ui_frame(); i++; }
+    println("terminal typing x100:", (ms() - t3));
+    t3 = ms();
+    let gx = wins[tw].x + 200; let gy = wins[tw].y + 10;
+    mouse_to(gx, gy, 0); mouse_to(gx, gy, 1);
+    i = 0;
+    while (i < 60) { mouse_to(gx + i * 6, gy + i * 3, 1); ticks = ticks + 1; ui_frame(); i++; }
+    mouse_to(gx + 360, gy + 180, 0);
+    println("dragging the terminal window x100:", (ms() - t3) * 100 / 60);
+    t3 = ms();
+    i = 0;
+    while (i < 100) { ticks = ticks + 5; ui_frame(); i++; }
+    println("idle with terminal x100:", (ms() - t3));
+    return 0;
+}

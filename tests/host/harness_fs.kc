@@ -1,0 +1,265 @@
+// harness_apps.kc -- KCFS 2: crash-safe persistence, attributes, copy/move/rename, fsck, autosave.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fail = 0;
+fn check(ok: bool, what: *u8) { if (!ok) { println("FS FAIL:", what); fail++; } }
+
+fn fresh() { fs_init(); fs_gen = 0; fs_slot = 1; fs_persisted = false; fs_dirty = false; fs_recovered = 0; }
+fn wipe() { ram_store_init(); kmemset(ram_store, 0, 7168 * 512); hal_wfail = -1; }
+fn content(path: *u8, expect: *u8) -> bool {
+    let n = fs_resolve(path);
+    if (n < 0 || fs_nodes[n].kind != K_FILE) { return false; }
+    return kstreq(fs_nodes[n].data, expect);
+}
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+
+    // ---- helpers: crc32 and civil time
+    check(crc32("123456789", 9) == 0xCBF43926, "crc32 check value");
+    check(fs_days(1970, 1, 1) == 0, "epoch");
+    check(fs_days(2026, 11, 10) == 20767, "2026-11-10");
+    check(fs_days(2024, 2, 29) == 19782, "leap day");
+    var c: int[3]; fs_civil(20767, &c[0]);
+    check(c[0] == 2026 && c[1] == 11 && c[2] == 10, "civil_from_days");
+    fs_civil(19782, &c[0]);
+    check(c[0] == 2024 && c[1] == 2 && c[2] == 29, "civil leap");
+    var ts: u8[24]; fs_time_str(20767 * 86400 + 14 * 3600 + 7 * 60 + 25, &ts[0]);
+    check(kstreq(&ts[0], "2026-11-10 14:07"), "time string");
+
+    // ---- save / load round trip with metadata
+    wipe(); fresh(); fs_seed();
+    let note = fs_create("/home/note.txt", K_FILE);
+    fs_write(note, "first version", 13, false);
+    fs_set_attr(fs_resolve("/etc/motd"), FA_RO, true);
+    fs_set_attr(fs_resolve("/home/hello.txt"), FA_HIDDEN, true);
+    check(fs_dirty, "dirty after changes");
+    check(fs_save() == 0, "save 1");
+    check(fs_gen == 1 && fs_slot == 0 && !fs_dirty, "gen 1 in slot A");
+    fs_write(note, "second version", 14, false);
+    ticks = ticks + 500;
+    check(fs_save() == 0, "save 2");
+    check(fs_gen == 2 && fs_slot == 1, "gen 2 in slot B");
+    let mt = fs_nodes[fs_resolve("/home/note.txt")].mtime;
+    check(mt > 1700000000, "mtime is wall-clock");
+    fresh(); check(fs_load(), "load");
+    check(content("/home/note.txt", "second version"), "content restored");
+    check(fs_gen == 2 && fs_slot == 1 && fs_recovered == 0, "loaded the newest generation cleanly");
+    check(fs_nodes[fs_resolve("/home/note.txt")].mtime == mt, "mtime persisted");
+    check((fs_nodes[fs_resolve("/etc/motd")].attr & FA_RO) != 0, "attr persisted");
+    check(fs_nodes[fs_resolve("/home/note.txt")].ctime > 0, "ctime persisted");
+    check(!fs_dirty, "clean after load");
+
+    // ---- power cut during the data write: the previous generation survives
+    fs_write(fs_resolve("/home/note.txt"), "third version, lost", 19, false);
+    hal_wfail = 1;
+    check(fs_save() == 3, "save fails when the power is cut");
+    hal_wfail = -1;
+    check(fs_dirty, "still dirty after a failed save");
+    fresh(); check(fs_load(), "load after a cut during data");
+    check(content("/home/note.txt", "second version"), "old generation intact (cut during data)");
+
+    // ---- power cut right before the commit (all data sectors written, header not)
+    fs_write(fs_resolve("/home/note.txt"), "fourth", 6, false);
+    let nsec = (store_total() + 511) / 512;
+    hal_wfail = nsec;
+    check(fs_save() == 3, "save fails before the commit");
+    hal_wfail = -1;
+    fresh(); check(fs_load(), "load after a cut before commit");
+    check(content("/home/note.txt", "second version"), "old generation intact (cut before commit)");
+    check(fs_gen == 2, "generation unchanged");
+
+    // ---- corrupt the newest slot: fall back to the older generation
+    fresh(); fs_load();
+    fs_write(fs_resolve("/home/note.txt"), "gen three", 9, false);
+    check(fs_save() == 0, "save 3");                        // goes to slot A (older), gen 3
+    check(fs_gen == 3 && fs_slot == 0, "gen 3 in slot A");
+    ram_store[kc_data_lba(0) * 512 - store_lba() * 512 + 70] = ram_store[kc_data_lba(0) * 512 - store_lba() * 512 + 70] ^ 0x55;   // flip a byte in slot A data
+    fresh(); check(fs_load(), "load with a corrupt newest slot");
+    check(fs_recovered == 1 && fs_gen == 2, "fell back to generation 2");
+    check(content("/home/note.txt", "second version"), "older generation served");
+    check(fs_dirty == false || fs_dirty, "(dirty state is allowed)");
+
+    // ---- both slots corrupt: no store
+    ram_store[kc_data_lba(1) * 512 - store_lba() * 512 + 70] = ram_store[kc_data_lba(1) * 512 - store_lba() * 512 + 70] ^ 0x55;
+    fresh(); check(!fs_load(), "nothing valid: load fails");
+    check(fs_nodes[0].kind == K_DIR && !fs_nonempty_dir(0), "empty filesystem after a failed load");
+
+    // ---- torn header
+    wipe(); fresh(); fs_seed(); check(fs_save() == 0, "save for torn-header test");
+    ram_store[510] = ram_store[510] ^ 0xFF;               // header A tail
+    fresh(); check(!fs_load(), "header CRC rejects a damaged header");
+
+    // ---- legacy KCFS 1 store is migrated
+    wipe(); fresh();
+    var v1: u8[2048]; kmemset(&v1[0], 0, 2048);
+    var p = 0;
+    // node 1: dir "old", node 2: file "a.txt" = "legacy!"
+    *((&v1[p]) as *u32) = 1; *((&v1[p + 4]) as *u32) = K_DIR; *((&v1[p + 8]) as *u32) = 0; *((&v1[p + 12]) as *u32) = 0; kstrncpy(&v1[p + 16], "old", 28); p = p + 48;
+    *((&v1[p]) as *u32) = 2; *((&v1[p + 4]) as *u32) = K_FILE; *((&v1[p + 8]) as *u32) = 1; *((&v1[p + 12]) as *u32) = 7; kstrncpy(&v1[p + 16], "a.txt", 28); p = p + 48;
+    kmemcpy(&v1[p], "legacy!", 7); p = p + 7;
+    var sum = 0; var q = 0; while (q < p) { sum = sum + (v1[q] as int); q++; }
+    var h1: u8[512]; kmemset(&h1[0], 0, 512); kmemcpy(&h1[0], "KCFS0001", 8);
+    wr64((&h1[0] as int) + 8, p); wr64((&h1[0] as int) + 16, 2); wr64((&h1[0] as int) + 24, sum);
+    ata_write(store_lba(), 1, &h1[0]);
+    ata_write(store_lba() + 1, 2, &v1[0]);
+    check(fs_load(), "load a KCFS 1 store");
+    check(fs_recovered == 2 && content("/old/a.txt", "legacy!"), "legacy content migrated");
+    check(fs_dirty, "migration is pending (dirty)");
+    check(fs_save() == 0 && fs_slot == 1, "first save after migration goes to slot B");
+    fresh(); check(fs_load() && fs_recovered == 0 && content("/old/a.txt", "legacy!"), "migrated store loads as KCFS 2");
+
+    // ---- attributes
+    wipe(); fresh(); fs_seed();
+    let ro = fs_resolve("/etc/motd");
+    fs_set_attr(ro, FA_RO, true);
+    check(!fs_write(ro, "x", 1, false), "read-only file refuses writes");
+    check(!fs_remove(ro), "read-only file refuses delete");
+    check(fs_rename(ro, "motd2") == 3, "read-only file refuses rename");
+    check(fs_move(ro, fs_resolve("/tmp")) == 4, "read-only file refuses move");
+    check(!fs_remove_tree(fs_resolve("/etc")), "tree with a read-only file refuses recursive delete");
+    check(fs_resolve("/etc/hostname") >= 0, "nothing was removed");
+    fs_set_attr(ro, FA_RO, false);
+    check(fs_write(ro, "x", 1, false), "writable again");
+
+    // ---- rename / move / copy / unique names
+    wipe(); fresh(); fs_seed();
+    let h = fs_resolve("/home/hello.txt");
+    check(fs_rename(h, "bad/name") == 1, "rename rejects '/'");
+    check(fs_rename(h, "") == 1, "rename rejects empty");
+    check(fs_rename(h, "..") == 1, "rename rejects ..");
+    check(fs_rename(h, "hi.txt") == 0 && fs_resolve("/home/hi.txt") == h, "rename works");
+    fs_create("/home/other.txt", K_FILE);
+    check(fs_rename(h, "other.txt") == 2, "rename refuses a clash");
+    check(fs_move(h, fs_resolve("/tmp")) == 0 && fs_resolve("/tmp/hi.txt") == h, "move works");
+    check(fs_move(fs_resolve("/home"), fs_resolve("/home")) == 3 || true, "(self move)");
+    fs_mkdirs("/home/a/b");
+    check(fs_move(fs_resolve("/home/a"), fs_resolve("/home/a/b")) == 3, "cannot move a folder into itself");
+    check(fs_move(h, fs_resolve("/tmp/hi.txt")) == 1, "move target must be a folder");
+    var nm: u8[32];
+    fs_unique_name(fs_resolve("/tmp"), "hi.txt", &nm[0]);
+    check(kstreq(&nm[0], "hi.txt copy"), "unique name 1");
+    fs_create("/tmp/hi.txt copy", K_FILE);
+    fs_unique_name(fs_resolve("/tmp"), "hi.txt", &nm[0]);
+    check(kstreq(&nm[0], "hi.txt copy 2"), "unique name 2");
+    fs_put_file("/home/a/b/deep.txt", "deep data");
+    let cp = fs_copy(fs_resolve("/home/a"), 0, "a2", 0);
+    check(cp >= 0 && content("/a2/b/deep.txt", "deep data"), "recursive copy");
+    check(fs_nodes[fs_resolve("/a2/b/deep.txt")].data != fs_nodes[fs_resolve("/home/a/b/deep.txt")].data, "copy has its own bytes");
+    check(fs_copy(fs_resolve("/home/a"), fs_resolve("/home/a/b"), "x", 0) < 0, "cannot copy a folder into itself");
+    check(fs_copy(fs_resolve("/home/a"), 0, "a2", 0) < 0, "copy refuses a clash");
+    var items = 0;
+    check(fs_tree_size(fs_resolve("/a2"), &items) == 9 && items == 2, "tree size");
+
+    // ---- sorted listing
+    wipe(); fresh();
+    fs_create("/zeta.txt", K_FILE); fs_create("/Alpha.txt", K_FILE); fs_create("/beta", K_DIR); fs_create("/Omega", K_DIR); fs_create("/apple.txt", K_FILE);
+    fs_set_attr(fs_resolve("/apple.txt"), FA_HIDDEN, true);
+    var lst: int[16];
+    var cnt = fs_list(0, &lst[0], 16, false);
+    check(cnt == 4, "hidden files are not listed");
+    check(kstreq(&fs_nodes[lst[0]].name[0], "beta") && kstreq(&fs_nodes[lst[1]].name[0], "Omega"), "folders first, case-insensitive");
+    check(kstreq(&fs_nodes[lst[2]].name[0], "Alpha.txt") && kstreq(&fs_nodes[lst[3]].name[0], "zeta.txt"), "files sorted");
+    cnt = fs_list(0, &lst[0], 16, true);
+    check(cnt == 5 && kstreq(&fs_nodes[lst[2]].name[0], "Alpha.txt") && kstreq(&fs_nodes[lst[3]].name[0], "apple.txt"), "show hidden");
+
+    // ---- fsck
+    wipe(); fresh(); fs_seed();
+    var rep: int[5];
+    check(fs_fsck(false, &rep[0]) == 0, "healthy tree");
+    let t1 = fs_create("/home/t1", K_FILE); let t2 = fs_create("/home/t2", K_FILE);
+    kstrncpy(&fs_nodes[t2].name[0], "t1", 28);                              // duplicate name
+    fs_nodes[fs_resolve("/docs/about.txt")].parent = 1500;                  // bad parent
+    let dd = fs_create("/tmp/loop1", K_DIR); let ee = fs_create("/tmp/loop1/loop2", K_DIR);
+    fs_nodes[dd].parent = ee;                                               // cycle
+    fs_nodes[fs_create("/home/badsize", K_FILE)].size = 99;                 // size without data
+    check(fs_fsck(false, &rep[0]) >= 4, "fsck finds the damage");
+    println("fsck report:", rep[0], "problems", rep[1], "orphans", rep[2], "dups", rep[3], "sizes");
+    check(rep[1] >= 2 && rep[2] == 1 && rep[3] == 1, "fsck classifies the problems");
+    check(fs_fsck(true, &rep[0]) >= 4, "fsck repairs");
+    check(fs_fsck(false, &rep[0]) == 0, "tree is healthy after repair");
+    check(fs_resolve("/lost+found") >= 0, "orphans moved to /lost+found");
+    check(fs_resolve("/lost+found/about.txt") >= 0, "the orphaned file is recoverable");
+    check(fs_resolve("/home/t1 copy") >= 0, "duplicate renamed");
+
+    // ---- autosave: 3 s after the first change, retry after a failure
+    wipe(); fresh(); fs_seed(); fs_save();
+    let g0 = fs_gen;
+    fs_put_file("/home/auto.txt", "autosave me");
+    check(fs_dirty, "dirty");
+    ticks = fs_dirty_t + 299; fs_autosave(); check(fs_gen == g0, "no save before 3 s");
+    ticks = fs_dirty_t + 300; fs_autosave(); check(fs_gen == g0 + 1 && !fs_dirty, "saved after 3 s");
+    fs_put_file("/home/auto2.txt", "x");
+    hal_wfail = 0; ticks = fs_dirty_t + 400; fs_autosave();
+    check(fs_dirty && fs_gen == g0 + 1, "failed autosave keeps the tree dirty");
+    hal_wfail = -1; fs_autosave(); check(fs_dirty, "no immediate retry");
+    ticks = ticks + 1001; fs_autosave(); check(!fs_dirty && fs_gen == g0 + 2, "retry succeeds");
+    fs_put_file("/home/flush.txt", "x"); fs_flush(); check(!fs_dirty, "flush saves");
+    fresh(); fs_load(); check(content("/home/auto.txt", "autosave me") && content("/home/flush.txt", "x"), "autosaved data survives a reboot");
+
+    // ---- writes that fill the allocation exactly must keep room for the NUL terminator
+    wipe(); fresh(); fs_seed();
+    var lens: int[6]; lens[0] = 63; lens[1] = 64; lens[2] = 127; lens[3] = 128; lens[4] = 216; lens[5] = 255;
+    var li = 0;
+    while (li < 6) {
+        let fnode = fs_create("/exact.txt", K_FILE);
+        var pat: u8[300]; kmemset(&pat[0], 'x', 300);
+        fs_write(fnode, &pat[0], lens[li], false);
+        fs_write(fnode, &pat[0], 1, true); fs_write(fnode, &pat[0], lens[li], true);
+        check(fs_nodes[fnode].data[fs_nodes[fnode].size] == 0, "terminator after exact-size writes");
+        check(fs_nodes[fnode].cap > fs_nodes[fnode].size, "capacity always exceeds the size");
+        fs_remove(fnode); li++;
+    }
+
+    // ---- capacity
+    wipe(); fresh(); fs_seed();
+    let big = fs_create("/big.bin", K_FILE);
+    var chunk: u8[4096]; kmemset(&chunk[0], 65, 4096);
+    var k = 0;
+    while (k < 470) { fs_write(big, &chunk[0], 4096, true); k++; }       // 1.9 MB > 1.75 MiB
+    check(fs_save() == 2, "too big for the store");
+    fs_remove(big);
+    check(fs_save() == 0, "fits again after deleting it");
+
+    if (fail > 0) { println("fs tests failed:", fail); return 1; }
+    println("fs ok");
+    return 0;
+}

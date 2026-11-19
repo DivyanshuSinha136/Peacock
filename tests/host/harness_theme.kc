@@ -1,0 +1,94 @@
+// harness_theme.kc -- host test of the desktop themes: Appearance app, `theme` command, wallpaper + accent colours.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn main() -> int {
+    let fbmem = malloc((2560 * 1440 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    println("default theme:", th_cur + 1, "block ok:", th_block_ok());
+    app_open(APP_THEME);
+    run_frames(2);
+    dump_ppm("theme_app.ppm");
+    // click the 4th tile (row 0, col 3) of the Appearance window
+    let i = win_of_kind(APP_SETTINGS);
+    click(wins[i].x + 2 + SET_SB + 12 + 3 * TH_CW + 40, wins[i].y + TB + TH_TOP + 30); run_frames(2);
+    println("after click: theme", th_cur + 1, "acc", th_acc, "expect", th_acc_t[3]);
+    if (th_cur != 3 || th_acc != th_acc_t[3]) { println("THEME FAIL click"); return 1; }
+    kb_push('9'); run_frames(1);
+    println("after key 9: theme", th_cur + 1);
+    if (th_cur != 8) { println("THEME FAIL key"); return 1; }
+    app_open(APP_TERM); run_frames(2);
+    type_str("theme 2"); kb_push(10); run_frames(2);
+    println("after `theme 2`: theme", th_cur + 1);
+    if (th_cur != 1) { println("THEME FAIL command"); return 1; }
+    var t = 0;
+    while (t < TH_N) {
+        theme_apply(t, false); run_frames(2);
+        if (t == 0) { dump_ppm("theme_1.ppm"); }
+        if (t == 2) { dump_ppm("theme_3.ppm"); }
+        if (t == 7) { dump_ppm("theme_8.ppm"); }
+        if (t == 8) { dump_ppm("theme_9.ppm"); }
+        t++;
+    }
+    var px = wall[400 * 1280 + 640] as int;
+    println("wall centre pixel", px);
+    if (px == 0) { println("THEME FAIL wall empty"); return 1; }
+    // live resolution switching through the (fake) Bochs adapter: no 1280 limit, buffers re-allocated, windows kept on screen
+    if (!disp_probe()) { println("THEME FAIL no display adapter"); return 1; }
+    if (disp_set(1280, 800) == false || fb_w != 1280) { println("THEME FAIL set 1280x800"); return 1; }
+    app_open(APP_THEME); run_frames(2);
+    if (!disp_set(1920, 1080) || fb_w != 1920 || fb_h != 1080 || fb_pitch != 7680 || dispi_regs[1] != 1920 || dispi_regs[2] != 1080) { println("THEME FAIL set 1920x1080"); return 1; }
+    run_frames(3);
+    dump_ppm("display_1920.ppm");
+    let wr = wall[1079 * 1920 + 1919] as int; let wc = wall[540 * 1920 + 960] as int;
+    println("1920x1080 wall", wc, wr, "why", th_why, "disp_cur", disp_cur(), disp_label(disp_cur()));
+    if (th_why != 0 || wc == 0 || wr == 0 || disp_cur() != 3) { println("THEME FAIL wide screen"); return 1; }
+    if (disp_set(4096, 2400) || disp_set(2560, 1440) == false || disp_cur() != 4) { println("THEME FAIL 2560x1440 / vram limit"); return 1; }
+    if (!disp_set(1024, 768) || fb_w != 1024) { println("THEME FAIL shrink"); return 1; }
+    var wi = 0;
+    while (wi < MAXWIN) { if (wins[wi].used != 0 && (wins[wi].x + wins[wi].w > 1024 || wins[wi].y + wins[wi].h > 768 - TASKBAR_H)) { println("THEME FAIL window off screen after shrink"); return 1; } wi++; }
+    run_frames(2);
+    var ds = 0;
+    while (ds < DISP_N) { if (!disp_fits(disp_w(ds), disp_h(ds))) { println("THEME FAIL fits", ds); return 1; } ds++; }
+    println("theme ok");
+    return 0;
+}

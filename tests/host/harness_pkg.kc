@@ -1,0 +1,108 @@
+// harness_pkg.kc -- host test of the terminal upgrade: install bundle, cp/mv/rm -r, grep, head/tail/wc, find, tree, du, edit, Tab, scrollback.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn cmd(s: *u8) { type_str(s); type_str("\n"); run_frames(1); }
+fn sum_of(path: *u8) -> int {
+    let n = fs_resolve(path);
+    if (n < 0) { return -1; }
+    var s = 0; var i = 0;
+    while (i < fs_nodes[n].size) { s = s + (fs_nodes[n].data[i] as int); i++; }
+    return s;
+}
+
+fn main() -> int {
+    let fbmem = malloc((800 * 600 * 4) as u64);
+    gfx_init(800, 600, 3200, 32, fbmem as int);
+    mouse_set_bounds(800, 600);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed();
+    ui_init();
+    app_open(APP_TERM);
+    run_frames(2);
+    cmd("df");
+    cmd("install -l");
+    cmd("install");
+    run_frames(2);
+    dump_ppm("/tmp/pk_inst.ppm");
+    println("codegen.kc size:", fs_nodes[fs_resolve("/usr/src/kingcobra/kcc/src/codegen.kc")].size, "sum:", sum_of("/usr/src/kingcobra/kcc/src/codegen.kc"));
+    println("hello.kc sum:", sum_of("/usr/src/kingcobra/kcc/examples/hello.kc"));
+    println("README sum:", sum_of("/usr/src/kingcobra/README.md"));
+    cmd("tree /usr/src/kingcobra/kcc/examples");
+    cmd("grep -n fn /usr/src/kingcobra/kcc/examples/hello.kc");
+    cmd("head -n 3 /usr/src/kingcobra/kcc/src/main.kc");
+    cmd("tail -n 2 /usr/src/kingcobra/kcc/src/main.kc");
+    cmd("wc /usr/src/kingcobra/kcc/src/main.kc");
+    cmd("find /usr/src -name codegen");
+    cmd("du /usr/src/kingcobra/kasm");
+    cmd("grep -r -i -n hello /usr/src/kingcobra/kcc/examples");
+    run_frames(2);
+    dump_ppm("/tmp/pk_cmds.ppm");
+    cmd("cp -r /usr/src/kingcobra/kasm /tmp/kasm2");
+    println("cp -r: kasm2 exists:", fs_resolve("/tmp/kasm2/src/asm.kc") >= 0, "sum equal:", sum_of("/tmp/kasm2/src/asm.kc") == sum_of("/usr/src/kingcobra/kasm/src/asm.kc"));
+    cmd("mv /tmp/kasm2 /tmp/kasm3");
+    println("mv: old gone:", fs_resolve("/tmp/kasm2") < 0, "new there:", fs_resolve("/tmp/kasm3/src/asm.kc") >= 0);
+    cmd("rm -r /tmp/kasm3");
+    println("rm -r: gone:", fs_resolve("/tmp/kasm3") < 0);
+    cmd("cp /usr/src/kingcobra/README.md /tmp");
+    println("cp into dir:", fs_resolve("/tmp/README.md") >= 0);
+    cmd("cp -r /usr/src /usr/src/x");
+    println("cp into itself refused:", fs_resolve("/usr/src/x") < 0);
+    // edit opens Notes with that file
+    cmd("edit /usr/src/kingcobra/kcc/examples/hello.kc");
+    println("notes path:", nlen, fs_nodes[fs_resolve("/usr/src/kingcobra/kcc/examples/hello.kc")].size, win_of_kind(APP_NOTES) >= 0);
+    type_str("hello");
+    run_frames(1);
+    dump_ppm("/tmp/pk_edit.ppm");
+    // back to the terminal: tab completion and scrollback
+    raise(win_of_kind(APP_TERM));
+    type_str("cd /usr/src/king\t");
+    run_frames(1);
+    tin[tin_len] = 0;
+    println("tab ->", &tin[0], "len", tin_len);
+    cmd("");
+    cmd("clear");
+    var q = 0;
+    while (q < 3) { cmd("ls /usr/src/kingcobra"); q++; }
+    println("scrollback lines:", sb_n);
+    kb_push(KEY_PGUP);
+    run_frames(1);
+    println("t_off after PgUp:", t_off);
+    dump_ppm("/tmp/pk_scroll.ppm");
+    return 0;
+}

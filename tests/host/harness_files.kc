@@ -1,0 +1,114 @@
+// harness_apps.kc -- screenshots of every app window.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fail = 0;
+fn check(ok: bool, what: *u8) { if (!ok) { println("FILES FAIL:", what); fail++; } }
+fn sel_name(name: *u8) { var i = 0; while (i < f_count()) { if (kstreq(&fs_nodes[f_nth(i)].name[0], name)) { f_si = i; f_fix(); return; } i++; } }
+
+fn main() -> int {
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    threads_start();
+    run_frames(2);
+    app_open(APP_FILES); run_frames(10);
+    f_dir = fs_resolve("/home");
+    check(f_count() >= 1, "home has entries");
+    // sorted: folders first
+    var i = 0; var seen_file = false; var ok = true;
+    while (i < f_count()) { let n = f_nth(i); if (fs_nodes[n].kind == K_FILE) { seen_file = true; } else if (seen_file) { ok = false; } i++; }
+    check(ok, "folders listed first");
+    // new file + rename
+    f_new(K_FILE);
+    let nn = f_nth(f_si);
+    check(kstreq(&fs_nodes[nn].name[0], "new.txt"), "new file name");
+    files_key('r'); check(f_ren, "rename mode");
+    var q = 0; while (q < 7) { files_key(8); q++; }
+    type_str("report.txt"); var t = 0; while (t < 10) { files_key("report.txt"[t] as int); t++; }
+    files_key(10);
+    check(!f_ren && kstreq(&fs_nodes[nn].name[0], "report.txt"), "renamed");
+    check(fs_resolve("/home/report.txt") == nn, "path resolves");
+    // rename clash
+    f_new(K_FILE);
+    files_key('r'); var z = 0; while (z < 9) { files_key(8); z++; }
+    t = 0; while (t < 10) { files_key("report.txt"[t] as int); t++; }
+    files_key(10);
+    check(kstreq(&fs_nodes[f_nth(f_si)].name[0], "new.txt") || fs_resolve("/home/new.txt") >= 0, "clash refused");
+    // copy / paste in place -> "report.txt copy"
+    sel_name("report.txt"); files_key('c'); files_key('v');
+    check(fs_resolve("/home/report.txt copy") >= 0, "copy pasted with a unique name");
+    files_key('v');
+    check(fs_resolve("/home/report.txt copy 2") >= 0, "second paste");
+    // cut / paste into a folder
+    f_new(K_DIR); let dn = f_nth(f_si);
+    sel_name("report.txt copy"); files_key('x');
+    f_dir = dn; files_key('v');
+    check(fs_resolve("/home/folder/report.txt copy") >= 0 && fs_resolve("/home/report.txt copy") < 0, "cut moves");
+    f_dir = fs_resolve("/home");
+    // lock: delete refused
+    sel_name("report.txt"); f_lock();
+    check((fs_nodes[nn].attr & FA_RO) != 0, "locked");
+    f_delete(); check(fs_nodes[nn].kind != K_FREE, "locked file is not deleted");
+    files_key('r'); check(!f_ren, "locked file is not renamed");
+    f_lock(); check((fs_nodes[nn].attr & FA_RO) == 0, "unlocked");
+    // hidden
+    f_hide(); let c1 = f_count();
+    check((fs_nodes[nn].attr & FA_HIDDEN) != 0, "hidden attr");
+    files_key('.'); check(f_count() == c1 + 1, "show hidden reveals it");
+    files_key('.'); check(f_count() == c1, "hide again");
+    // recursive delete needs two presses
+    sel_name("folder"); f_delete(); check(fs_nodes[dn].kind != K_FREE, "armed, not deleted yet");
+    f_delete(); check(fs_nodes[dn].kind == K_FREE && fs_resolve("/home/folder/report.txt copy") < 0, "second press deletes the tree");
+    // autosave reflects in status; ticks past 3 s save
+    check(fs_dirty, "dirty after edits");
+    run_frames(80);
+    check(!fs_dirty, "autosaved by the UI loop");
+    run_frames(4); dump_ppm("files.ppm");
+    // threads tab of the Monitor with a few workers
+    thr_create("counter", fnaddr(demo_counter), 50, 2, 0); thr_create("spin", fnaddr(demo_spin), 50, 1, 0);
+    app_open(APP_MON); run_frames(20); mon_tab = 1; ui_inval_all(APP_MON); run_frames(20);
+    check(thr_count() >= 4, "workers listed");
+    dump_ppm("monitor_threads.ppm");
+    if (fail > 0) { println("files tests failed:", fail); return 1; }
+    println("files ok");
+    return 0;
+}

@@ -1,0 +1,207 @@
+// harness_net.kc -- host test of the network stack + browser against tests/gateway.py (a simulated QEMU gateway) over FIFOs.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+fn nrun(n: int) { var i = 0; while (i < n) { ticks = ticks + 2; ui_frame(); usleep(4000); i++; } }
+fn nwait_job(max: int) { var i = 0; while (t_job != 0 && i < max) { nrun(1); i++; } println("  job frames:", i, "still running:", t_job != 0); }
+fn ncmd(s: *u8) { type_str(s); type_str("\n"); nrun(2); nwait_job(4000); }
+fn nwait_web(max: int) { var i = 0; while (web_loading && i < max) { nrun(1); i++; } println("  web frames:", i, "loading:", web_loading, "status:", &web_status[0]); }
+fn fsize(p: *u8) -> int { let n = fs_resolve(p); if (n < 0) { return -1; } return fs_nodes[n].size; }
+fn has_text(p: *u8, needle: *u8) -> bool {
+    let n = fs_resolve(p);
+    if (n < 0) { return false; }
+    let nl = kstrlen(needle);
+    var i = 0;
+    while (i + nl <= fs_nodes[n].size) {
+        var k = 0;
+        while (k < nl && fs_nodes[n].data[i + k] == needle[k]) { k++; }
+        if (k == nl) { return true; }
+        i++;
+    }
+    return false;
+}
+
+var bfail = 0;
+fn bcheck(ok: bool, what: *u8) { if (!ok) { println("BROWSER FAIL:", what); bfail++; } else { println("  ok:", what); } }
+fn btype(s: *u8) { var i = 0; while (s[i] != 0) { web_key(s[i] as int); i++; } }
+
+fn browser_tests() {
+    // ---- styled page: colours, background, anchors, find
+    web_nav("http://example.test/styled", true); nwait_web(3000);
+    bcheck(w_bg == 0xFFF8E0, "body bgcolor sets the page background");
+    var red = false; var blue = false; var cent = false; var strike = false; var mark = false; var i = 0;
+    while (i < wn) {
+        if (wit[i].color == 0xC00000) { red = true; } if (wit[i].color == 0x1565C0) { blue = true; }
+        if ((wit[i].flags & WF_STRIKE) != 0) { strike = true; } if ((wit[i].flags & WF_MARK) != 0) { mark = true; }
+        i++;
+    }
+    bcheck(red, "style color on a heading"); bcheck(blue, "font color"); bcheck(strike && mark, "strike and mark flags");
+    dump_ppm("/tmp/net_styled.ppm");
+    let hn0 = tabs[wt].hn;
+    // anchor link: scrolls, no new history entry, no reload
+    var lx0 = -1; var ly0 = -1; i = 0;
+    while (i < wn) { if (wit[i].link >= 0 && kstreq(wpool + wl_off[wit[i].link], "#bottom")) { lx0 = wit[i].x; ly0 = wit[i].y; break; } i++; }
+    bcheck(lx0 >= 0, "anchor link found");
+    web_scroll = 0;
+    web_mouse(8 + lx0 + 4, wb_top() + ly0 + 4 - web_scroll, 1);
+    bcheck(web_scroll > 300 && tabs[wt].hn == hn0, "anchor jump scrolls without navigating");
+    web_scroll = 0;
+    web_key(6); btype("needle");
+    bcheck(find_on && find_n == 2, "find counts both matches");
+    bcheck(web_scroll > 300, "find scrolls to the match");
+    web_key(10); bcheck(find_cur == 1, "Enter goes to the next match");
+    web_key(10); bcheck(find_cur == 0, "next wraps around");
+    nrun(2); dump_ppm("/tmp/net_find.ppm");
+    web_key(27); bcheck(!find_on, "Esc closes find");
+    // ---- bookmarks
+    let bn0 = bm_n;
+    web_key(4);
+    bcheck(bm_n == bn0 + 1 && bm_find(&web_url[0]) >= 0, "Ctrl+D adds a bookmark");
+    bcheck(has_text("/etc/bookmarks", "example.test/styled"), "bookmarks are saved to /etc/bookmarks");
+    // ---- history
+    bcheck(hs_n > 0 && has_text("/etc/history", "example.test"), "history is recorded and saved");
+    // ---- tabs
+    web_key(20);
+    bcheck(web_tab_count() == 2 && wt == 1, "Ctrl+T opens a second tab");
+    web_nav("http://example.test/about", true); nwait_web(3000);
+    bcheck(kstreq(&tabs[1].title[0], "About"), "second tab shows About");
+    web_focus = 1; web_key('[');
+    bcheck(wt == 0 && kstreq(&w_title[0], "Styled") && w_bg == 0xFFF8E0, "back to tab 1 re-renders from cache");
+    web_focus = 1; web_key(']'); bcheck(wt == 1 && kstreq(&w_title[0], "About"), "forward to tab 2");
+    dump_ppm("/tmp/net_tabs.ppm");
+    // suggestions
+    web_key(12); btype("exam");
+    bcheck(sg_n > 0, "address bar suggests matching history");
+    nrun(2); dump_ppm("/tmp/net_suggest.ppm");
+    web_key(27); web_key(27);
+    web_key(23);
+    bcheck(web_tab_count() == 1 && wt == 0, "Ctrl+W closes the tab");
+    // bookmark bar click
+    web_mouse(20, WB_TABS + WB_BAR + 8, 1); nwait_web(3000);
+    bcheck(kmatch_ci(&web_url[0], "http://example.test/styled"), "bookmark bar chip opens the page");
+    web_key(4); bcheck(bm_n == bn0, "Ctrl+D again removes it");
+    // ---- word search, about pages
+    web_nav("example test", true);
+    bcheck(kmatch_ci(&web_url[0], "about:search?") && kstreq(&tabs[wt].title[0], "Search"), "words search bookmarks and history");
+    web_nav("about:history", true); bcheck(kstreq(&tabs[wt].title[0], "History"), "about:history");
+    web_nav("about:bookmarks", true); bcheck(kstreq(&tabs[wt].title[0], "Bookmarks"), "about:bookmarks");
+    web_nav("about:nonsense", true); bcheck(web_status[0] == 'U', "unknown about page");
+    // ---- download
+    web_nav("http://example.test/file.bin", true); nwait_web(3000);
+    bcheck(fsize("/home/Downloads/blob.bin") == 1024, "non-page content is saved to /home/Downloads");
+    dump_ppm("/tmp/net_download.ppm");
+    // ---- compressed responses are refused politely
+    web_nav("http://example.test/gz", true); nwait_web(3000);
+    bcheck(kmatch_ci(&web_status[0], "compressed"), "gzip response refused");
+    // ---- save page
+    web_nav("http://example.test/about", true); nwait_web(3000);
+    web_key(19);
+    bcheck(fsize("/home/Downloads/About.html") > 20, "Ctrl+S saves the page source");
+    // ---- back/forward restore
+    web_nav("http://example.test/", true); nwait_web(3000);
+    web_back(); nwait_web(3000);
+    bcheck(kstreq(&w_title[0], "About"), "back navigates");
+    web_forward(); nwait_web(3000);
+    bcheck(kstreq(&w_title[0], "Example Test"), "forward navigates");
+    // hover shows the link in the status bar
+    var k2 = 0; while (k2 < wn && wit[k2].link < 0) { k2++; }
+    web_mouse(8 + wit[k2].x + 2, wb_top() + wit[k2].y + 2 - web_scroll, 5);
+    bcheck(web_hov >= 0, "hover tracks the link under the pointer");
+    dump_ppm("/tmp/net_hover.ppm");
+}
+
+fn main() -> int {
+    let fbmem = malloc((800 * 600 * 4) as u64);
+    gfx_init(800, 600, 3200, 32, fbmem as int);
+    mouse_set_bounds(800, 600);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed();
+    ui_init();
+    net_init();
+    println("net_ready:", net_ready);
+    app_open(APP_TERM);
+    var i = 0;
+    while (!net_up && i < 600) { nrun(1); i++; }
+    var ib: u8[20]; var gb: u8[20]; var db: u8[20];
+    ip_str(my_ip, &ib[0]); ip_str(gw_ip, &gb[0]); ip_str(dns_ip, &db[0]);
+    println("net_up:", net_up, "frames:", i, "ip:", &ib[0], "gw:", &gb[0], "dns:", &db[0]);
+    ncmd("ifconfig");
+    ncmd("nslookup example.test");
+    ncmd("ping 10.0.2.2");
+    ncmd("wget http://example.test/text /tmp/t.txt");
+    println("text.txt size:", fsize("/tmp/t.txt"));
+    ncmd("wget http://example.test/big /tmp/big.html");
+    println("big size:", fsize("/tmp/big.html"), "has END:", has_text("/tmp/big.html", "END-OF-BIG"));
+    ncmd("wget http://example.test/chunked /tmp/ch.html");
+    println("chunked:", fsize("/tmp/ch.html"), has_text("/tmp/ch.html", "first chunk, second chunk"));
+    ncmd("wget http://example.test/redir /tmp/rd.html");
+    println("redirect:", has_text("/tmp/rd.html", "The about page"));
+    ncmd("wget http://example.test/nope /tmp/nf.html");
+    nrun(2);
+    dump_ppm("/tmp/net_term.ppm");
+
+    app_open(APP_WEB);
+    nrun(3);
+    dump_ppm("/tmp/net_home.ppm");
+    web_nav("http://example.test/", true);
+    nwait_web(3000);
+    println("title:", &w_title[0], "items:", wn);
+    dump_ppm("/tmp/net_page.ppm");
+    web_nav("http://example.test/redir", true);
+    nwait_web(3000);
+    println("after redirect title:", &w_title[0], "url:", &web_url[0]);
+    web_nav("http://example.test/big", true);
+    nwait_web(3000);
+    println("big title:", &w_title[0], "height:", w_height);
+    web_nav("http://nosuch.test/", true);
+    nwait_web(3000);
+    println("dns fail title:", &w_title[0]);
+    dump_ppm("/tmp/net_err.ppm");
+    web_nav("https://example.test/", true);
+    nwait_web(300);
+    println("https title:", &w_title[0]);
+    web_nav("about:home", true);
+    nrun(2);
+    dump_ppm("/tmp/net_about.ppm");
+    web_nav("file:///usr/src/kingcobra/README.md", true);
+    nrun(3);
+    println("file title:", &w_title[0]);
+    dump_ppm("/tmp/net_file.ppm");
+    browser_tests();
+    return bfail;
+}

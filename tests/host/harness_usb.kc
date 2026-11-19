@@ -1,0 +1,166 @@
+// harness_usb.kc -- host test of the UHCI USB driver (kernel/usb.kc) against the simulated controller in usb_host.kc
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fails = 0;
+fn chk(name: *u8, ok: bool) { if (ok) { println("  ok  ", name); } else { println("  FAIL", name); fails++; } }
+fn drain() { while (kb_get() >= 0) { } }
+fn poll() { usb_poll(); usb_poll(); }
+
+fn main() -> int {
+    let fbmem = malloc((1920 * 1080 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+
+    println("-- no controller");
+    chk("usb_init fails without a controller", !usb_init());
+    chk("usb_ok false", !usb_ok);
+    poll();
+
+    println("-- enumeration");
+    ush_enable();
+    ush_attach(0, 1); ush_attach(1, 3);
+    chk("usb_init succeeds", usb_init());
+    chk("DMA offset keeps addresses in 32 bits", upa(ub_fl) >= 0 && upa(ub_fl) < 0xFFFFF000 && (ub_fl & 4095) == 0);
+    chk("two root ports", usb_nports == 2);
+    chk("two devices found", usb_count() == 2);
+    chk("device 0 is a keyboard", ud_kind[0] == UK_KBD && ud_addr[0] == 1);
+    chk("device 1 is storage", ud_kind[1] == UK_STORAGE && ud_addr[1] == 2);
+    chk("keyboard name", kstreq(ud_namep(0), "USB keyboard"));
+    chk("vendor id read", ud_vid[0] == 0x0627 && ud_pid[0] == 0x11);
+    chk("boot protocol and idle were requested", ush_proto_seen >= 1 && ush_idle_seen >= 1);
+    chk("HID descriptor skipped, interrupt endpoint found", ud_ep[0] == 1 && ud_epmps[0] == 8);
+    chk("storage name from INQUIRY", kstreq(ud_namep(1), "PEACOCK SIM DISK"));
+    chk("capacity: 128 blocks of 512", ud_blocks[1] == 128 && ud_bsize[1] == 512);
+    chk("storage is the default disk", usb_ms == 1);
+    chk("note says ready", kstreq(&usb_note[0], "USB ready"));
+
+    set_open(SP_USB); run_frames(3); dump_ppm("usb_page.ppm");
+    chk("Settings window shows the USB page", win_of_kind(APP_SETTINGS) >= 0 && set_page == SP_USB);
+    win_close(win_of_kind(APP_SETTINGS)); run_frames(1);
+
+    println("-- keyboard");
+    drain();
+    ush_report(0, 0, 0, 4, 0, 0, 0, 0, 0);
+    poll();
+    chk("key 'a'", kb_get() == 'a');
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    poll();
+    chk("release makes nothing", kb_get() == -1);
+    ush_report(0, 2, 0, 4, 0, 0, 0, 0, 0);
+    poll();
+    chk("shift+a is 'A' and shift is tracked", kb_get() == 'A' && kb_shift);
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    chk("shift released", !kb_shift);
+    ush_report(0, 0, 0, 30, 0, 0, 0, 0, 0); poll();
+    chk("digit 1", kb_get() == '1');
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    ush_report(0, 2, 0, 30, 0, 0, 0, 0, 0); poll();
+    chk("shift+1 = '!'", kb_get() == '!');
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    ush_report(0, 0, 0, 56, 0, 0, 0, 0, 0); poll();
+    chk("slash", kb_get() == '/');
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    ush_report(0, 0, 0, 80, 0, 0, 0, 0, 0); poll();
+    chk("left arrow", kb_get() == KEY_LEFT);
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    ush_report(0, 0, 0, 40, 0, 0, 0, 0, 0); poll();
+    chk("enter", kb_get() == 10);
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    ush_report(0, 1, 0, 6, 0, 0, 0, 0, 0); poll();
+    chk("ctrl+c is 3", kb_get() == 3);
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll();
+    drain();
+    ush_report(0, 0, 0, 5, 0, 0, 0, 0, 0); poll();
+    chk("hold: first 'b'", kb_get() == 'b' && kb_get() == -1);
+    ticks = ticks + 45; poll();
+    chk("hold: auto repeat after 400 ms", kb_get() == 'b');
+    ticks = ticks + 4; poll();
+    chk("hold: keeps repeating", kb_get() == 'b');
+    ush_report(0, 0, 0, 0, 0, 0, 0, 0, 0); poll(); drain();
+    ticks = ticks + 60; poll();
+    chk("release stops the repeat", kb_get() == -1);
+
+    println("-- mass storage");
+    var buf: u8[2048];
+    chk("read 2 sectors at 5", usb_ms_read(5, 2, &buf[0]));
+    chk("sector 5 pattern", (buf[0] as int) == 35 && (buf[3] as int) == 38 && (buf[511] as int) == ((35 + 511) & 255));
+    chk("sector 6 pattern", (buf[512] as int) == 42 && (buf[600] as int) == ((42 + 88) & 255));
+    chk("read past the end refused", !usb_ms_read(127, 2, &buf[0]));
+    chk("negative lba refused", !usb_ms_read(-1, 1, &buf[0]));
+    var big: *u8 = kmalloc(512 * 9);
+    chk("9 sectors (three SCSI commands)", usb_ms_read(20, 9, big));
+    chk("sector 28 (last of the 9)", (big[512 * 8] as int) == ((28 * 7) & 255) && (big[512 * 8 + 5] as int) == ((28 * 7 + 5) & 255));
+    chk("many bulk transfers happened", ush_nbulk > 20 && ush_nreads >= 4);
+
+    println("-- hot-plug");
+    ush_detach(1);
+    ticks = ticks + 100; poll();
+    chk("storage removed", usb_count() == 1 && usb_ms == -1);
+    chk("reads fail without a disk", !usb_ms_read(0, 1, &buf[0]));
+    ush_attach(1, 2);
+    ticks = ticks + 100; poll();
+    chk("tablet appears", usb_count() == 2 && ud_kind[1] == UK_TABLET);
+    drain();
+    ush_report(1, 1, 0, 0x40, 0, 0x40, 0, 0, 0);
+    poll();
+    chk("tablet centre maps to the screen centre", mouse_x == 640 && mouse_y == 400 && mouse_btn == 1);
+    ush_report(1, 0, 0xFF, 0x7F, 0xFF, 0x7F, 0, 0, 0);
+    poll();
+    chk("tablet bottom-right corner", mouse_x == 1279 && mouse_y == 799 && mouse_btn == 0);
+    ush_report(1, 0, 0, 0, 0, 0, 1, 0, 0);
+    poll();
+    chk("tablet wheel up scrolls up", mouse_wheel == -1);
+    mouse_wheel = 0;
+    ush_detach(1);
+    ticks = ticks + 100; poll();
+    chk("tablet removed", usb_count() == 1);
+    ush_attach(1, 4);
+    ticks = ticks + 100; poll();
+    chk("relative mouse appears", ud_kind[1] == UK_MOUSE);
+    mouse_set_bounds(1280, 800);
+    ush_report(1, 1, 5, 0xFD, 1, 0, 0, 0, 0);
+    poll();
+    chk("mouse moves +5 -3, button 1", mouse_x == 645 && mouse_y == 397 && mouse_btn == 1);
+    chk("mouse wheel down", mouse_wheel == -1);
+    if (fails == 0) { println("USB TESTS PASSED"); } else { println("USB TESTS FAILED"); }
+    return fails;
+}

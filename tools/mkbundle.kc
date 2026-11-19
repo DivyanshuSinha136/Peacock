@@ -1,0 +1,138 @@
+// mkbundle.kc -- pack a directory tree into a Peacock install bundle (read by `install` in the Peacock terminal).
+// Author: Divyanshu Sinha (MIT License)
+//
+//   kingcobra tools/mkbundle.kc <dir> -o build/kingcobra.pkg [--name kingcobra] [--ext .kc,.kasm,.md,.txt]
+//                               [--skip peacock,build,.git] [--max-file 400000]
+// Only files whose extension is listed are packed; folders that end up empty are left out.  Names longer than 27 characters
+// or paths longer than 90 characters do not fit KCFS and are skipped (reported at the end).
+// Format (see kernel/pkg.kc): header sector "PKGB0001" | u64 payload bytes | u64 records | u64 adler32 | name; then the payload.
+import std.fbin;
+import std.io;
+import std.system;
+
+fn die(msg: string) { println("mkbundle: " + msg); system.exit(1); }
+
+var exts = [];
+var skips = [];
+var max_file = 400000;
+var files = [];          // [relative path, absolute path] pairs
+var skipped = [];
+
+fn listed(arr, v: string) -> bool {
+    var i = 0;
+    while (i < len(arr)) { if (arr[i] == v) { return true; } i = i + 1; }
+    return false;
+}
+
+fn walk(abs: string, rel: string) {
+    let names = system.list_dir(abs);
+    var i = 0;
+    while (i < len(names)) {
+        let nm = names[i];
+        i = i + 1;
+        let a = system.path_join(abs, nm);
+        var r = nm;
+        if (rel != "") { r = rel + "/" + nm; }
+        if (system.is_dir(a)) {
+            if (!listed(skips, nm)) { walk(a, r); }
+        } else if (system.is_file(a)) {
+            if (listed(exts, system.extension(nm))) {
+                if (len(nm) > 27 || len(r) > 90) { skipped.push(r + "  (name too long)"); }
+                else if (fbin.file_size(a) > max_file) { skipped.push(r + "  (larger than --max-file)"); }
+                else { files.push([r, a]); }
+            }
+        }
+    }
+}
+
+fn split_list(s: string) -> array {
+    var out = [];
+    var cur = "";
+    var i = 0;
+    while (i < len(s)) {
+        let c = s[i];
+        if (c == ",") { if (cur != "") { out.push(cur); } cur = ""; } else { cur = cur + c; }
+        i = i + 1;
+    }
+    if (cur != "") { out.push(cur); }
+    return out;
+}
+
+fn main() {
+    let args = system.args();
+    var dir = "";
+    var out = "";
+    var name = "bundle";
+    exts = [".kc", ".kasm", ".md", ".txt"];
+    skips = ["peacock", "build", ".git", "node_modules"];
+    var i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        if (a == "-o" && i + 1 < len(args)) { out = args[i + 1]; i = i + 2; }
+        else if (a == "--name" && i + 1 < len(args)) { name = args[i + 1]; i = i + 2; }
+        else if (a == "--ext" && i + 1 < len(args)) { exts = split_list(args[i + 1]); i = i + 2; }
+        else if (a == "--skip" && i + 1 < len(args)) { skips = split_list(args[i + 1]); i = i + 2; }
+        else if (a == "--max-file" && i + 1 < len(args)) { max_file = int(args[i + 1]); i = i + 2; }
+        else { dir = a; i = i + 1; }
+    }
+    if (dir == "" || out == "") { println("usage: mkbundle <dir> -o out.pkg [--name N] [--ext .kc,.md] [--skip a,b] [--max-file BYTES]"); system.exit(2); }
+    if (!system.is_dir(dir)) { die("not a directory: " + dir); }
+    walk(dir, "");
+    if (len(files) == 0) { die("no matching files under " + dir); }
+
+    let pay = fbin.buffer();
+    var made = [];
+    var records = 0;
+    var total = 0;
+    var f = 0;
+    while (f < len(files)) {
+        let rel = name + "/" + files[f][0];
+        // directories first: name, name/a, name/a/b ...
+        var parts = [];
+        var cur = "";
+        var k = 0;
+        while (k < len(rel)) {
+            if (rel[k] == "/") { parts.push(cur); cur = ""; } else { cur = cur + rel[k]; }
+            k = k + 1;
+        }
+        var acc = "";
+        var d = 0;
+        while (d < len(parts)) {
+            if (acc == "") { acc = parts[d]; } else { acc = acc + "/" + parts[d]; }
+            if (!listed(made, acc)) {
+                made.push(acc);
+                fbin.write_u32(pay, 2); fbin.write_u32(pay, len(acc)); fbin.write_u32(pay, 0); fbin.write_u32(pay, 0);
+                fbin.write_string(pay, acc);
+                records = records + 1;
+            }
+            d = d + 1;
+        }
+        let src = fbin.load(files[f][1]);
+        let sz = fbin.size(src);
+        fbin.write_u32(pay, 1); fbin.write_u32(pay, len(rel)); fbin.write_u32(pay, sz); fbin.write_u32(pay, 0);
+        fbin.write_string(pay, rel);
+        fbin.copy(src, pay, sz);
+        records = records + 1;
+        total = total + sz;
+        f = f + 1;
+    }
+    let psize = fbin.size(pay);
+    let sum = fbin.adler32(pay);
+    let img = fbin.buffer();
+    fbin.write_string(img, "PKGB0001");
+    fbin.write_u64(img, psize);
+    fbin.write_u64(img, records);
+    fbin.write_u64(img, sum);
+    fbin.write_cstring(img, name);
+    fbin.seek(img, 0, "end");
+    fbin.fill(img, 0, 512 - fbin.size(img));
+    fbin.seek(pay, 0);
+    fbin.copy(pay, img, psize);
+    let pad = (512 - (fbin.size(img) % 512)) % 512;
+    if (pad > 0) { fbin.fill(img, 0, pad); }
+    fbin.save(img, out);
+    println("mkbundle: " + str(len(files)) + " files, " + str(len(made)) + " folders, " + str(total) + " bytes of content -> " + out + " (" + str(fbin.size(img)) + " bytes)");
+    var s = 0;
+    while (s < len(skipped) && s < 10) { println("  skipped: " + skipped[s]); s = s + 1; }
+    if (len(skipped) > 10) { println("  ... and " + str(len(skipped) - 10) + " more skipped"); }
+}

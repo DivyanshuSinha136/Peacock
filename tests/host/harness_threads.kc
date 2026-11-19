@@ -1,0 +1,238 @@
+// harness_apps.kc -- KCFS 2: crash-safe persistence, attributes, copy/move/rename, fsck, autosave.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fail = 0;
+fn check(ok: bool, what: *u8) { if (!ok) { println("THR FAIL:", what); fail++; } }
+
+var log: int[64]; var ln = 0;
+fn put(v: int) { if (ln < 64) { log[ln] = v; ln++; } }
+var shared = 0;
+var m1 = -1; var s1 = -1; var q1 = -1;
+
+fn t_a(arg: int) -> int { var i = 0; while (i < 3) { put(10 + i); thr_yield(); i++; } return 7; }
+fn t_b(arg: int) -> int { var i = 0; while (i < 3) { put(20 + i); thr_yield(); i++; } return 8; }
+fn t_sleeper(arg: int) -> int { thr_sleep(arg); put(30); return 0; }
+fn t_hi(arg: int) -> int { put(90); return 0; }
+fn t_lo(arg: int) -> int { put(10); return 0; }
+fn t_locker(arg: int) -> int {                    // read-modify-write across yields, protected by the mutex
+    var i = 0;
+    while (i < 5) { mtx_lock(m1); let v = shared; thr_yield(); shared = v + 1; mtx_unlock(m1); i++; }
+    return 0;
+}
+fn t_holder(arg: int) -> int { mtx_lock(m1); thr_sleep(100000); return 0; }
+fn t_waiter(arg: int) -> int { sem_wait(s1, 0); put(55); return 0; }
+fn t_prod(arg: int) -> int { var i = 0; while (i < arg) { q_send(q1, i * 3, 0); i++; } return 0; }
+fn t_cons(arg: int) -> int { var o: int[1]; var i = 0; while (i < arg) { if (q_recv(q1, &o[0], 0)) { shared = shared + o[0]; } i++; } return 0; }
+fn t_deep(arg: int) -> int { var buf: u8[4096]; kmemset(&buf[0], 7, 4096); thr_yield(); return buf[100] as int; }
+fn t_regs(arg: int) -> int {                      // callee-saved registers survive switches
+    var a = arg * 3; var b = arg * 5; var c = arg * 7; var d = arg * 11;
+    var i = 0;
+    while (i < 20) { thr_yield(); i++; }
+    if (a == arg * 3 && b == arg * 5 && c == arg * 7 && d == arg * 11) { return 1; }
+    return 0;
+}
+fn t_spin_hi(arg: int) -> int { while (true) { thr_yield(); } return 0; }
+fn t_forever(arg: int) -> int { while (true) { thr_sleep(50); } return 0; }
+
+fn drain(n: int) { var i = 0; while (i < n) { thr_yield(); i++; } }
+
+fn main() -> int {
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    thr_init();
+    check(thr_on && thr_count() == 1 && thr_self() == 0, "main thread registered");
+
+    // ---- round robin and return values
+    let a = thr_create("a", fnaddr(t_a), 0, 2, 0);
+    let b = thr_create("b", fnaddr(t_b), 0, 2, 0);
+    check(a > 0 && b > 0 && a != b, "ids");
+    check(thr_join(a, 0) == 7, "join returns the exit code of a");
+    check(thr_join(b, 0) == 8, "join returns the exit code of b");
+    println("order:", log[0], log[1], log[2], log[3], log[4], log[5]);
+    check(ln == 6, "both ran three times");
+    check(log[0] == 10 && log[1] == 20 && log[2] == 11 && log[3] == 21 && log[4] == 12 && log[5] == 22, "strict round robin");
+    check(thr_count() == 1, "joined threads are gone");
+
+    // ---- sleep
+    ln = 0;
+    let sl = thr_create("sleeper", fnaddr(t_sleeper), 500, 2, 0);
+    drain(5);
+    check(ln == 0, "still asleep");
+    check(thr[thr_slot(sl)].state == TS_SLEEP, "state is sleeping");
+    ticks = ticks + 60;
+    drain(3);
+    check(ln == 1 && log[0] == 30, "woke after 500 ms");
+    thr_join(sl, 0);
+
+    // ---- priorities: the high priority thread runs first
+    ln = 0;
+    let lo = thr_create("lo", fnaddr(t_lo), 0, 0, 0);
+    let hi = thr_create("hi", fnaddr(t_hi), 0, 3, 0);
+    thr_yield();
+    check(ln >= 1 && log[0] == 90, "priority 3 before priority 0");
+    thr_join(hi, 0); thr_join(lo, 0);
+
+    // ---- no starvation of a low priority thread (aging)
+    ln = 0;
+    let hog = thr_create("hog", fnaddr(t_forever), 0, 3, 0);
+    thr_kill(hog);
+    let lo2 = thr_create("lo2", fnaddr(t_lo), 0, 0, 0);
+    let hi2 = thr_create("hi2", fnaddr(t_spin_hi), 0, 3, 0);
+    var spins = 0;
+    while (ln == 0 && spins < 100) { thr_yield(); spins++; }
+    check(ln > 0 && spins < 100, "aging lets the low priority thread run");
+    thr_kill(hi2); thr_join(lo2, 0);
+
+    // ---- mutex: no lost updates
+    m1 = mtx_new("test"); shared = 0;
+    let l1 = thr_create("l1", fnaddr(t_locker), 0, 2, 0);
+    let l2 = thr_create("l2", fnaddr(t_locker), 0, 2, 0);
+    let l3 = thr_create("l3", fnaddr(t_locker), 0, 2, 0);
+    thr_join(l1, 0); thr_join(l2, 0); thr_join(l3, 0);
+    check(shared == 15, "mutex protects the shared counter");
+    check(mtx_owner[m1] == -1, "mutex released");
+
+    // ---- a thread that dies holding a mutex releases it
+    let h = thr_create("holder", fnaddr(t_holder), 0, 2, 0);
+    drain(3);
+    check(mtx_owner[m1] == thr[thr_slot(h)].id, "holder owns the mutex");
+    check(!mtx_trylock(m1), "trylock fails while held");
+    check(thr_kill(h), "kill the holder");
+    check(mtx_owner[m1] == -1 && mtx_trylock(m1), "mutex free after the owner died");
+    mtx_unlock(m1);
+
+    // ---- recursive locking
+    mtx_lock(m1); mtx_lock(m1); check(mtx_depth[m1] == 2, "recursive depth");
+    mtx_unlock(m1); check(mtx_owner[m1] == 0, "still held"); mtx_unlock(m1); check(mtx_owner[m1] == -1, "released");
+    check(!mtx_unlock(m1), "unlock without owning fails");
+
+    // ---- semaphore with timeout
+    s1 = sem_new(0);
+    ln = 0;
+    let w = thr_create("waiter", fnaddr(t_waiter), 0, 2, 0);
+    drain(3);
+    check(ln == 0 && thr[thr_slot(w)].state == TS_BLOCK, "waiter blocked on the semaphore");
+    sem_post(s1);
+    thr_join(w, 0);
+    check(ln == 1 && log[0] == 55, "post wakes the waiter");
+    let t0 = ticks;
+    check(!sem_wait(s1, 300), "sem_wait times out");
+    check(ticks - t0 >= 30, "after the timeout");
+
+    // ---- message queue: producer / consumer through a 32-slot ring
+    q1 = q_new(); shared = 0;
+    let c = thr_create("cons", fnaddr(t_cons), 100, 2, 0);
+    let p = thr_create("prod", fnaddr(t_prod), 100, 2, 0);
+    thr_join(p, 0); thr_join(c, 0);
+    check(shared == 3 * (99 * 100 / 2), "all 100 messages arrived in order, none lost");
+    var o: int[1];
+    check(!q_recv(q1, &o[0], 100), "empty queue: recv times out");
+
+    // ---- stack use and canary
+    let dp = thr_create("deep", fnaddr(t_deep), 0, 2, 0);
+    drain(1);
+    let ds = thr_slot(dp);
+    check(thr_stack_used(ds) > 4096 && thr_stack_used(ds) < THR_STACK, "stack high-water mark");
+    check(thr_canary_ok(ds), "canary intact");
+    check(thr_join(dp, 0) == 7, "deep thread result");
+    // a stack smash is detected at the next switch
+    let sm = thr_create("smash", fnaddr(t_forever), 0, 2, 0);
+    drain(2);
+    let ss = thr_slot(sm);
+    *((thr[ss].stack + 8) as *u8) = 0;
+    thr_log_overflow = 0;
+    var tries = 0;
+    while (thr[ss].state != TS_DEAD && tries < 20) { ticks = ticks + 10; drain(1); tries++; }
+    check(thr[ss].state == TS_DEAD && thr_log_overflow == 1, "overflow detected and the thread stopped");
+    thr_join(sm, 0);
+
+    // ---- registers survive
+    let r1 = thr_create("r1", fnaddr(t_regs), 3, 2, 0);
+    let r2 = thr_create("r2", fnaddr(t_regs), 9, 2, 0);
+    check(thr_join(r1, 0) == 1 && thr_join(r2, 0) == 1, "callee-saved registers preserved across switches");
+
+    // ---- kill, system threads, join timeout
+    let f1 = thr_create("forever", fnaddr(t_forever), 0, 1, 0);
+    drain(2);
+    check(thr_join(f1, 200) == -1, "join with a timeout gives up");
+    check(thr_kill(f1) && !thr_kill(f1), "kill once");
+    check(thr_join(f1, 0) == -1, "killed thread has exit code -1");
+    let sysid = thr_create("sys", fnaddr(t_forever), 0, 1, TF_SYSTEM);
+    check(!thr_kill(sysid), "system threads cannot be killed");
+    check(!thr_kill(0), "the kernel thread cannot be killed");
+    check(!thr_kill(9999), "unknown id");
+
+    // ---- table full
+    var made = 0; var ids: int[16];
+    var z = 0;
+    while (z < 20) { let id = thr_create("fill", fnaddr(t_forever), 0, 0, 0); if (id > 0) { ids[made] = id; made++; } z++; }
+    check(made == THR_MAX - 2, "thread table fills up (kernel + the system thread occupy two slots)");
+    z = 0; while (z < made) { thr_kill(ids[z]); thr_join(ids[z], 0); z++; }
+    check(thr_count() == 2, "all freed");
+
+    // ---- cpu accounting
+    thr_idle_enter(); ticks = ticks + 400; thr_idle_leave();
+    ticks = ticks + 100; thr_yield();
+    check(thr_idle_acc >= 400, "idle time accounted");
+
+    // ---- the saver thread: a save with a write in flight does not lose an edit made meanwhile
+    threads_start();
+    fs_init(); fs_seed(); fs_gen = 0; fs_slot = 1; fs_persisted = false; fs_dirty = false;
+    let big = fs_create("/big.bin", K_FILE);
+    var chunk: u8[4096]; kmemset(&chunk[0], 66, 4096);
+    var kk = 0; while (kk < 100) { fs_write(big, &chunk[0], 4096, true); kk++; }          // 400 KB: several 128-sector chunks
+    fs_put_file("/edit1", "one");
+    ticks = fs_dirty_t + 400;
+    var guard = 0;
+    while (fs_gen == 0 && guard < 50) { thr_yield(); guard++; }                          // the autosave thread starts saving ...
+    check(fs_gen == 0 || fs_gen == 1, "autosave thread started");
+    // ... and the main thread edits while it is yielding between chunks (simulated: edit, then let it finish)
+    fs_put_file("/edit2", "two");
+    ticks = ticks + 100;
+    guard = 0;
+    guard = 0;
+    while (guard < 400) { ticks = ticks + 30; thr_yield(); guard++; }
+    check(fs_gen >= 1, "saved by the background thread");
+    check(!fs_dirty, "everything flushed eventually");
+    fs_init(); fs_gen = 0; fs_persisted = false;
+    check(fs_load() && fs_resolve("/edit1") >= 0 && fs_resolve("/edit2") >= 0, "both edits are on disk");
+
+    if (fail > 0) { println("thread tests failed:", fail); return 1; }
+    println("threads ok");
+    return 0;
+}

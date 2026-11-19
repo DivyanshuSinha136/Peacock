@@ -1,0 +1,104 @@
+// harness_3d.kc -- software 3D renderer: every model in every style, rendered to PPM.
+import "../../kernel/kstr.kc";
+import "../../kernel/font.kc";
+import "../../kernel/input.kc";
+import "../../kernel/gfx.kc";
+import "../../kernel/gfx3d.kc";
+import "../../kernel/fs.kc";
+import "../../kernel/ui.kc";
+import "../../kernel/apps.kc";
+import "../../kernel/apps2.kc";
+import "../../kernel/pkg.kc";
+import "../../kernel/shell.kc";
+import "hal_host.kc";
+import "../../kernel/kcfs.kc";
+import "../../kernel/threads.kc";
+import "nic_host.kc";
+import "../../kernel/net.kc";
+import "../../kernel/html.kc";
+import "../../kernel/browser.kc";
+import "../../kernel/peabin.kc";
+import "../../kernel/builder.kc";
+import "../../kernel/samples.kc";
+import "../../kernel/theme.kc";
+import "../../kernel/modern.kc";
+import "../../kernel/svgdata.kc";
+import "../../kernel/peacockicon.kc";
+import "../../kernel/svg.kc";
+import "../../kernel/fontdata.kc";
+import "../../kernel/vfont.kc";
+import "../../kernel/fonts.kc";
+import "../../kernel/studio3d.kc";
+import "../../kernel/display.kc";
+import "../../kernel/pci.kc";
+import "../../kernel/hwctl.kc";
+import "../../kernel/usb.kc";
+import "../../kernel/settings.kc";
+import "usb_host.kc";
+import "../../kernel/notepad.kc";
+
+var fail = 0;
+fn check(ok: bool, what: *u8) { if (!ok) { println("3D FAIL:", what); fail++; } }
+
+fn main() -> int {
+    let W = 1120; let H = 480;
+    let fbmem = malloc((1280 * 800 * 4) as u64);
+    gfx_init(1280, 800, 5120, 32, fbmem as int);
+    mouse_set_bounds(1280, 800);
+    kstrncpy(&disk_model[0], "HOST TEST DISK", 44);
+    fs_init(); fs_seed(); bld_seed_apps();
+    ui_init();
+    threads_start();
+    run_frames(2);
+    check(g3_init(), "init");
+    check(g3_s(0) == 0 && g3_s(64) == 4096 && g3_s(128) == 0 && g3_s(192) == -4096, "sine quarter points");
+    check(iabs(g3_s(32) - 2896) < 40, "sine 45 degrees");
+    fill(0, 0, W, H, 0xE8ECF4);
+    var m = 0;
+    while (m < G3_MODELS) {
+        g3_render(m * 160, 0, 160, 160, m, 30, 20, 0, 0x4F7CFF);
+        g3_render(m * 160, 160, 160, 160, m, 30, 20, 1, 0x4F7CFF);
+        g3_render(m * 160, 320, 160, 160, m, 30, 20, 2, 0xE6502D);
+        check(g3_nv > 3 && g3_nt > 3 && g3_ne > 3, "mesh built");
+        m++;
+    }
+    dump_ppm("/tmp/g3a.ppm");
+    var cell = 0;
+    while (cell < G3_MODELS) {
+        var drawn = 0; var y = 40;
+        while (y < 120) { var x = cell * 160 + 40; while (x < cell * 160 + 120) { if (px32(bb[y * 1280 + x] as int) != 0xE8ECF4) { drawn++; } x++; } y++; }
+        check(drawn > 200, "model drawn");
+        cell++;
+    }
+    // a large viewport falls back to 1x and stays inside its rectangle
+    fill(0, 0, W, H, 0xE8ECF4);
+    g3_render(10, 10, 900, 460, 4, 0, 0, 0, 0x30A060);
+    check(px32(bb[2 * 1280 + 2] as int) == 0xE8ECF4, "nothing outside viewport");
+    check(px32(bb[240 * 1280 + 460] as int) != 0xE8ECF4, "sphere in the middle");
+
+    // ---- the 3D Studio app
+    app_open(APP_3D); run_frames(6);
+    let wi = win_of_kind(APP_3D);
+    check(wi >= 0, "studio opens");
+    let ox = wins[wi].x + 2; let oy = wins[wi].y + TB + 1;
+    s3_mouse(S3_PX + 96 + 10, 30 + 10, 1);                         // second model chip: Pyramid
+    check(s3_model == 1, "model chip");
+    s3_mouse(S3_PX + 64 + 10, 180 + 10, 1); check(s3_style == 1, "style chip wire");
+    s3_mouse(S3_PX + 128 + 10, 180 + 10, 1); check(s3_style == 2, "style chip both");
+    s3_mouse(S3_PX + 3 * 24 + 5, 236 + 5, 1); check(s3_col == 3, "colour swatch");
+    let y0 = s3_yaw; s3_mouse(100, 100, 1); s3_mouse(160, 100, 2); s3_mouse(160, 100, 3);
+    check(s3_yaw != y0, "drag rotates");
+    s3_spin = 2; let y1 = s3_yaw; run_frames(10);
+    check(s3_yaw != y1, "spin animates");
+    s3_key('5'); check(s3_model == 4, "key picks model");
+    s3_key('s'); s3_key('s'); s3_key('s'); check(s3_style == 2, "style cycles");
+    s3_key(' '); check(s3_spin == 0, "space stops spin");
+    var z0 = s3_zoom; s3_key('+'); check(s3_zoom > z0, "zoom in");
+    s3_zoom = 256; s3_style = 0; s3_model = 5; s3_spin = 0; s3_key(KEY_UP); run_frames(3);
+    dump_ppm("/tmp/g3b.ppm");
+    win_close(wi);
+    app_open(APP_THEME); run_frames(4); app_open(APP_FILES); run_frames(6); app_open(APP_BLD); run_frames(4);
+    dump_ppm("/tmp/g3d.ppm");
+    if (fail == 0) { println("3D OK"); }
+    return fail;
+}
