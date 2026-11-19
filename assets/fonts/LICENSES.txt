@@ -1,0 +1,8 @@
+Fonts embedded in Peacock OS (converted to SVG fonts by tools/mkfonts.py; outlines are unmodified apart from scaling to 1000 units/em):
+
+  Inter              (c) The Inter Project Authors            SIL Open Font License 1.1   https://rsms.me/inter
+  Poppins            (c) Indian Type Foundry                  SIL Open Font License 1.1   https://github.com/itfoundry/poppins
+  Liberation Serif   (c) Red Hat, Inc.                        SIL Open Font License 1.1   https://github.com/liberationfonts
+  DejaVu Sans / Mono (c) Bitstream, Inc. / Tavmjong Bah       Bitstream Vera + public-domain DejaVu changes   https://dejavu-fonts.github.io
+
+The SIL OFL 1.1 text: https://openfontlicense.org .  The Bitstream Vera license permits embedding and redistribution with this notice.
